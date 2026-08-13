@@ -97,13 +97,15 @@ final class AppModel: ObservableObject {
     @Published var errors: [String] = []
     @Published private(set) var skipStorms: [String: SkipStormSummary] = [:]
     @Published private(set) var runsByJob: [String: [Run]] = [:]
-    @Published private(set) var managedJobIDs: Set<String> = []
+    @Published private(set) var recoveryStates: [String: JobRecoveryState] = [:]
+    @Published private(set) var recoveryStateErrors: [String: String] = [:]
     @Published private(set) var actionMessages: [String: String] = [:]
     @Published private(set) var busyJobIDs: Set<String> = []
 
     private let wrapper: JobWrapper
     private let workQueue = DispatchQueue(label: "com.suchintan.ticker.work", qos: .userInitiated)
     private var refreshInProgress = false
+    private var refreshPending = false
     private var runningProcesses: [String: Process] = [:]
     private var refreshTimer: Timer?
 
@@ -131,6 +133,7 @@ final class AppModel: ObservableObject {
 
     func refresh() {
         guard !refreshInProgress else {
+            refreshPending = true
             return
         }
         refreshInProgress = true
@@ -149,7 +152,8 @@ final class AppModel: ObservableObject {
 
             var refreshErrors = discovery.errors.map { $0.localizedDescription }
             var latestHealth: [String: Outcome]?
-            var managedIDs: Set<String>?
+            var latestRecoveryStates: [String: JobRecoveryState] = [:]
+            var latestRecoveryErrors: [String: String] = [:]
 
             do {
                 latestHealth = try self.store.health()
@@ -157,27 +161,35 @@ final class AppModel: ObservableObject {
                 refreshErrors.append("Could not read job health: \(error.localizedDescription)")
             }
 
-            do {
-                managedIDs = try self.store.managedJobIDs()
-            } catch {
-                refreshErrors.append("Could not read wrapped jobs: \(error.localizedDescription)")
+            for job in discovery.jobs where job.source == .launchd && job.configPath != nil {
+                do {
+                    latestRecoveryStates[job.id] = try self.wrapper.recoveryState(job: job)
+                } catch {
+                    let message = "Could not verify wrapper recovery for \(job.label): \(error.localizedDescription)"
+                    latestRecoveryErrors[job.id] = message
+                    refreshErrors.append(message)
+                }
             }
 
             let publishedErrors = refreshErrors
             let publishedHealth = latestHealth
-            let publishedManagedIDs = managedIDs
+            let publishedRecoveryStates = latestRecoveryStates
+            let publishedRecoveryErrors = latestRecoveryErrors
             DispatchQueue.main.async {
                 self.jobs = discovery.jobs
                 self.skipStorms = summaries
                 if let publishedHealth = publishedHealth {
                     self.health = publishedHealth
                 }
-                if let publishedManagedIDs = publishedManagedIDs {
-                    self.managedJobIDs = publishedManagedIDs
-                }
+                self.recoveryStates = publishedRecoveryStates
+                self.recoveryStateErrors = publishedRecoveryErrors
                 self.errors = publishedErrors
                 self.refreshInProgress = false
                 self.lastRefresh = Date()
+                if self.refreshPending {
+                    self.refreshPending = false
+                    self.refresh()
+                }
             }
         }
     }
@@ -193,7 +205,64 @@ final class AppModel: ObservableObject {
     }
 
     func isManaged(_ job: Job) -> Bool {
-        job.managed || managedJobIDs.contains(job.id)
+        switch recoveryStates[job.id] {
+        case .wrappedConsistent, .wrappedMissingBackup:
+            return true
+        case .unwrapped, .wrappedForeignLabel, .staleManagedRow, .none:
+            return false
+        }
+    }
+
+    func recoveryState(for job: Job) -> JobRecoveryState? {
+        recoveryStates[job.id]
+    }
+
+    func recoveryStateError(for job: Job) -> String? {
+        recoveryStateErrors[job.id]
+    }
+
+    func canToggleWrapping(_ job: Job) -> Bool {
+        guard job.source == .launchd, job.configPath != nil,
+              recoveryStateErrors[job.id] == nil,
+              let state = recoveryStates[job.id]
+        else {
+            return false
+        }
+        if case .wrappedForeignLabel = state {
+            return false
+        }
+        return true
+    }
+
+    func wrappingButtonTitle(for job: Job) -> String {
+        if recoveryStateErrors[job.id] != nil {
+            return "Wrapper unavailable"
+        }
+        switch recoveryStates[job.id] {
+        case .unwrapped, .staleManagedRow:
+            return "Wrap for history"
+        case .wrappedConsistent:
+            return "Unwrap for history"
+        case .wrappedMissingBackup:
+            return "Repair history wrapper"
+        case .wrappedForeignLabel:
+            return "Unsafe wrapper"
+        case .none:
+            return "Checking wrapper state…"
+        }
+    }
+
+    func wrappingButtonIcon(for job: Job) -> String {
+        switch recoveryStates[job.id] {
+        case .wrappedConsistent:
+            return "arrow.uturn.backward"
+        case .wrappedMissingBackup:
+            return "wrench.and.screwdriver"
+        case .wrappedForeignLabel:
+            return "exclamationmark.triangle"
+        case .unwrapped, .staleManagedRow, .none:
+            return "clock.arrow.2.circlepath"
+        }
     }
 
     func skipStorm(for job: Job) -> SkipStormSummary? {
@@ -218,6 +287,10 @@ final class AppModel: ObservableObject {
             }
         }
     }
+    func runEnvironment(for job: Job) -> [String: String] {
+        SchedulerEnvironment.effectiveEnvironment(for: job)
+    }
+
 
     func runNow(_ job: Job) {
         guard job.canRunNow else {
@@ -241,9 +314,7 @@ final class AppModel: ObservableObject {
             let process = Process()
             process.executableURL = executable
             process.arguments = Array(processCommand.dropFirst())
-            process.environment = ProcessInfo.processInfo.environment.merging(job.environment) {
-                _, jobValue in jobValue
-            }
+            process.environment = runEnvironment(for: job)
             if let cwd = job.cwd {
                 process.currentDirectoryURL = URL(fileURLWithPath: cwd, isDirectory: true)
             }
@@ -272,7 +343,14 @@ final class AppModel: ObservableObject {
     }
 
     func toggleWrapping(_ job: Job) {
-        let currentlyWrapped = isManaged(job)
+        guard canToggleWrapping(job), let recoveryState = recoveryStates[job.id] else {
+            appendError(
+                recoveryStateErrors[job.id]
+                    ?? "Could not change history wrapping for \(job.label): wrapper recovery is unsafe or unavailable."
+            )
+            return
+        }
+
         setBusy(true, for: job.id)
         actionMessages[job.id] = nil
 
@@ -285,21 +363,22 @@ final class AppModel: ObservableObject {
                 let commands: ReloadCommands
                 let verb: String
 
-                if currentlyWrapped {
+                switch recoveryState {
+                case .wrappedConsistent:
                     commands = try self.wrapper.unwrap(job: job)
                     verb = "Restored"
-                } else {
+                case .unwrapped, .staleManagedRow, .wrappedMissingBackup:
                     guard let tickerPath = self.resolveTickerCLIPath() else {
                         throw TickerAppError.tickerCLINotFound
                     }
                     commands = try self.wrapper.wrap(job: job, tickerPath: tickerPath)
-                    verb = "Wrapped"
+                    verb = recoveryState == .wrappedMissingBackup ? "Repaired" : "Wrapped"
+                case .wrappedForeignLabel(let embeddedJobID):
+                    throw TickerAppError.unsafeWrapper(embeddedJobID)
                 }
 
-                let managedIDs = try self.store.managedJobIDs()
                 let message = "\(verb) the configuration. Reload it with:\n\(commands.unload)\n\(commands.load)"
                 DispatchQueue.main.async {
-                    self.managedJobIDs = managedIDs
                     self.actionMessages[job.id] = message
                     self.setBusy(false, for: job.id)
                     self.refresh()
@@ -362,6 +441,7 @@ final class AppModel: ObservableObject {
 private enum TickerAppError: LocalizedError {
     case executableNotFound(String)
     case tickerCLINotFound
+    case unsafeWrapper(String)
 
     var errorDescription: String? {
         switch self {
@@ -369,6 +449,8 @@ private enum TickerAppError: LocalizedError {
             return "Executable not found: \(command)"
         case .tickerCLINotFound:
             return "The ticker CLI was not found in the app bundle or PATH."
+        case .unsafeWrapper(let embeddedJobID):
+            return "This plist contains a Ticker wrapper for \(embeddedJobID); refusing to modify it."
         }
     }
 }

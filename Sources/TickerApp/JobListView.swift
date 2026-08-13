@@ -2,6 +2,21 @@ import AppKit
 import Foundation
 import SwiftUI
 import TickerCore
+enum JobNextFirePresentation {
+    static func relativeText(
+        for schedule: Schedule,
+        nextFire: Date?,
+        relativeTo now: Date = Date()
+    ) -> String {
+        guard let nextFire else {
+            return schedule.humanDescription
+        }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: nextFire, relativeTo: now)
+    }
+}
+
 
 struct JobListView: View {
     @ObservedObject var model: AppModel
@@ -216,12 +231,7 @@ private struct JobRow: View {
     }
 
     private var relativeNextFire: String {
-        guard let nextFire = job.nextFireAt else {
-            return "on demand"
-        }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: nextFire, relativeTo: Date())
+        JobNextFirePresentation.relativeText(for: job.schedule, nextFire: job.nextFireAt)
     }
 
     private var statusColor: Color {

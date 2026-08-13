@@ -98,6 +98,43 @@ struct JobDetailView: View {
             )
         }
 
+        if job.source == .launchd {
+            if let recoveryError = model.recoveryStateError(for: job) {
+                DetailCallout(
+                    color: .red,
+                    icon: "exclamationmark.triangle.fill",
+                    title: "Wrapper recovery could not be verified",
+                    detail: recoveryError
+                )
+            } else {
+                switch model.recoveryState(for: job) {
+                case .wrappedMissingBackup:
+                    DetailCallout(
+                        color: .orange,
+                        icon: "wrench.and.screwdriver.fill",
+                        title: "History wrapper needs repair",
+                        detail: "Ticker found its wrapper but no verified backup. Repair the wrapper before you can safely restore this job."
+                    )
+                case .wrappedForeignLabel(let embeddedJobID):
+                    DetailCallout(
+                        color: .red,
+                        icon: "exclamationmark.triangle.fill",
+                        title: "Unsafe wrapper label",
+                        detail: "This plist contains a Ticker wrapper for \(embeddedJobID). Ticker will not modify it."
+                    )
+                case .staleManagedRow:
+                    DetailCallout(
+                        color: .orange,
+                        icon: "externaldrive.badge.exclamationmark",
+                        title: "Stale history record",
+                        detail: "The plist was restored outside Ticker. Wrapping it again will replace the stale record and preserve the current plist."
+                    )
+                case .unwrapped, .wrappedConsistent, .none:
+                    EmptyView()
+                }
+            }
+        }
+
         if !model.isManaged(job) {
             switch job.source {
             case .launchd:
@@ -151,11 +188,11 @@ struct JobDetailView: View {
                 model.toggleWrapping(job)
             } label: {
                 Label(
-                    model.isManaged(job) ? "Unwrap for history" : "Wrap for history",
-                    systemImage: model.isManaged(job) ? "arrow.uturn.backward" : "clock.arrow.2.circlepath"
+                    model.wrappingButtonTitle(for: job),
+                    systemImage: model.wrappingButtonIcon(for: job)
                 )
             }
-            .disabled(busy || job.source != .launchd || job.configPath == nil)
+            .disabled(busy || !model.canToggleWrapping(job))
             .help(wrappingHelp)
 
             if busy {
@@ -184,10 +221,8 @@ struct JobDetailView: View {
             DetailField(label: "Next fire") {
                 if let nextFire = job.nextFireAt {
                     Text(Self.dateTime(nextFire))
-                } else if job.schedule == .onDemand {
-                    Text("On demand")
                 } else {
-                    Text("Not predictable")
+                    Text(job.schedule.humanDescription)
                 }
             }
 
@@ -207,6 +242,22 @@ struct JobDetailView: View {
                     Text(cwd)
                         .font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
+                }
+            }
+
+            if job.canRunNow {
+                let environment = model.runEnvironment(for: job)
+                DetailField(label: "Run Now environment") {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Scheduler defaults, then job variables:")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        ForEach(environment.keys.sorted(), id: \.self) { name in
+                            Text("\(name)=\(environment[name] ?? "")")
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                        }
+                    }
                 }
             }
         }

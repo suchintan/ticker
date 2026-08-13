@@ -65,16 +65,46 @@ internal func runAdapterCommand(executable: URL, arguments: [String]) throws -> 
 }
 
 public enum LaunchdWrapper {
-    public static func decode(_ argv: [String]) -> (label: String, original: [String])? {
+    public static func decode(
+        _ argv: [String]
+    ) -> (label: String, original: [String], argv0: String?)? {
         guard argv.count >= 5,
               URL(fileURLWithPath: argv[0]).lastPathComponent == "ticker",
-              argv[1] == "run",
-              argv[2] == "--label",
-              argv[4] == "--"
+              argv[1] == "run"
         else {
             return nil
         }
-        return (argv[3], Array(argv.dropFirst(5)))
+
+        var label: String?
+        var originalArgv0: String?
+        var index = 2
+        while index < argv.count, argv[index] != "--" {
+            switch argv[index] {
+            case "--label":
+                guard index + 1 < argv.count else {
+                    return nil
+                }
+                label = argv[index + 1]
+                index += 2
+            case "--argv0":
+                guard index + 1 < argv.count else {
+                    return nil
+                }
+                originalArgv0 = argv[index + 1]
+                index += 2
+            default:
+                return nil
+            }
+        }
+
+        guard let label,
+              index < argv.count,
+              argv[index] == "--",
+              index + 1 < argv.count
+        else {
+            return nil
+        }
+        return (label, Array(argv[(index + 1)...]), originalArgv0)
     }
 }
 
@@ -241,15 +271,21 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 return nil
             }
 
+            let program = dictionary["Program"] as? String
+            let programArguments = dictionary["ProgramArguments"] as? [String]
             let literalCommand: [String]
-            if let arguments = dictionary["ProgramArguments"] as? [String], !arguments.isEmpty {
-                literalCommand = arguments
-            } else if let program = dictionary["Program"] as? String, !program.isEmpty {
-                literalCommand = [program]
+            if let program, !program.isEmpty {
+                if let programArguments, !programArguments.isEmpty {
+                    literalCommand = [program] + programArguments.dropFirst()
+                } else {
+                    literalCommand = [program]
+                }
+            } else if let programArguments, !programArguments.isEmpty {
+                literalCommand = programArguments
             } else {
                 literalCommand = []
             }
-            let decodedWrapper = LaunchdWrapper.decode(literalCommand)
+            let decodedWrapper = LaunchdWrapper.decode(programArguments ?? [])
 
             return ParsedConfiguration(
                 label: label,

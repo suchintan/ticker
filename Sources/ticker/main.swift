@@ -6,6 +6,7 @@ import TickerCore
 private let tickerVersion = "0.1.0"
 private let defaultTailBytes = 8 * 1_024
 private let maxTailBytes = 1_024 * 1_024
+private let postExitDrainTimeout = DispatchTimeInterval.seconds(2)
 private let humanDateFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.calendar = .current
@@ -177,7 +178,7 @@ private final class SignalForwarder {
     private let lock = NSLock()
     private let interruptSource: DispatchSourceSignal
     private let terminateSource: DispatchSourceSignal
-    private var processIdentifier: pid_t?
+    private var processGroupIdentifier: pid_t?
     private var pendingSignals: [Int32] = []
     private var restoreDisposition: () -> Void = {}
     private var stopped = false
@@ -202,19 +203,19 @@ private final class SignalForwarder {
         terminateSource.resume()
     }
 
-    func attach(processIdentifier: pid_t) {
+    func attach(processGroupIdentifier: pid_t) {
         lock.lock()
         guard !stopped else {
             lock.unlock()
             return
         }
-        self.processIdentifier = processIdentifier
+        self.processGroupIdentifier = processGroupIdentifier
         let signals = pendingSignals
         pendingSignals.removeAll(keepingCapacity: false)
         lock.unlock()
 
         for signal in signals {
-            Darwin.kill(processIdentifier, signal)
+            Darwin.kill(-processGroupIdentifier, signal)
         }
     }
 
@@ -225,7 +226,7 @@ private final class SignalForwarder {
             return
         }
         stopped = true
-        processIdentifier = nil
+        processGroupIdentifier = nil
         pendingSignals.removeAll(keepingCapacity: false)
         lock.unlock()
 
@@ -240,13 +241,13 @@ private final class SignalForwarder {
             lock.unlock()
             return
         }
-        guard let processIdentifier else {
+        guard let processGroupIdentifier else {
             pendingSignals.append(signal)
             lock.unlock()
             return
         }
         lock.unlock()
-        Darwin.kill(processIdentifier, signal)
+        Darwin.kill(-processGroupIdentifier, signal)
     }
 }
 
@@ -273,6 +274,8 @@ private struct TickerCLI {
             try wrap(arguments: remaining)
         case "unwrap":
             try unwrap(arguments: remaining)
+        case "doctor":
+            try doctor(arguments: remaining)
         default:
             throw CLIError.usage("Unknown command '\(command)'. Run 'ticker --help' for usage.")
         }
@@ -290,6 +293,7 @@ private struct TickerCLI {
         }
 
         var label: String?
+        var originalArgv0: String?
         var tailBytes = defaultTailBytes
         var index = 0
         while index < options.count {
@@ -299,6 +303,12 @@ private struct TickerCLI {
                     throw CLIError.usage("--label requires a job id")
                 }
                 label = options[index + 1]
+                index += 2
+            case "--argv0":
+                guard index + 1 < options.count else {
+                    throw CLIError.usage("--argv0 requires a value")
+                }
+                originalArgv0 = options[index + 1]
                 index += 2
             case "--tail-bytes":
                 guard index + 1 < options.count,
@@ -316,16 +326,26 @@ private struct TickerCLI {
             throw CLIError.usage("run requires --label <id>")
         }
 
-        executeChild(jobID: jobID, arguments: childArguments, tailBytes: tailBytes)
+        executeChild(
+            jobID: jobID,
+            arguments: childArguments,
+            originalArgv0: originalArgv0,
+            tailBytes: tailBytes
+        )
     }
 
-    private func executeChild(jobID: String, arguments: [String], tailBytes: Int) -> Never {
+    private func executeChild(
+        jobID: String,
+        arguments: [String],
+        originalArgv0: String?,
+        tailBytes: Int
+    ) -> Never {
         let startedAt = Date()
         var store: SQLiteRunStore?
         var runID: Int64?
 
         do {
-            let openedStore = try SQLiteRunStore(path: SQLiteRunStore.defaultPath())
+            let openedStore = try SQLiteRunStore(path: configuredStorePath())
             store = openedStore
             do {
                 runID = try openedStore.beginRun(jobID: jobID, startedAt: startedAt)
@@ -354,19 +374,19 @@ private struct TickerCLI {
             Darwin.exit(127)
         }
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executablePath)
-        process.arguments = Array(arguments.dropFirst())
-
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
         let forwarder = SignalForwarder()
+        let processIdentifier: pid_t
         do {
-            try process.run()
-            forwarder.attach(processIdentifier: process.processIdentifier)
+            processIdentifier = try spawnChild(
+                executablePath: executablePath,
+                arguments: arguments,
+                originalArgv0: originalArgv0,
+                stdoutPipe: stdoutPipe,
+                stderrPipe: stderrPipe
+            )
+            forwarder.attach(processGroupIdentifier: processIdentifier)
         } catch {
             forwarder.stop()
             let message = "ticker: could not execute \(arguments[0]): \(error.localizedDescription)\n"
@@ -382,6 +402,9 @@ private struct TickerCLI {
             )
             Darwin.exit(127)
         }
+
+        try? stdoutPipe.fileHandleForWriting.close()
+        try? stderrPipe.fileHandleForWriting.close()
 
         let readers = DispatchGroup()
         readers.enter()
@@ -403,19 +426,24 @@ private struct TickerCLI {
             readers.leave()
         }
 
-        try? stdoutPipe.fileHandleForWriting.close()
-        try? stderrPipe.fileHandleForWriting.close()
-        process.waitUntilExit()
-        readers.wait()
+        let rawStatus: Int32
+        do {
+            rawStatus = try waitForChild(processIdentifier)
+        } catch {
+            let messageData = Data("ticker: \(error.localizedDescription)\n".utf8)
+            stderrTail.append(messageData)
+            FileHandle.standardError.write(messageData)
+            rawStatus = 127 << 8
+        }
         forwarder.stop()
 
-        let exitCode: Int32
-        if process.terminationReason == .uncaughtSignal {
-            exitCode = 128 + process.terminationStatus
-        } else {
-            exitCode = process.terminationStatus
+        if readers.wait(timeout: .now() + postExitDrainTimeout) == .timedOut {
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForReading.close()
+            _ = readers.wait(timeout: .now() + .milliseconds(250))
         }
 
+        let exitCode = childExitCode(rawStatus)
         finishRun(
             store: store,
             runID: runID,
@@ -433,7 +461,7 @@ private struct TickerCLI {
             writeStandardError("ticker: discovery warning: \(error.localizedDescription)\n")
         }
 
-        let store = try SQLiteRunStore(path: SQLiteRunStore.defaultPath())
+        let store = try SQLiteRunStore(path: configuredStorePath())
         let health = try store.health()
         let records = discovery.jobs.sorted { left, right in
             if left.source.rawValue == right.source.rawValue {
@@ -491,7 +519,7 @@ private struct TickerCLI {
             }
         }
 
-        let store = try SQLiteRunStore(path: SQLiteRunStore.defaultPath())
+        let store = try SQLiteRunStore(path: configuredStorePath())
         let runs = try store.runs(jobID: jobID, limit: limit)
         if json {
             let records = runs.map { run in
@@ -538,7 +566,7 @@ private struct TickerCLI {
             throw CLIError.usage("wrap requires exactly one <job-id>")
         }
         let job = try findJob(id: arguments[0])
-        let store = try SQLiteRunStore(path: SQLiteRunStore.defaultPath())
+        let store = try SQLiteRunStore(path: configuredStorePath())
         let wrapper = JobWrapper(store: store)
         let commands = try wrapper.wrap(job: job, tickerPath: currentExecutablePath())
         print(commands.unload)
@@ -550,11 +578,43 @@ private struct TickerCLI {
             throw CLIError.usage("unwrap requires exactly one <job-id>")
         }
         let job = try findJob(id: arguments[0])
-        let store = try SQLiteRunStore(path: SQLiteRunStore.defaultPath())
+        let store = try SQLiteRunStore(path: configuredStorePath())
         let wrapper = JobWrapper(store: store)
         let commands = try wrapper.unwrap(job: job)
         print(commands.unload)
         print(commands.load)
+    }
+
+    private func doctor(arguments: [String]) throws {
+        let store = try SQLiteRunStore(path: configuredStorePath())
+        if arguments.count == 2, arguments[0] == "--clear-stale" {
+            let job = try findJob(id: arguments[1])
+            let state = try JobWrapper(store: store).recoveryState(job: job)
+            guard state == .staleManagedRow else {
+                throw CLIError.operation(
+                    "Refusing to clear \(job.id): recovery state is \(state.description), not stale-row"
+                )
+            }
+            try store.unmarkManaged(jobID: job.id)
+            print("\(job.id)\tunwrapped")
+            return
+        }
+        guard arguments.isEmpty else {
+            throw CLIError.usage("doctor accepts no arguments or --clear-stale <job-id>")
+        }
+
+        let discovery = JobRegistry.standard().discoverAll()
+        for error in discovery.errors {
+            writeStandardError("ticker: discovery warning: \(error.localizedDescription)\n")
+        }
+        let wrapper = JobWrapper(store: store)
+        for job in discovery.jobs.filter({ $0.source == .launchd }).sorted(by: { $0.id < $1.id }) {
+            do {
+                print("\(job.id)\t\(try wrapper.recoveryState(job: job).description)")
+            } catch {
+                print("\(job.id)\terror: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func findJob(id: String) throws -> Job {
@@ -607,19 +667,174 @@ private struct TickerCLI {
         Ticker tracks scheduled jobs on this Mac.
 
         Usage:
-          ticker run --label <id> [--tail-bytes N] -- <argv>...
+          ticker run --label <id> [--argv0 VALUE] [--tail-bytes N] -- <argv>...
           ticker list [--json]
           ticker history <job-id> [--limit N] [--json]
           ticker wrap <job-id>
           ticker unwrap <job-id>
+          ticker doctor [--clear-stale <job-id>]
           ticker --help
           ticker --version
 
-        --tail-bytes is clamped to 1,048,576 bytes.
+        --argv0 preserves a launchd job's original process name when it differs
+        from the executable. --tail-bytes is clamped to 1,048,576 bytes.
 
         wrap and unwrap rewrite a launchd plist but do not reload it. They print
         the exact launchctl unload and load commands to run next.
         """
+}
+
+private struct POSIXProcessError: Error, LocalizedError {
+    let operation: String
+    let code: Int32
+
+    var errorDescription: String? {
+        "\(operation) failed: \(String(cString: strerror(code)))"
+    }
+}
+
+private func configuredStorePath() -> String {
+    ProcessInfo.processInfo.environment["TICKER_STORE_PATH"] ?? SQLiteRunStore.defaultPath()
+}
+
+private func spawnChild(
+    executablePath: String,
+    arguments: [String],
+    originalArgv0: String?,
+    stdoutPipe: Pipe,
+    stderrPipe: Pipe
+) throws -> pid_t {
+    var fileActions: posix_spawn_file_actions_t? = nil
+    var attributes: posix_spawnattr_t? = nil
+    var code = posix_spawn_file_actions_init(&fileActions)
+    guard code == 0 else {
+        throw POSIXProcessError(operation: "posix_spawn_file_actions_init", code: code)
+    }
+    defer { posix_spawn_file_actions_destroy(&fileActions) }
+
+    code = posix_spawnattr_init(&attributes)
+    guard code == 0 else {
+        throw POSIXProcessError(operation: "posix_spawnattr_init", code: code)
+    }
+    defer { posix_spawnattr_destroy(&attributes) }
+
+    func requireSuccess(_ result: Int32, _ operation: String) throws {
+        guard result == 0 else {
+            throw POSIXProcessError(operation: operation, code: result)
+        }
+    }
+
+    let stdoutRead = stdoutPipe.fileHandleForReading.fileDescriptor
+    let stdoutWrite = stdoutPipe.fileHandleForWriting.fileDescriptor
+    let stderrRead = stderrPipe.fileHandleForReading.fileDescriptor
+    let stderrWrite = stderrPipe.fileHandleForWriting.fileDescriptor
+    try requireSuccess(
+        posix_spawn_file_actions_adddup2(&fileActions, stdoutWrite, STDOUT_FILENO),
+        "posix_spawn_file_actions_adddup2(stdout)"
+    )
+    try requireSuccess(
+        posix_spawn_file_actions_adddup2(&fileActions, stderrWrite, STDERR_FILENO),
+        "posix_spawn_file_actions_adddup2(stderr)"
+    )
+    try requireSuccess(
+        posix_spawn_file_actions_addclose(&fileActions, stdoutRead),
+        "posix_spawn_file_actions_addclose(stdout read)"
+    )
+    try requireSuccess(
+        posix_spawn_file_actions_addclose(&fileActions, stderrRead),
+        "posix_spawn_file_actions_addclose(stderr read)"
+    )
+    try requireSuccess(
+        posix_spawn_file_actions_addclose(&fileActions, stdoutWrite),
+        "posix_spawn_file_actions_addclose(stdout write)"
+    )
+    try requireSuccess(
+        posix_spawn_file_actions_addclose(&fileActions, stderrWrite),
+        "posix_spawn_file_actions_addclose(stderr write)"
+    )
+
+    var defaultSignals = sigset_t()
+    sigemptyset(&defaultSignals)
+    sigaddset(&defaultSignals, SIGINT)
+    sigaddset(&defaultSignals, SIGTERM)
+    try requireSuccess(
+        posix_spawnattr_setsigdefault(&attributes, &defaultSignals),
+        "posix_spawnattr_setsigdefault"
+    )
+    try requireSuccess(
+        posix_spawnattr_setflags(
+            &attributes,
+            Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF)
+        ),
+        "posix_spawnattr_setflags"
+    )
+    try requireSuccess(
+        posix_spawnattr_setpgroup(&attributes, 0),
+        "posix_spawnattr_setpgroup"
+    )
+
+    var argvStrings = [originalArgv0 ?? arguments[0]]
+    argvStrings.append(contentsOf: arguments.dropFirst())
+    var argv = argvStrings.map { strdup($0) }
+    argv.append(nil)
+    defer {
+        for pointer in argv where pointer != nil {
+            free(pointer)
+        }
+    }
+
+    let environmentStrings = ProcessInfo.processInfo.environment
+        .map { "\($0.key)=\($0.value)" }
+        .sorted()
+    var environment: [UnsafeMutablePointer<CChar>?] = environmentStrings.map { strdup($0) }
+    environment.append(nil)
+    defer {
+        for pointer in environment where pointer != nil {
+            free(pointer)
+        }
+    }
+
+    var processIdentifier: pid_t = 0
+    code = executablePath.withCString { executable in
+        argv.withUnsafeMutableBufferPointer { argvBuffer in
+            environment.withUnsafeMutableBufferPointer { environmentBuffer in
+                posix_spawn(
+                    &processIdentifier,
+                    executable,
+                    &fileActions,
+                    &attributes,
+                    argvBuffer.baseAddress,
+                    environmentBuffer.baseAddress
+                )
+            }
+        }
+    }
+    guard code == 0 else {
+        throw POSIXProcessError(operation: "posix_spawn \(executablePath)", code: code)
+    }
+    return processIdentifier
+}
+
+private func waitForChild(_ processIdentifier: pid_t) throws -> Int32 {
+    var status: Int32 = 0
+    while true {
+        let result = Darwin.waitpid(processIdentifier, &status, 0)
+        if result == processIdentifier {
+            return status
+        }
+        if result == -1, errno == EINTR {
+            continue
+        }
+        throw POSIXProcessError(operation: "waitpid \(processIdentifier)", code: errno)
+    }
+}
+
+private func childExitCode(_ status: Int32) -> Int32 {
+    let signal = status & 0x7f
+    if signal != 0 {
+        return 128 + signal
+    }
+    return (status >> 8) & 0xff
 }
 
 private func drain(pipe: Pipe, parentHandle: FileHandle, tail: TailBuffer) {
