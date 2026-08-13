@@ -15,7 +15,7 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
 
     private struct ParsedTask {
         let taskID: String
-        let accountIdentity: String
+        let accountDirectoryPath: String
         let job: Job
         let createdAt: Date?
         let snapshotModifiedAt: Date?
@@ -24,12 +24,12 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
 
     private struct TaskKey: Hashable {
         let taskID: String
-        let accountIdentity: String
+        let accountDirectoryPath: String
     }
 
     private struct ScheduledTaskFile {
         let url: URL
-        let accountIdentity: String
+        let accountDirectoryPath: String
     }
 
     private let searchRoots: [URL]
@@ -46,12 +46,15 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
     }
 
     internal init(searchRoots: [URL]) {
+        var seenPaths = Set<String>()
         self.searchRoots = searchRoots
+            .map { $0.standardizedFileURL.resolvingSymlinksInPath() }
+            .filter { seenPaths.insert($0.path).inserted }
+            .sorted { $0.path < $1.path }
     }
 
     public func discover() throws -> [Job] {
         let files = scheduledTaskFiles()
-        let accountIdentities = accountIdentitiesByTaskID(in: files)
         var tasksByKey: [TaskKey: ParsedTask] = [:]
 
         for snapshot in files {
@@ -63,20 +66,20 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
             }
             let snapshotModifiedAt = try? snapshot.url.resourceValues(forKeys: [.contentModificationDateKey])
                 .contentModificationDate
-            let snapshotPath = snapshot.url.standardizedFileURL.path
+            let snapshotPath = snapshot.url.standardizedFileURL.resolvingSymlinksInPath().path
 
             for rawTask in rawTasks {
                 guard let dictionary = rawTask as? [String: Any],
                       let task = parseTask(
                           dictionary,
-                          accountIdentity: snapshot.accountIdentity,
+                          accountDirectoryPath: snapshot.accountDirectoryPath,
                           snapshotModifiedAt: snapshotModifiedAt,
                           snapshotPath: snapshotPath
                       )
                 else {
                     continue
                 }
-                let key = TaskKey(taskID: task.taskID, accountIdentity: task.accountIdentity)
+                let key = TaskKey(taskID: task.taskID, accountDirectoryPath: task.accountDirectoryPath)
                 if let existing = tasksByKey[key] {
                     if isMoreRecent(task, than: existing) {
                         tasksByKey[key] = task
@@ -92,8 +95,7 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
                 task.job,
                 id: jobID(
                     taskID: task.taskID,
-                    accountIdentity: task.accountIdentity,
-                    accountIdentities: accountIdentities
+                    accountDirectoryPath: task.accountDirectoryPath
                 )
             )
         }.sorted { $0.id < $1.id }
@@ -101,7 +103,6 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
 
     public func skips() throws -> [String: [SkipRecord]] {
         let files = scheduledTaskFiles()
-        let accountIdentities = accountIdentitiesByTaskID(in: files)
         var recordsByJobID: [String: Set<SkipRecord>] = [:]
 
         for snapshot in files {
@@ -117,8 +118,7 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
                 }
                 let jobID = jobID(
                     taskID: taskID,
-                    accountIdentity: snapshot.accountIdentity,
-                    accountIdentities: accountIdentities
+                    accountDirectoryPath: snapshot.accountDirectoryPath
                 )
                 for value in values {
                     guard let dictionary = value as? [String: Any],
@@ -153,7 +153,7 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
         for root in searchRoots {
             let firstLevel = directoryContents(root)
             for accountDirectory in firstLevel where isDirectory(accountDirectory) {
-                let accountIdentity = accountDirectory.lastPathComponent
+                let accountDirectoryPath = accountDirectory.standardizedFileURL.resolvingSymlinksInPath().path
                 let secondLevel = directoryContents(accountDirectory)
                 for sessionDirectory in secondLevel where isDirectory(sessionDirectory) {
                     let candidate = sessionDirectory.appendingPathComponent("scheduled-tasks.json")
@@ -161,7 +161,12 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
                     if FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectoryValue),
                        !isDirectoryValue.boolValue
                     {
-                        files.append(ScheduledTaskFile(url: candidate, accountIdentity: accountIdentity))
+                        files.append(
+                            ScheduledTaskFile(
+                                url: candidate.standardizedFileURL.resolvingSymlinksInPath(),
+                                accountDirectoryPath: accountDirectoryPath
+                            )
+                        )
                     }
                 }
             }
@@ -198,38 +203,11 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
             return nil
         }
     }
-    private func accountIdentitiesByTaskID(
-        in files: [ScheduledTaskFile]
-    ) -> [String: Set<String>] {
-        var identities: [String: Set<String>] = [:]
-        for snapshot in files {
-            guard let root = loadRootDictionary(snapshot.url) else {
-                continue
-            }
-            if let rawTasks = root["scheduledTasks"] as? [Any] {
-                for rawTask in rawTasks {
-                    guard let dictionary = rawTask as? [String: Any],
-                          let taskID = dictionary["id"] as? String,
-                          !taskID.isEmpty
-                    else {
-                        continue
-                    }
-                    identities[taskID, default: []].insert(snapshot.accountIdentity)
-                }
-            }
-            if let recordedSkips = root["recordedSkips"] as? [String: Any] {
-                for taskID in recordedSkips.keys where !taskID.isEmpty {
-                    identities[taskID, default: []].insert(snapshot.accountIdentity)
-                }
-            }
-        }
-        return identities
-    }
 
 
     private func parseTask(
         _ dictionary: [String: Any],
-        accountIdentity: String,
+        accountDirectoryPath: String,
         snapshotModifiedAt: Date?,
         snapshotPath: String
     ) -> ParsedTask? {
@@ -248,7 +226,7 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
 
         return ParsedTask(
             taskID: taskID,
-            accountIdentity: accountIdentity,
+            accountDirectoryPath: accountDirectoryPath,
             job: Job(
                 id: "claude:\(taskID)",
                 source: .claudeRoutine,
@@ -270,18 +248,12 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
     }
     private func jobID(
         taskID: String,
-        accountIdentity: String,
-        accountIdentities: [String: Set<String>]
+        accountDirectoryPath: String
     ) -> String {
-        let base = "claude:\(taskID)"
-        guard accountIdentities[taskID, default: []].count > 1 else {
-            return base
-        }
-
-        let digest = SHA256.hash(data: Data(accountIdentity.utf8))
+        let digest = SHA256.hash(data: Data(accountDirectoryPath.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
-        return "\(base)#\(digest.prefix(12))"
+        return "claude:\(taskID)#\(digest.prefix(12))"
     }
 
     private func reidentifiedJob(_ job: Job, id: String) -> Job {
@@ -291,9 +263,11 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
             label: job.label,
             schedule: job.schedule,
             command: job.command,
+            argv0: job.argv0,
             environment: job.environment,
             cwd: job.cwd,
             enabled: job.enabled,
+            runtimeStatusAttribution: job.runtimeStatusAttribution,
             configPath: job.configPath,
             lastKnownExit: job.lastKnownExit,
             lastRunAt: job.lastRunAt,

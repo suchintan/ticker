@@ -7,6 +7,8 @@ private let tickerVersion = "0.1.0"
 private let defaultTailBytes = 8 * 1_024
 private let maxTailBytes = 1_024 * 1_024
 private let postExitDrainTimeout = DispatchTimeInterval.seconds(2)
+private let postExitForwardTimeout = DispatchTimeInterval.milliseconds(250)
+private let maxPendingForwardBytes = 1_024 * 1_024
 private let humanDateFormatter: DateFormatter = {
     let formatter = DateFormatter()
     formatter.calendar = .current
@@ -47,9 +49,12 @@ private struct ListRecord: Encodable {
     let label: String
     let schedule: String
     let command: [String]
+    let argv0: String?
     let environment: [String: String]
     let cwd: String?
     let enabled: Bool
+    let runtimeStatusAttribution: RuntimeStatusAttribution?
+    let runtimeStatusExplanation: String?
     let configPath: String?
     let lastKnownExit: ExitStatusRecord?
     let lastRunAt: Date?
@@ -65,9 +70,12 @@ private struct ListRecord: Encodable {
         label = job.label
         schedule = job.schedule.humanDescription
         command = job.command
+        argv0 = job.argv0
         environment = job.environment
         cwd = job.cwd
         enabled = job.enabled
+        runtimeStatusAttribution = job.runtimeStatusAttribution
+        runtimeStatusExplanation = job.runtimeStatusExplanation
         configPath = job.configPath
         lastKnownExit = job.lastKnownExit.map(ExitStatusRecord.init)
         lastRunAt = job.lastRunAt
@@ -89,7 +97,10 @@ private struct ListRecord: Encodable {
         try container.encode(enabled, forKey: .enabled)
         try container.encode(managed, forKey: .managed)
         try container.encode(lastOutcome, forKey: .lastOutcome)
+        try encode(argv0, into: &container, forKey: .argv0)
         try encode(cwd, into: &container, forKey: .cwd)
+        try encode(runtimeStatusAttribution, into: &container, forKey: .runtimeStatusAttribution)
+        try encode(runtimeStatusExplanation, into: &container, forKey: .runtimeStatusExplanation)
         try encode(configPath, into: &container, forKey: .configPath)
         try encode(lastKnownExit, into: &container, forKey: .lastKnownExit)
         try encode(lastRunAt, into: &container, forKey: .lastRunAt)
@@ -116,9 +127,12 @@ private struct ListRecord: Encodable {
         case label
         case schedule
         case command
+        case argv0
         case environment
         case cwd
         case enabled
+        case runtimeStatusAttribution
+        case runtimeStatusExplanation
         case configPath
         case lastKnownExit
         case lastRunAt
@@ -174,14 +188,56 @@ private final class TailBuffer {
     }
 }
 
+private final class OutputForwarder {
+    private let parentHandle: FileHandle
+    private let queue: DispatchQueue
+    private let group = DispatchGroup()
+    private let lock = NSLock()
+    private var pendingBytes = 0
+
+    init(parentHandle: FileHandle, label: String) {
+        self.parentHandle = parentHandle
+        queue = DispatchQueue(label: label, qos: .utility)
+    }
+
+    func forward(_ data: Data) {
+        lock.lock()
+        let available = max(0, maxPendingForwardBytes - pendingBytes)
+        guard available > 0 else {
+            lock.unlock()
+            return
+        }
+        let forwarded = data.count <= available ? data : Data(data.prefix(available))
+        pendingBytes += forwarded.count
+        group.enter()
+        lock.unlock()
+
+        queue.async {
+            self.parentHandle.write(forwarded)
+            self.lock.lock()
+            self.pendingBytes -= forwarded.count
+            self.lock.unlock()
+            self.group.leave()
+        }
+    }
+
+    func flush(timeout: DispatchTimeInterval) {
+        _ = group.wait(timeout: .now() + timeout)
+    }
+}
+
 private final class SignalForwarder {
     private let lock = NSLock()
     private let interruptSource: DispatchSourceSignal
     private let terminateSource: DispatchSourceSignal
+    // A live process-group id is read and signalled only while this lock is held.
+    // The child stays unreaped until the same lock clears the id, so the kernel
+    // cannot reuse the numeric process-group id during a forwarding send.
     private var processGroupIdentifier: pid_t?
     private var pendingSignals: [Int32] = []
     private var restoreDisposition: () -> Void = {}
     private var stopped = false
+    private var disposed = false
 
     init() {
         let previousInterruptHandler = Darwin.signal(SIGINT, SIG_IGN)
@@ -205,31 +261,49 @@ private final class SignalForwarder {
 
     func attach(processGroupIdentifier: pid_t) {
         lock.lock()
+        defer { lock.unlock() }
         guard !stopped else {
-            lock.unlock()
             return
         }
         self.processGroupIdentifier = processGroupIdentifier
-        let signals = pendingSignals
+        for signal in pendingSignals {
+            _ = Darwin.kill(-processGroupIdentifier, signal)
+        }
         pendingSignals.removeAll(keepingCapacity: false)
-        lock.unlock()
+    }
 
-        for signal in signals {
-            Darwin.kill(-processGroupIdentifier, signal)
+    func reap(processIdentifier: pid_t) throws -> Int32 {
+        waitForChildExitWithoutReaping(processIdentifier)
+
+        lock.lock()
+        stopped = true
+        processGroupIdentifier = nil
+        pendingSignals.removeAll(keepingCapacity: false)
+        do {
+            let status = try reapChild(processIdentifier)
+            lock.unlock()
+            return status
+        } catch {
+            lock.unlock()
+            throw error
         }
     }
 
     func stop() {
         lock.lock()
-        guard !stopped else {
+        guard !disposed else {
             lock.unlock()
             return
         }
+        disposed = true
         stopped = true
         processGroupIdentifier = nil
         pendingSignals.removeAll(keepingCapacity: false)
         lock.unlock()
+        finish()
+    }
 
+    private func finish() {
         interruptSource.cancel()
         terminateSource.cancel()
         restoreDisposition()
@@ -237,17 +311,15 @@ private final class SignalForwarder {
 
     private func forward(_ signal: Int32) {
         lock.lock()
+        defer { lock.unlock() }
         guard !stopped else {
-            lock.unlock()
             return
         }
         guard let processGroupIdentifier else {
             pendingSignals.append(signal)
-            lock.unlock()
             return
         }
-        lock.unlock()
-        Darwin.kill(-processGroupIdentifier, signal)
+        _ = Darwin.kill(-processGroupIdentifier, signal)
     }
 }
 
@@ -303,6 +375,14 @@ private struct TickerCLI {
                     throw CLIError.usage("--label requires a job id")
                 }
                 label = options[index + 1]
+                index += 2
+            case "--ticker-wrapper-version":
+                guard index + 1 < options.count,
+                      options[index + 1] == LaunchdWrapper.currentVersion else {
+                    throw CLIError.usage(
+                        "--ticker-wrapper-version requires supported version \(LaunchdWrapper.currentVersion)"
+                    )
+                }
                 index += 2
             case "--argv0":
                 guard index + 1 < options.count else {
@@ -406,42 +486,43 @@ private struct TickerCLI {
         try? stdoutPipe.fileHandleForWriting.close()
         try? stderrPipe.fileHandleForWriting.close()
 
+        let stdoutForwarder = OutputForwarder(
+            parentHandle: FileHandle.standardOutput,
+            label: "com.ticker.stdout-forwarder"
+        )
+        let stderrForwarder = OutputForwarder(
+            parentHandle: FileHandle.standardError,
+            label: "com.ticker.stderr-forwarder"
+        )
         let readers = DispatchGroup()
         readers.enter()
         DispatchQueue.global(qos: .utility).async {
-            drain(
-                pipe: stdoutPipe,
-                parentHandle: FileHandle.standardOutput,
-                tail: stdoutTail
-            )
+            drain(pipe: stdoutPipe, forwarder: stdoutForwarder, tail: stdoutTail)
             readers.leave()
         }
         readers.enter()
         DispatchQueue.global(qos: .utility).async {
-            drain(
-                pipe: stderrPipe,
-                parentHandle: FileHandle.standardError,
-                tail: stderrTail
-            )
+            drain(pipe: stderrPipe, forwarder: stderrForwarder, tail: stderrTail)
             readers.leave()
         }
 
         let rawStatus: Int32
         do {
-            rawStatus = try waitForChild(processIdentifier)
+            rawStatus = try forwarder.reap(processIdentifier: processIdentifier)
         } catch {
             let messageData = Data("ticker: \(error.localizedDescription)\n".utf8)
             stderrTail.append(messageData)
             FileHandle.standardError.write(messageData)
             rawStatus = 127 << 8
         }
-        forwarder.stop()
 
         if readers.wait(timeout: .now() + postExitDrainTimeout) == .timedOut {
             try? stdoutPipe.fileHandleForReading.close()
             try? stderrPipe.fileHandleForReading.close()
             _ = readers.wait(timeout: .now() + .milliseconds(250))
         }
+        stdoutForwarder.flush(timeout: postExitForwardTimeout)
+        stderrForwarder.flush(timeout: postExitForwardTimeout)
 
         let exitCode = childExitCode(rawStatus)
         finishRun(
@@ -462,6 +543,10 @@ private struct TickerCLI {
         }
 
         let store = try SQLiteRunStore(path: configuredStorePath())
+        _ = try store.migrateLegacyJobIDs(
+            discoveredJobs: discovery.jobs,
+            discoveryComplete: discovery.errors.isEmpty
+        )
         let health = try store.health()
         let records = discovery.jobs.sorted { left, right in
             if left.source.rawValue == right.source.rawValue {
@@ -479,19 +564,29 @@ private struct TickerCLI {
             try printJSON(records)
             return
         }
-
         let rows = records.map { record in
             [
                 record.source.rawValue,
-                record.enabled ? "on" : "off",
+                record.runtimeStatusAttribution == .ambiguous
+                    ? "ambiguous"
+                    : (record.enabled ? "on" : "off"),
+                record.id,
                 record.label + (record.managed ? "*" : ""),
                 record.schedule,
                 record.nextFireAt.map(formatDate) ?? "—",
                 record.lastOutcome.rawValue,
             ]
         }
-        printTable(headers: ["SOURCE", "STATE", "JOB", "SCHEDULE", "NEXT FIRE", "OUTCOME"], rows: rows)
+        printTable(
+            headers: ["SOURCE", "STATE", "ID", "JOB", "SCHEDULE", "NEXT FIRE", "OUTCOME"],
+            rows: rows
+        )
         print("\n* managed by Ticker")
+        for record in records where record.runtimeStatusAttribution == .ambiguous {
+            if let explanation = record.runtimeStatusExplanation {
+                print("\(record.label): \(explanation)")
+            }
+        }
     }
 
     private func history(arguments: [String]) throws {
@@ -520,6 +615,11 @@ private struct TickerCLI {
         }
 
         let store = try SQLiteRunStore(path: configuredStorePath())
+        let discovery = discoverJobs()
+        _ = try store.migrateLegacyJobIDs(
+            discoveredJobs: discovery.jobs,
+            discoveryComplete: discovery.complete
+        )
         let runs = try store.runs(jobID: jobID, limit: limit)
         if json {
             let records = runs.map { run in
@@ -565,8 +665,13 @@ private struct TickerCLI {
         guard arguments.count == 1 else {
             throw CLIError.usage("wrap requires exactly one <job-id>")
         }
-        let job = try findJob(id: arguments[0])
+        let discovery = discoverJobs()
+        let job = try findJob(id: arguments[0], in: discovery.jobs)
         let store = try SQLiteRunStore(path: configuredStorePath())
+        _ = try store.migrateLegacyJobIDs(
+            discoveredJobs: discovery.jobs,
+            discoveryComplete: discovery.complete
+        )
         let wrapper = JobWrapper(store: store)
         let commands = try wrapper.wrap(job: job, tickerPath: currentExecutablePath())
         print(commands.unload)
@@ -577,8 +682,13 @@ private struct TickerCLI {
         guard arguments.count == 1 else {
             throw CLIError.usage("unwrap requires exactly one <job-id>")
         }
-        let job = try findJob(id: arguments[0])
+        let discovery = discoverJobs()
+        let job = try findJob(id: arguments[0], in: discovery.jobs)
         let store = try SQLiteRunStore(path: configuredStorePath())
+        _ = try store.migrateLegacyJobIDs(
+            discoveredJobs: discovery.jobs,
+            discoveryComplete: discovery.complete
+        )
         let wrapper = JobWrapper(store: store)
         let commands = try wrapper.unwrap(job: job)
         print(commands.unload)
@@ -586,9 +696,15 @@ private struct TickerCLI {
     }
 
     private func doctor(arguments: [String]) throws {
+        let discovery = discoverJobs()
+        let discoveredJobs = discovery.jobs
         let store = try SQLiteRunStore(path: configuredStorePath())
+        let migration = try store.migrateLegacyJobIDs(
+            discoveredJobs: discoveredJobs,
+            discoveryComplete: discovery.complete
+        )
         if arguments.count == 2, arguments[0] == "--clear-stale" {
-            let job = try findJob(id: arguments[1])
+            let job = try findJob(id: arguments[1], in: discoveredJobs)
             let state = try JobWrapper(store: store).recoveryState(job: job)
             guard state == .staleManagedRow else {
                 throw CLIError.operation(
@@ -602,27 +718,36 @@ private struct TickerCLI {
         guard arguments.isEmpty else {
             throw CLIError.usage("doctor accepts no arguments or --clear-stale <job-id>")
         }
-
-        let discovery = JobRegistry.standard().discoverAll()
-        for error in discovery.errors {
-            writeStandardError("ticker: discovery warning: \(error.localizedDescription)\n")
-        }
         let wrapper = JobWrapper(store: store)
-        for job in discovery.jobs.filter({ $0.source == .launchd }).sorted(by: { $0.id < $1.id }) {
+        for job in discoveredJobs.filter({ $0.source == .launchd }).sorted(by: { $0.id < $1.id }) {
             do {
-                print("\(job.id)\t\(try wrapper.recoveryState(job: job).description)")
+                let recovery = try wrapper.recoveryState(job: job).description
+                if job.runtimeStatusAttribution == .ambiguous {
+                    print("\(job.id)\t\(recovery)\tambiguous-runtime")
+                    if let explanation = job.runtimeStatusExplanation {
+                        print("\t\(explanation)")
+                    }
+                } else {
+                    print("\(job.id)\t\(recovery)")
+                }
             } catch {
                 print("\(job.id)\terror: \(error.localizedDescription)")
             }
         }
+        for legacyID in migration.orphanedLegacyJobIDs {
+            print("\(legacyID)\torphaned-history")
+        }
     }
 
-    private func findJob(id: String) throws -> Job {
+    private func discoverJobs() -> (jobs: [Job], complete: Bool) {
         let discovery = JobRegistry.standard().discoverAll()
         for error in discovery.errors {
             writeStandardError("ticker: discovery warning: \(error.localizedDescription)\n")
         }
-        guard let job = discovery.jobs.first(where: { $0.id == id }) else {
+        return (discovery.jobs, discovery.errors.isEmpty)
+    }
+    private func findJob(id: String, in jobs: [Job]) throws -> Job {
+        guard let job = jobs.first(where: { $0.id == id }) else {
             throw CLIError.operation("No discovered job has id '\(id)'")
         }
         return job
@@ -667,7 +792,7 @@ private struct TickerCLI {
         Ticker tracks scheduled jobs on this Mac.
 
         Usage:
-          ticker run --label <id> [--argv0 VALUE] [--tail-bytes N] -- <argv>...
+          ticker run --label <id> [--ticker-wrapper-version VERSION] [--argv0 VALUE] [--tail-bytes N] -- <argv>...
           ticker list [--json]
           ticker history <job-id> [--limit N] [--json]
           ticker wrap <job-id>
@@ -815,7 +940,22 @@ private func spawnChild(
     return processIdentifier
 }
 
-private func waitForChild(_ processIdentifier: pid_t) throws -> Int32 {
+private func waitForChildExitWithoutReaping(_ processIdentifier: pid_t) {
+    let exited = DispatchSemaphore(value: 0)
+    let source = DispatchSource.makeProcessSource(
+        identifier: processIdentifier,
+        eventMask: .exit,
+        queue: .global(qos: .utility)
+    )
+    source.setEventHandler {
+        exited.signal()
+    }
+    source.resume()
+    exited.wait()
+    source.cancel()
+}
+
+private func reapChild(_ processIdentifier: pid_t) throws -> Int32 {
     var status: Int32 = 0
     while true {
         let result = Darwin.waitpid(processIdentifier, &status, 0)
@@ -837,14 +977,14 @@ private func childExitCode(_ status: Int32) -> Int32 {
     return (status >> 8) & 0xff
 }
 
-private func drain(pipe: Pipe, parentHandle: FileHandle, tail: TailBuffer) {
+private func drain(pipe: Pipe, forwarder: OutputForwarder, tail: TailBuffer) {
     while true {
         let data = pipe.fileHandleForReading.availableData
         if data.isEmpty {
             return
         }
-        parentHandle.write(data)
         tail.append(data)
+        forwarder.forward(data)
     }
 }
 

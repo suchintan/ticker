@@ -24,7 +24,10 @@ public enum JobRecoveryState: Equatable {
     case unwrapped
     case wrappedConsistent
     case wrappedMissingBackup
+    case wrappedBackupContentMismatch
+    case wrappedBackupUnverified
     case wrappedForeignLabel(embeddedJobID: String)
+    case ambiguousTickerInvocation
     case staleManagedRow
 
     public var description: String {
@@ -35,8 +38,14 @@ public enum JobRecoveryState: Equatable {
             return "wrapped-consistent"
         case .wrappedMissingBackup:
             return "wrapped-missing-backup"
+        case .wrappedBackupContentMismatch:
+            return "wrapped-backup-content-mismatch"
+        case .wrappedBackupUnverified:
+            return "wrapped-backup-unverified"
         case .wrappedForeignLabel(let embeddedJobID):
             return "wrapped-foreign-label (\(embeddedJobID))"
+        case .ambiguousTickerInvocation:
+            return "ambiguous-ticker-invocation"
         case .staleManagedRow:
             return "stale-row"
         }
@@ -47,12 +56,21 @@ private struct BackupMetadata: Codable {
     let version: Int
     let jobID: String
     let sourcePlistPath: String
+    let backupByteCount: Int?
+    let backupSHA256: String?
 }
 
 private enum BackupResolution {
     case verified(URL)
     case missing
-    case unverifiable([URL])
+    case contentMismatch([URL])
+    case unverified([URL])
+}
+
+private enum BackupValidation {
+    case verified
+    case contentMismatch
+    case unverified
 }
 
 private struct OriginalExecution: Equatable {
@@ -120,31 +138,37 @@ public final class JobWrapper {
         let state = try recoveryState(job: job)
         switch state {
         case .wrappedConsistent:
-            try migrateWrapperPathIfNeeded(
+            try migrateWrapperIfNeeded(
                 dictionary: &dictionary,
                 format: format,
                 plistURL: plistURL,
+                job: job,
                 tickerPath: tickerPath
             )
             return commands
+        case .wrappedBackupContentMismatch:
+            throw JobWrapperError(
+                message: "Ticker backup content for \(job.id) does not match its authenticated metadata; refusing to rewrite the plist"
+            )
+        case .wrappedBackupUnverified:
+            throw JobWrapperError(
+                message: "Ticker backup for \(job.id) has no valid content digest; explicit recovery is required"
+            )
+        case .ambiguousTickerInvocation:
+            throw JobWrapperError(
+                message: "Launchd job \(job.id) invokes an unproven executable named ticker; refusing to rewrite it"
+            )
         case .wrappedForeignLabel(let embeddedJobID):
             throw JobWrapperError(
                 message: "Launchd job \(job.id) contains a Ticker wrapper for \(embeddedJobID); refusing to replace it"
             )
         case .wrappedMissingBackup:
-            guard let decodedWrapper, decodedWrapper.label == job.id else {
+            guard let decodedWrapper, acceptedWrapperLabels(for: job).contains(decodedWrapper.label) else {
                 throw JobWrapperError(message: "Could not decode the existing Ticker wrapper for \(job.id)")
             }
 
             if case .verified(let backupURL) = try backupResolution(for: job, plistURL: plistURL) {
                 try store.markManaged(jobID: job.id, backupPath: backupURL.path)
-            } else if let migratedURL = try migrateLegacyBackupIfSafe(
-                job: job,
-                plistURL: plistURL,
-                wrappedDictionary: dictionary,
-                decodedWrapper: decodedWrapper
-            ) {
-                try store.markManaged(jobID: job.id, backupPath: migratedURL.path)
             } else {
                 let repairedDictionary = try reconstructedOriginal(
                     from: dictionary,
@@ -167,10 +191,11 @@ public final class JobWrapper {
                 try store.markManaged(jobID: job.id, backupPath: backupURL.path)
             }
 
-            try migrateWrapperPathIfNeeded(
+            try migrateWrapperIfNeeded(
                 dictionary: &dictionary,
                 format: format,
                 plistURL: plistURL,
+                job: job,
                 tickerPath: tickerPath
             )
             return commands
@@ -201,17 +226,12 @@ public final class JobWrapper {
         try store.markManaged(jobID: job.id, backupPath: backupURL.path)
 
         dictionary.removeValue(forKey: "Program")
-        var wrapperArguments = [
-            tickerPath,
-            "run",
-            "--label",
-            job.id,
-        ]
-        if let argv0 = originalExecution.argv0 {
-            wrapperArguments += ["--argv0", argv0]
-        }
-        wrapperArguments += ["--"] + originalExecution.command
-        dictionary["ProgramArguments"] = wrapperArguments
+        dictionary["ProgramArguments"] = wrapperArguments(
+            tickerPath: tickerPath,
+            jobID: job.id,
+            original: originalExecution.command,
+            argv0: originalExecution.argv0
+        )
 
         let rewrittenData: Data
         do {
@@ -248,6 +268,18 @@ public final class JobWrapper {
                     message: "Ticker recovery state for \(job.id) is incomplete; the verified backup is missing"
                 )
             }
+        case .wrappedBackupContentMismatch:
+            throw JobWrapperError(
+                message: "Ticker backup content for \(job.id) does not match its authenticated metadata; refusing to restore it"
+            )
+        case .wrappedBackupUnverified:
+            throw JobWrapperError(
+                message: "Ticker backup for \(job.id) has no valid content digest; explicit recovery is required"
+            )
+        case .ambiguousTickerInvocation:
+            throw JobWrapperError(
+                message: "Launchd job \(job.id) invokes an unproven executable named ticker; refusing to restore it"
+            )
         case .wrappedForeignLabel(let embeddedJobID):
             throw JobWrapperError(
                 message: "Launchd job \(job.id) contains a Ticker wrapper for \(embeddedJobID); refusing to restore it"
@@ -263,7 +295,11 @@ public final class JobWrapper {
         guard case .verified(let backupURL) = try backupResolution(for: job, plistURL: plistURL) else {
             throw JobWrapperError(message: "No verified Ticker backup exists for \(job.id)")
         }
-        let backupData = try readData(at: backupURL)
+        let backupData = try authenticatedBackupData(
+            at: backupURL,
+            job: job,
+            plistURL: plistURL
+        )
         do {
             try backupData.write(to: plistURL, options: .atomic)
         } catch {
@@ -291,38 +327,45 @@ public final class JobWrapper {
             throw JobWrapperError(message: "Launchd plist at \(plistURL.path) is not a dictionary")
         }
 
-        let managedRowExists = try store.managedJobIDs().contains(job.id)
-        guard let arguments = dictionary["ProgramArguments"] as? [String],
-              let decoded = LaunchdWrapper.decode(arguments) else {
+        let managedIDs = try store.managedJobIDs()
+        let managedRowExists = !managedIDs.isDisjoint(with: acceptedBackupJobIDs(for: job))
+        guard let arguments = dictionary["ProgramArguments"] as? [String] else {
             return managedRowExists ? .staleManagedRow : .unwrapped
         }
-        guard decoded.label == job.id else {
-            return .wrappedForeignLabel(embeddedJobID: decoded.label)
+
+        let acceptedLabels = acceptedWrapperLabels(for: job)
+        if let decoded = LaunchdWrapper.decode(arguments) {
+            guard acceptedLabels.contains(decoded.label) else {
+                return .wrappedForeignLabel(embeddedJobID: decoded.label)
+            }
+            guard managedRowExists else {
+                return .wrappedMissingBackup
+            }
+            switch try backupResolution(for: job, plistURL: plistURL) {
+            case .verified:
+                return .wrappedConsistent
+            case .missing:
+                return .wrappedMissingBackup
+            case .contentMismatch:
+                return .wrappedBackupContentMismatch
+            case .unverified:
+                return .wrappedBackupUnverified
+            }
         }
-        guard managedRowExists else {
-            return .wrappedMissingBackup
+
+        if let legacy = LaunchdWrapper.decodeLegacy(arguments) {
+            guard acceptedLabels.contains(legacy.label),
+                  managedRowExists,
+                  case .verified = try backupResolution(for: job, plistURL: plistURL) else {
+                return .ambiguousTickerInvocation
+            }
+            return .wrappedConsistent
         }
-        guard case .verified = try backupResolution(for: job, plistURL: plistURL) else {
-            return .wrappedMissingBackup
-        }
-        return .wrappedConsistent
+        return managedRowExists ? .staleManagedRow : .unwrapped
     }
 
     public func isWrapped(job: Job) -> Bool {
-        guard let configPath = job.configPath,
-              let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
-              let propertyList = try? PropertyListSerialization.propertyList(
-                  from: data,
-                  options: [],
-                  format: nil
-              ),
-              let dictionary = propertyList as? [String: Any],
-              let arguments = dictionary["ProgramArguments"] as? [String],
-              let decoded = LaunchdWrapper.decode(arguments)
-        else {
-            return false
-        }
-        return decoded.label == job.id
+        return (try? recoveryState(job: job)) == .wrappedConsistent
     }
 
     private func configurationURL(for job: Job) throws -> URL {
@@ -332,7 +375,9 @@ public final class JobWrapper {
         guard let configPath = job.configPath, !configPath.isEmpty else {
             throw JobWrapperError(message: "Launchd job \(job.id) has no plist path")
         }
-        return URL(fileURLWithPath: configPath).standardizedFileURL
+        return URL(fileURLWithPath: configPath)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
     }
 
     private func reloadCommands(for plistURL: URL) -> ReloadCommands {
@@ -344,52 +389,88 @@ public final class JobWrapper {
     }
 
     private func backupResolution(for job: Job, plistURL: URL) throws -> BackupResolution {
-        var unverifiable: [URL] = []
+        var candidates: [URL] = []
+        var seenPaths = Set<String>()
+        func appendCandidate(_ url: URL) {
+            let standardized = url.standardizedFileURL
+            if seenPaths.insert(standardized.path).inserted {
+                candidates.append(standardized)
+            }
+        }
+
         if let sqliteStore = store as? SQLiteRunStore,
-           let path = try sqliteStore.managedBackupPath(jobID: job.id) {
+           let path = try managedBackupPath(for: job, in: sqliteStore) {
             let storedURL = URL(fileURLWithPath: path).standardizedFileURL
             if fileManager.fileExists(atPath: storedURL.path) {
-                if metadataMatches(backupURL: storedURL, job: job, plistURL: plistURL) {
+                switch backupValidation(backupURL: storedURL, job: job, plistURL: plistURL) {
+                case .verified:
                     return .verified(storedURL)
+                case .contentMismatch:
+                    return .contentMismatch([storedURL])
+                case .unverified:
+                    return .unverified([storedURL])
                 }
-                unverifiable.append(storedURL)
             }
         }
 
-        if !fileManager.fileExists(atPath: backupDirectory.path) {
-            return unverifiable.isEmpty ? .missing : .unverifiable(unverifiable)
-        }
-        let candidates: [URL]
-        do {
-            let currentPrefix = backupStem(for: job) + ".plist."
-            let legacyPrefix = sanitizedLabel(job.label) + ".plist."
-            candidates = try fileManager.contentsOfDirectory(
-                at: backupDirectory,
-                includingPropertiesForKeys: [.contentModificationDateKey],
-                options: [.skipsHiddenFiles]
-            ).filter { candidate in
-                let name = candidate.lastPathComponent
-                guard !name.hasSuffix(".metadata.json") else {
-                    return false
+        if fileManager.fileExists(atPath: backupDirectory.path) {
+            do {
+                let currentPrefix = backupStem(for: job) + ".plist."
+                let legacyPrefix = sanitizedLabel(job.label) + ".plist."
+                for candidate in try fileManager.contentsOfDirectory(
+                    at: backupDirectory,
+                    includingPropertiesForKeys: [.contentModificationDateKey],
+                    options: [.skipsHiddenFiles]
+                ) {
+                    let name = candidate.lastPathComponent
+                    guard !name.hasSuffix(".metadata.json"),
+                          name.hasPrefix(currentPrefix) || name.hasPrefix(legacyPrefix) else {
+                        continue
+                    }
+                    appendCandidate(candidate)
                 }
-                return name.hasPrefix(currentPrefix) || name.hasPrefix(legacyPrefix)
+            } catch let error as CocoaError where error.code == .fileNoSuchFile {
+                // A concurrent cleanup is the same as finding no directory.
+            } catch {
+                throw JobWrapperError(
+                    message: "Could not inspect backup directory at \(backupDirectory.path): \(error.localizedDescription)"
+                )
             }
-        } catch let error as CocoaError where error.code == .fileNoSuchFile {
-            return unverifiable.isEmpty ? .missing : .unverifiable(unverifiable)
-        } catch {
-            throw JobWrapperError(
-                message: "Could not inspect backup directory at \(backupDirectory.path): \(error.localizedDescription)"
-            )
         }
 
-        let verified = candidates.filter {
-            metadataMatches(backupURL: $0, job: job, plistURL: plistURL)
+        var verified: [URL] = []
+        var mismatched: [URL] = []
+        var unverified: [URL] = []
+        for candidate in candidates {
+            switch backupValidation(backupURL: candidate, job: job, plistURL: plistURL) {
+            case .verified:
+                verified.append(candidate)
+            case .contentMismatch:
+                mismatched.append(candidate)
+            case .unverified:
+                unverified.append(candidate)
+            }
         }
         if let newest = newestBackup(in: verified) {
             return .verified(newest)
         }
-        unverifiable.append(contentsOf: candidates)
-        return unverifiable.isEmpty ? .missing : .unverifiable(unverifiable)
+        if !mismatched.isEmpty {
+            return .contentMismatch(mismatched)
+        }
+        if !unverified.isEmpty {
+            return .unverified(unverified)
+        }
+        return .missing
+    }
+
+    private func managedBackupPath(for job: Job, in store: SQLiteRunStore) throws -> String? {
+        if let current = try store.managedBackupPath(jobID: job.id) {
+            return current
+        }
+        if let legacy = legacyJobID(for: job) {
+            return try store.managedBackupPath(jobID: legacy)
+        }
+        return nil
     }
 
     private func newestBackup(in candidates: [URL]) -> URL? {
@@ -433,14 +514,68 @@ public final class JobWrapper {
         backupURL.appendingPathExtension("metadata.json")
     }
 
-    private func metadataMatches(backupURL: URL, job: Job, plistURL: URL) -> Bool {
-        guard let data = try? Data(contentsOf: metadataURL(for: backupURL)),
-              let metadata = try? JSONDecoder().decode(BackupMetadata.self, from: data) else {
-            return false
+    private func backupValidation(backupURL: URL, job: Job, plistURL: URL) -> BackupValidation {
+        guard let metadataData = try? Data(contentsOf: metadataURL(for: backupURL)),
+              let metadata = try? JSONDecoder().decode(BackupMetadata.self, from: metadataData),
+              let backupData = try? Data(contentsOf: backupURL) else {
+            return .unverified
         }
-        return metadata.version == 1
-            && metadata.jobID == job.id
-            && metadata.sourcePlistPath == plistURL.standardizedFileURL.path
+        return backupValidation(
+            metadata: metadata,
+            backupData: backupData,
+            job: job,
+            plistURL: plistURL
+        )
+    }
+
+    private func backupValidation(
+        metadata: BackupMetadata,
+        backupData: Data,
+        job: Job,
+        plistURL: URL
+    ) -> BackupValidation {
+        guard metadata.version == 2,
+              acceptedBackupJobIDs(for: job).contains(metadata.jobID),
+              metadata.sourcePlistPath == canonicalPath(plistURL),
+              let expectedByteCount = metadata.backupByteCount,
+              let expectedDigest = metadata.backupSHA256 else {
+            return .unverified
+        }
+        guard backupData.count == expectedByteCount,
+              sha256(backupData) == expectedDigest else {
+            return .contentMismatch
+        }
+        return .verified
+    }
+
+    private func authenticatedBackupData(at backupURL: URL, job: Job, plistURL: URL) throws -> Data {
+        let metadataData = try readData(at: metadataURL(for: backupURL))
+        let backupData = try readData(at: backupURL)
+        let metadata: BackupMetadata
+        do {
+            metadata = try JSONDecoder().decode(BackupMetadata.self, from: metadataData)
+        } catch {
+            throw JobWrapperError(
+                message: "Backup metadata at \(metadataURL(for: backupURL).path) is not authenticated"
+            )
+        }
+        switch backupValidation(
+            metadata: metadata,
+            backupData: backupData,
+            job: job,
+            plistURL: plistURL
+        ) {
+        case .verified:
+            return backupData
+        case .contentMismatch:
+            throw JobWrapperError(
+                message: "Backup content at \(backupURL.path) changed after it was recorded; refusing to restore it"
+            )
+        case .unverified:
+            throw JobWrapperError(
+                message: "Backup metadata at \(metadataURL(for: backupURL).path) has no valid content digest"
+            )
+        }
     }
 
     private func persistBackupWithMetadata(
@@ -451,9 +586,11 @@ public final class JobWrapper {
     ) throws {
         try persistBackup(data, to: backupURL)
         let metadata = BackupMetadata(
-            version: 1,
+            version: 2,
             jobID: job.id,
-            sourcePlistPath: plistURL.standardizedFileURL.path
+            sourcePlistPath: canonicalPath(plistURL),
+            backupByteCount: data.count,
+            backupSHA256: sha256(data)
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -465,65 +602,6 @@ public final class JobWrapper {
         }
     }
 
-    private func migrateLegacyBackupIfSafe(
-        job: Job,
-        plistURL: URL,
-        wrappedDictionary: [String: Any],
-        decodedWrapper: (label: String, original: [String], argv0: String?)
-    ) throws -> URL? {
-        guard let sqliteStore = store as? SQLiteRunStore,
-              let path = try sqliteStore.managedBackupPath(jobID: job.id) else {
-            return nil
-        }
-        let backupURL = URL(fileURLWithPath: path).standardizedFileURL
-        guard fileManager.fileExists(atPath: backupURL.path),
-              !fileManager.fileExists(atPath: metadataURL(for: backupURL).path),
-              legacyBackup(
-                  backupURL,
-                  matches: wrappedDictionary,
-                  decodedWrapper: decodedWrapper,
-                  jobID: job.id
-              ) else {
-            return nil
-        }
-
-        let metadata = BackupMetadata(
-            version: 1,
-            jobID: job.id,
-            sourcePlistPath: plistURL.standardizedFileURL.path
-        )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        try persistBackup(try encoder.encode(metadata), to: metadataURL(for: backupURL))
-        return backupURL
-    }
-
-    private func legacyBackup(
-        _ backupURL: URL,
-        matches wrappedDictionary: [String: Any],
-        decodedWrapper: (label: String, original: [String], argv0: String?),
-        jobID: String
-    ) -> Bool {
-        guard decodedWrapper.label == jobID,
-              let data = try? Data(contentsOf: backupURL),
-              let value = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
-              let backupDictionary = value as? [String: Any],
-              let backupExecution = try? execution(from: backupDictionary, fallback: [], jobID: jobID),
-              backupExecution == OriginalExecution(
-                  command: decodedWrapper.original,
-                  argv0: decodedWrapper.argv0
-              ) else {
-            return false
-        }
-
-        var backupRemainder = backupDictionary
-        backupRemainder.removeValue(forKey: "Program")
-        backupRemainder.removeValue(forKey: "ProgramArguments")
-        var wrappedRemainder = wrappedDictionary
-        wrappedRemainder.removeValue(forKey: "Program")
-        wrappedRemainder.removeValue(forKey: "ProgramArguments")
-        return NSDictionary(dictionary: backupRemainder).isEqual(to: wrappedRemainder)
-    }
 
     private func execution(
         from dictionary: [String: Any],
@@ -568,24 +646,88 @@ public final class JobWrapper {
         return restored
     }
 
-    private func migrateWrapperPathIfNeeded(
+    private func migrateWrapperIfNeeded(
         dictionary: inout [String: Any],
         format: PropertyListSerialization.PropertyListFormat,
         plistURL: URL,
+        job: Job,
         tickerPath: String
     ) throws {
-        guard var arguments = dictionary["ProgramArguments"] as? [String],
-              LaunchdWrapper.decode(arguments) != nil,
-              arguments[0] != tickerPath else {
+        guard let arguments = dictionary["ProgramArguments"] as? [String],
+              let decoded = LaunchdWrapper.decode(arguments) ?? LaunchdWrapper.decodeLegacy(arguments) else {
             return
         }
-        arguments[0] = tickerPath
-        dictionary["ProgramArguments"] = arguments
+        let expected = wrapperArguments(
+            tickerPath: tickerPath,
+            jobID: job.id,
+            original: decoded.original,
+            argv0: decoded.argv0
+        )
+        guard arguments != expected else {
+            return
+        }
+        dictionary["ProgramArguments"] = expected
         try beforeSourceRewrite?()
         try writeRewrittenData(
             try serializedData(dictionary, format: format, plistURL: plistURL),
             to: plistURL
         )
+    }
+
+    private func wrapperArguments(
+        tickerPath: String,
+        jobID: String,
+        original: [String],
+        argv0: String?
+    ) -> [String] {
+        var arguments = [
+            tickerPath,
+            "run",
+            "--ticker-wrapper-version",
+            LaunchdWrapper.currentVersion,
+            "--label",
+            jobID,
+        ]
+        if let argv0 {
+            arguments += ["--argv0", argv0]
+        }
+        arguments += ["--"] + original
+        return arguments
+    }
+
+    private func acceptedWrapperLabels(for job: Job) -> Set<String> {
+        return acceptedBackupJobIDs(for: job)
+    }
+
+    private func acceptedBackupJobIDs(for job: Job) -> Set<String> {
+        var result: Set<String> = [job.id]
+        if let legacy = legacyJobID(for: job) {
+            result.insert(legacy)
+        }
+        return result
+    }
+
+    private func legacyJobID(for job: Job) -> String? {
+        guard job.source == .launchd || job.source == .claudeRoutine,
+              let separator = job.id.lastIndex(of: "#") else {
+            return nil
+        }
+        let suffix = job.id[job.id.index(after: separator)...]
+        guard suffix.count == 12,
+              suffix.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+            return nil
+        }
+        return String(job.id[..<separator])
+    }
+
+    private func canonicalPath(_ url: URL) -> String {
+        return url.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    private func sha256(_ data: Data) -> String {
+        return SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     private func persistBackup(_ data: Data, to backupURL: URL) throws {

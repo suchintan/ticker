@@ -3,6 +3,26 @@ import Foundation
 import SwiftUI
 import TickerCore
 
+struct JobRunNowPresentation: Equatable {
+    let isEnabled: Bool
+    let helpText: String
+    let disabledTitle: String?
+    let disabledDetail: String?
+
+    init(job: Job, busy: Bool) {
+        isEnabled = !busy && job.canRunNow
+        if job.canRunNow {
+            helpText = "Run this job now."
+            disabledTitle = nil
+            disabledDetail = nil
+        } else {
+            helpText = "Ticker observes this job but cannot faithfully re-run it. Trigger it from Claude."
+            disabledTitle = "Claude routines cannot run from Ticker"
+            disabledDetail = "Ticker observes Claude routines but cannot faithfully re-run them. Trigger this routine from Claude."
+        }
+    }
+}
+
 struct JobDetailView: View {
     @ObservedObject var model: AppModel
     let job: Job
@@ -60,10 +80,9 @@ struct JobDetailView: View {
                 Spacer()
                 DetailOutcomeBadge(outcome: model.outcome(for: job))
             }
-            Text(job.id)
-                .font(.system(.caption, design: .monospaced))
+            Text(job.source == .claudeRoutine ? "Claude routine" : job.source.rawValue)
+                .font(.caption)
                 .foregroundColor(.secondary)
-                .textSelection(.enabled)
         }
     }
 
@@ -89,15 +108,25 @@ struct JobDetailView: View {
             )
         }
 
-        if job.source == .claudeRoutine, !job.canRunNow {
+        let runNow = JobRunNowPresentation(job: job, busy: model.busyJobIDs.contains(job.id))
+        if let title = runNow.disabledTitle, let detail = runNow.disabledDetail {
             DetailCallout(
                 color: .blue,
                 icon: "play.slash.fill",
-                title: "Claude routines cannot run from Ticker",
-                detail: "Ticker observes Claude routines but cannot faithfully re-run them. Trigger this routine from Claude."
+                title: title,
+                detail: detail
             )
         }
 
+
+        if let explanation = job.runtimeStatusExplanation {
+            DetailCallout(
+                color: .orange,
+                icon: "questionmark.diamond.fill",
+                title: "Runtime status is ambiguous",
+                detail: explanation
+            )
+        }
         if job.source == .launchd {
             if let recoveryError = model.recoveryStateError(for: job) {
                 DetailCallout(
@@ -115,12 +144,33 @@ struct JobDetailView: View {
                         title: "History wrapper needs repair",
                         detail: "Ticker found its wrapper but no verified backup. Repair the wrapper before you can safely restore this job."
                     )
-                case .wrappedForeignLabel(let embeddedJobID):
+                case .wrappedBackupContentMismatch:
+                    DetailCallout(
+                        color: .red,
+                        icon: "exclamationmark.shield.fill",
+                        title: "Backup integrity check failed",
+                        detail: "Ticker's backup does not match its authenticated metadata. Ticker will not rewrite or restore this plist."
+                    )
+                case .wrappedBackupUnverified:
+                    DetailCallout(
+                        color: .orange,
+                        icon: "questionmark.diamond.fill",
+                        title: "Backup cannot be verified",
+                        detail: "Ticker's backup has no valid content digest. Explicit recovery is required before Ticker can modify this plist."
+                    )
+                case .ambiguousTickerInvocation:
+                    DetailCallout(
+                        color: .red,
+                        icon: "exclamationmark.triangle.fill",
+                        title: "Unverified ticker command",
+                        detail: "This plist invokes an executable named ticker without Ticker's version marker. Ticker will not modify it."
+                    )
+                case .wrappedForeignLabel:
                     DetailCallout(
                         color: .red,
                         icon: "exclamationmark.triangle.fill",
                         title: "Unsafe wrapper label",
-                        detail: "This plist contains a Ticker wrapper for \(embeddedJobID). Ticker will not modify it."
+                        detail: "This plist contains a Ticker wrapper for another job. Ticker will not modify it."
                     )
                 case .staleManagedRow:
                     DetailCallout(
@@ -164,18 +214,18 @@ struct JobDetailView: View {
 
     private var actionButtons: some View {
         let busy = model.busyJobIDs.contains(job.id)
+        let presentation = JobRunNowPresentation(
+            job: job,
+            busy: busy
+        )
         return HStack(spacing: 8) {
             Button {
                 model.runNow(job)
             } label: {
                 Label("Run Now", systemImage: "play.fill")
             }
-            .disabled(busy || !job.canRunNow)
-            .help(
-                job.canRunNow
-                    ? "Run this job now."
-                    : "Ticker observes this job but cannot faithfully re-run it. Trigger it from Claude."
-            )
+            .disabled(!presentation.isEnabled)
+            .help(presentation.helpText)
 
             Button {
                 revealConfig()

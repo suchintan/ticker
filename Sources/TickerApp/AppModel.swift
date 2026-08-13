@@ -151,6 +151,19 @@ final class AppModel: ObservableObject {
             }
 
             var refreshErrors = discovery.errors.map { $0.localizedDescription }
+
+            if discovery.errors.isEmpty {
+                do {
+                    _ = try self.store.migrateLegacyJobIDs(
+                        discoveredJobs: discovery.jobs,
+                        discoveryComplete: discovery.errors.isEmpty
+                    )
+                } catch {
+                    refreshErrors.append(
+                        "Could not migrate legacy job history: \(error.localizedDescription)"
+                    )
+                }
+            }
             var latestHealth: [String: Outcome]?
             var latestRecoveryStates: [String: JobRecoveryState] = [:]
             var latestRecoveryErrors: [String: String] = [:]
@@ -206,9 +219,10 @@ final class AppModel: ObservableObject {
 
     func isManaged(_ job: Job) -> Bool {
         switch recoveryStates[job.id] {
-        case .wrappedConsistent, .wrappedMissingBackup:
+        case .wrappedConsistent, .wrappedMissingBackup,
+             .wrappedBackupContentMismatch, .wrappedBackupUnverified:
             return true
-        case .unwrapped, .wrappedForeignLabel, .staleManagedRow, .none:
+        case .unwrapped, .wrappedForeignLabel, .ambiguousTickerInvocation, .staleManagedRow, .none:
             return false
         }
     }
@@ -228,10 +242,13 @@ final class AppModel: ObservableObject {
         else {
             return false
         }
-        if case .wrappedForeignLabel = state {
+        switch state {
+        case .wrappedForeignLabel, .wrappedBackupContentMismatch,
+             .wrappedBackupUnverified, .ambiguousTickerInvocation:
             return false
+        case .unwrapped, .wrappedConsistent, .wrappedMissingBackup, .staleManagedRow:
+            return true
         }
-        return true
     }
 
     func wrappingButtonTitle(for job: Job) -> String {
@@ -245,6 +262,12 @@ final class AppModel: ObservableObject {
             return "Unwrap for history"
         case .wrappedMissingBackup:
             return "Repair history wrapper"
+        case .wrappedBackupContentMismatch:
+            return "Unsafe backup"
+        case .wrappedBackupUnverified:
+            return "Unverified backup"
+        case .ambiguousTickerInvocation:
+            return "Unverified ticker command"
         case .wrappedForeignLabel:
             return "Unsafe wrapper"
         case .none:
@@ -258,7 +281,8 @@ final class AppModel: ObservableObject {
             return "arrow.uturn.backward"
         case .wrappedMissingBackup:
             return "wrench.and.screwdriver"
-        case .wrappedForeignLabel:
+        case .wrappedBackupContentMismatch, .wrappedBackupUnverified,
+             .ambiguousTickerInvocation, .wrappedForeignLabel:
             return "exclamationmark.triangle"
         case .unwrapped, .staleManagedRow, .none:
             return "clock.arrow.2.circlepath"
@@ -305,7 +329,11 @@ final class AppModel: ObservableObject {
             guard let tickerPath = resolveTickerCLIPath() else {
                 throw TickerAppError.tickerCLINotFound
             }
-            let processCommand = [tickerPath, "run", "--label", job.id, "--"] + job.command
+            var processCommand = [tickerPath, "run", "--label", job.id]
+            if let argv0 = job.argv0 {
+                processCommand += ["--argv0", argv0]
+            }
+            processCommand += ["--"] + job.command
 
             guard let executable = resolveExecutable(processCommand[0]) else {
                 throw TickerAppError.executableNotFound(processCommand[0])
@@ -373,8 +401,9 @@ final class AppModel: ObservableObject {
                     }
                     commands = try self.wrapper.wrap(job: job, tickerPath: tickerPath)
                     verb = recoveryState == .wrappedMissingBackup ? "Repaired" : "Wrapped"
-                case .wrappedForeignLabel(let embeddedJobID):
-                    throw TickerAppError.unsafeWrapper(embeddedJobID)
+                case .wrappedBackupContentMismatch, .wrappedBackupUnverified,
+                     .ambiguousTickerInvocation, .wrappedForeignLabel:
+                    throw TickerAppError.unsafeWrapper
                 }
 
                 let message = "\(verb) the configuration. Reload it with:\n\(commands.unload)\n\(commands.load)"
@@ -441,7 +470,7 @@ final class AppModel: ObservableObject {
 private enum TickerAppError: LocalizedError {
     case executableNotFound(String)
     case tickerCLINotFound
-    case unsafeWrapper(String)
+    case unsafeWrapper
 
     var errorDescription: String? {
         switch self {
@@ -449,8 +478,8 @@ private enum TickerAppError: LocalizedError {
             return "Executable not found: \(command)"
         case .tickerCLINotFound:
             return "The ticker CLI was not found in the app bundle or PATH."
-        case .unsafeWrapper(let embeddedJobID):
-            return "This plist contains a Ticker wrapper for \(embeddedJobID); refusing to modify it."
+        case .unsafeWrapper:
+            return "This plist contains a Ticker wrapper for another job; refusing to modify it."
         }
     }
 }

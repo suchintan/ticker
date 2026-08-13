@@ -13,15 +13,21 @@ public enum Outcome: String, Codable {
     case unknown
 }
 
+public enum RuntimeStatusAttribution: String, Codable, Hashable {
+    case ambiguous
+}
+
 public struct Job: Identifiable, Codable, Hashable {
     public let id: String
     public let source: JobSource
     public let label: String
     public let schedule: Schedule
     public let command: [String]
+    public let argv0: String?
     public let environment: [String: String]
     public let cwd: String?
     public let enabled: Bool
+    public let runtimeStatusAttribution: RuntimeStatusAttribution?
     public let configPath: String?
     public let lastKnownExit: ExitStatus?
     public let lastRunAt: Date?
@@ -34,9 +40,11 @@ public struct Job: Identifiable, Codable, Hashable {
         label: String,
         schedule: Schedule,
         command: [String],
+        argv0: String? = nil,
         environment: [String: String] = [:],
         cwd: String?,
         enabled: Bool,
+        runtimeStatusAttribution: RuntimeStatusAttribution? = nil,
         configPath: String?,
         lastKnownExit: ExitStatus?,
         lastRunAt: Date?,
@@ -48,9 +56,11 @@ public struct Job: Identifiable, Codable, Hashable {
         self.label = label
         self.schedule = schedule
         self.command = command
+        self.argv0 = argv0
         self.environment = environment
         self.cwd = cwd
         self.enabled = enabled
+        self.runtimeStatusAttribution = runtimeStatusAttribution
         self.configPath = configPath
         self.lastKnownExit = lastKnownExit
         self.lastRunAt = lastRunAt
@@ -66,6 +76,13 @@ public struct Job: Identifiable, Codable, Hashable {
         !command.isEmpty
     }
 
+    public var runtimeStatusExplanation: String? {
+        guard runtimeStatusAttribution == .ambiguous else {
+            return nil
+        }
+        return "Multiple launchd plists use this label, so Ticker cannot determine which plist owns launchd's loaded state or last exit status."
+    }
+
     public var skew: TimeInterval? {
         guard let lastRunAt = lastRunAt, let lastScheduledFor = lastScheduledFor else {
             return nil
@@ -79,9 +96,11 @@ public struct Job: Identifiable, Codable, Hashable {
         case label
         case schedule
         case command
+        case argv0
         case environment
         case cwd
         case enabled
+        case runtimeStatusAttribution
         case configPath
         case lastKnownExit
         case lastRunAt

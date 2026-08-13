@@ -65,8 +65,23 @@ internal func runAdapterCommand(executable: URL, arguments: [String]) throws -> 
 }
 
 public enum LaunchdWrapper {
+    public static let currentVersion = "1"
+
     public static func decode(
         _ argv: [String]
+    ) -> (label: String, original: [String], argv0: String?)? {
+        decode(argv, requiresVersionMarker: true)
+    }
+
+    public static func decodeLegacy(
+        _ argv: [String]
+    ) -> (label: String, original: [String], argv0: String?)? {
+        decode(argv, requiresVersionMarker: false)
+    }
+
+    private static func decode(
+        _ argv: [String],
+        requiresVersionMarker: Bool
     ) -> (label: String, original: [String], argv0: String?)? {
         guard argv.count >= 5,
               URL(fileURLWithPath: argv[0]).lastPathComponent == "ticker",
@@ -75,11 +90,21 @@ public enum LaunchdWrapper {
             return nil
         }
 
+        var wrapperVersion: String?
         var label: String?
         var originalArgv0: String?
         var index = 2
         while index < argv.count, argv[index] != "--" {
             switch argv[index] {
+            case "--ticker-wrapper-version":
+                guard requiresVersionMarker,
+                      wrapperVersion == nil,
+                      index + 1 < argv.count
+                else {
+                    return nil
+                }
+                wrapperVersion = argv[index + 1]
+                index += 2
             case "--label":
                 guard index + 1 < argv.count else {
                     return nil
@@ -97,7 +122,8 @@ public enum LaunchdWrapper {
             }
         }
 
-        guard let label,
+        guard (!requiresVersionMarker || wrapperVersion == currentVersion),
+              let label,
               index < argv.count,
               argv[index] == "--",
               index + 1 < argv.count
@@ -115,6 +141,7 @@ public final class LaunchdAdapter: JobSourceAdapter {
         let label: String
         let schedule: Schedule
         let command: [String]
+        let argv0: String?
         let environment: [String: String]
         let managed: Bool
         let cwd: String?
@@ -151,7 +178,7 @@ public final class LaunchdAdapter: JobSourceAdapter {
     ) {
         var seenPaths = Set<String>()
         self.searchDirectories = searchDirectories
-            .map(\.standardizedFileURL)
+            .map { $0.standardizedFileURL.resolvingSymlinksInPath() }
             .filter { seenPaths.insert($0.path).inserted }
             .sorted { $0.path < $1.path }
         self.launchctlURL = launchctlURL
@@ -171,8 +198,14 @@ public final class LaunchdAdapter: JobSourceAdapter {
 
         let loadedLabels = parseLoadedLabels(listResult.stdout)
         let configurations = loadConfigurations()
-        let labelCounts = Dictionary(grouping: configurations, by: \.label).mapValues(\.count)
-        let labelsNeedingStatus = Set(configurations.map(\.label)).intersection(loadedLabels)
+        let duplicateLabels = Set(
+            Dictionary(grouping: configurations, by: \.label)
+                .filter { $0.value.count > 1 }
+                .keys
+        )
+        let labelsNeedingStatus = Set(configurations.map(\.label))
+            .subtracting(duplicateLabels)
+            .intersection(loadedLabels)
         var exitStatuses: [String: ExitStatus] = [:]
 
         for label in labelsNeedingStatus.sorted() {
@@ -183,20 +216,19 @@ public final class LaunchdAdapter: JobSourceAdapter {
         }
 
         return configurations.map { configuration in
-            let isLoaded = loadedLabels.contains(configuration.label)
+            let hasAmbiguousRuntimeStatus = duplicateLabels.contains(configuration.label)
+            let isLoaded = !hasAmbiguousRuntimeStatus && loadedLabels.contains(configuration.label)
             return Job(
-                id: jobID(
-                    label: configuration.label,
-                    configPath: configuration.configPath,
-                    hasCollision: labelCounts[configuration.label, default: 0] > 1
-                ),
+                id: jobID(label: configuration.label, configPath: configuration.configPath),
                 source: .launchd,
                 label: configuration.label,
                 schedule: configuration.schedule,
                 command: configuration.command,
+                argv0: configuration.argv0,
                 environment: configuration.environment,
                 cwd: configuration.cwd,
                 enabled: isLoaded && !configuration.disabled && !configuration.manuallyDisabled,
+                runtimeStatusAttribution: hasAmbiguousRuntimeStatus ? .ambiguous : nil,
                 configPath: configuration.configPath,
                 lastKnownExit: isLoaded ? exitStatuses[configuration.label] : nil,
                 lastRunAt: nil,
@@ -274,25 +306,33 @@ public final class LaunchdAdapter: JobSourceAdapter {
             let program = dictionary["Program"] as? String
             let programArguments = dictionary["ProgramArguments"] as? [String]
             let literalCommand: [String]
+            let literalArgv0: String?
             if let program, !program.isEmpty {
                 if let programArguments, !programArguments.isEmpty {
                     literalCommand = [program] + programArguments.dropFirst()
+                    literalArgv0 = programArguments[0] == program ? nil : programArguments[0]
                 } else {
                     literalCommand = [program]
+                    literalArgv0 = nil
                 }
             } else if let programArguments, !programArguments.isEmpty {
                 literalCommand = programArguments
+                literalArgv0 = nil
             } else {
                 literalCommand = []
+                literalArgv0 = nil
             }
-            let decodedWrapper = LaunchdWrapper.decode(programArguments ?? [])
+            let versionedWrapper = LaunchdWrapper.decode(programArguments ?? [])
+            let observedWrapper = versionedWrapper
+                ?? LaunchdWrapper.decodeLegacy(programArguments ?? [])
 
             return ParsedConfiguration(
                 label: label,
                 schedule: parseSchedule(dictionary),
-                command: decodedWrapper?.original ?? literalCommand,
+                command: observedWrapper?.original ?? literalCommand,
+                argv0: observedWrapper?.argv0 ?? literalArgv0,
                 environment: parseEnvironment(dictionary["EnvironmentVariables"]),
-                managed: decodedWrapper != nil,
+                managed: versionedWrapper != nil,
                 cwd: dictionary["WorkingDirectory"] as? String,
                 standardOutPath: dictionary["StandardOutPath"] as? String,
                 standardErrorPath: dictionary["StandardErrorPath"] as? String,
@@ -300,7 +340,7 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 keepAlive: parseKeepAlive(dictionary["KeepAlive"]),
                 disabled: (dictionary["Disabled"] as? Bool) ?? false,
                 manuallyDisabled: manuallyDisabled,
-                configPath: file.standardizedFileURL.path
+                configPath: file.standardizedFileURL.resolvingSymlinksInPath().path
             )
         } catch {
             return nil
@@ -448,16 +488,11 @@ public final class LaunchdAdapter: JobSourceAdapter {
         }
         return nil
     }
-    private func jobID(label: String, configPath: String, hasCollision: Bool) -> String {
-        let base = "launchd:\(label)"
-        guard hasCollision else {
-            return base
-        }
-
+    private func jobID(label: String, configPath: String) -> String {
         let digest = SHA256.hash(data: Data(configPath.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
-        return "\(base)#\(digest.prefix(12))"
+        return "launchd:\(label)#\(digest.prefix(12))"
     }
 
 

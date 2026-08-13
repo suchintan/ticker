@@ -313,8 +313,10 @@ private func testLaunchdAdapter(_ tests: TestHarness) throws {
             [
                 "Label": "com.example.dictionary",
                 "ProgramArguments": [
-                    "/usr/local/bin/ticker", "run", "--label",
-                    "launchd:com.example.dictionary", "--", "/usr/bin/true", "--original-flag",
+                    "/usr/local/bin/ticker", "run",
+                    "--ticker-wrapper-version", LaunchdWrapper.currentVersion,
+                    "--label", "launchd:com.example.dictionary",
+                    "--", "/usr/bin/true", "--original-flag",
                 ],
                 "StartCalendarInterval": ["Hour": 4, "Minute": 30, "Weekday": 0],
             ],
@@ -408,12 +410,27 @@ private func testLaunchdAdapter(_ tests: TestHarness) throws {
 private func testLaunchdWrapperDecode(_ tests: TestHarness) throws {
     let decoded = try require(
         LaunchdWrapper.decode([
-            "ticker", "run", "--label", "launchd:com.example", "--", "/bin/bash", "/tmp/job.sh",
+            "ticker", "run", "--ticker-wrapper-version", LaunchdWrapper.currentVersion,
+            "--label", "launchd:com.example", "--", "/bin/bash", "/tmp/job.sh",
         ]),
-        "wrapped argv"
+        "versioned wrapped argv"
     )
     tests.expectEqual(decoded.label, "launchd:com.example", "LaunchdWrapper decodes the job label")
     tests.expectEqual(decoded.original, ["/bin/bash", "/tmp/job.sh"], "LaunchdWrapper decodes original argv")
+    tests.expectEqual(
+        LaunchdWrapper.decode([
+            "ticker", "run", "--label", "launchd:com.example", "--", "/bin/bash",
+        ])?.label,
+        nil,
+        "LaunchdWrapper requires versioned provenance"
+    )
+    tests.expectEqual(
+        LaunchdWrapper.decodeLegacy([
+            "ticker", "run", "--label", "launchd:com.example", "--", "/bin/bash",
+        ])?.label,
+        "launchd:com.example",
+        "LaunchdWrapper explicitly recognizes legacy wrappers"
+    )
     tests.expectEqual(
         LaunchdWrapper.decode(["/bin/bash", "/tmp/job.sh"])?.label,
         nil,
@@ -421,7 +438,8 @@ private func testLaunchdWrapperDecode(_ tests: TestHarness) throws {
     )
     tests.expectEqual(
         LaunchdWrapper.decode([
-            "/usr/local/bin/ticker-helper", "run", "--label", "launchd:com.example", "--", "/bin/bash",
+            "/usr/local/bin/ticker-helper", "run", "--ticker-wrapper-version",
+            LaunchdWrapper.currentVersion, "--label", "launchd:com.example", "--", "/bin/bash",
         ])?.label,
         nil,
         "LaunchdWrapper rejects near-miss executables"
@@ -508,7 +526,13 @@ private func testClaudeAdapter(_ tests: TestHarness) throws {
         let jobs = try adapter.discover()
         tests.expectEqual(jobs.count, 1, "Claude routines dedupe across files and tolerate empty files")
         let job = try require(jobs.first, "deduped Claude job")
-        tests.expectEqual(job.id, "claude:daily-summary", "Claude routine id is stable")
+        tests.expect(
+            job.id.range(
+                of: #"^claude:daily-summary#[0-9a-f]{12}$"#,
+                options: .regularExpression
+            ) != nil,
+            "Claude routine id always includes its account-directory digest"
+        )
         tests.expectEqual(job.cwd, "/tmp/project-new", "Claude routine dedupe keeps the newest run")
         tests.expectNear(
             try require(job.lastRunAt, "Claude lastRunAt").timeIntervalSince1970,
@@ -517,7 +541,7 @@ private func testClaudeAdapter(_ tests: TestHarness) throws {
             "Claude fractional-second ISO-8601 timestamp is parsed"
         )
         let skips = try adapter.skips()
-        let records = try require(skips["claude:daily-summary"], "Claude skips")
+        let records = try require(skips[job.id], "Claude skips")
         tests.expectEqual(records.count, 1, "Claude skip records are loaded")
         tests.expectNear(
             try require(records.first, "first Claude skip").at.timeIntervalSince1970,
@@ -1647,18 +1671,6 @@ private func test2B_ClaudeRunNowDisabled(_ tests: TestHarness) throws {
         )
     }
 
-    let detailSourceURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        .appendingPathComponent("Sources/TickerApp/JobDetailView.swift")
-    let detailSource = try String(contentsOf: detailSourceURL, encoding: .utf8)
-    tests.expect(
-        detailSource.contains(".disabled(busy || !job.canRunNow)"),
-        "test2B detail view uses the tested Run Now predicate"
-    )
-    tests.expect(
-        detailSource.contains("Ticker observes Claude routines but cannot faithfully re-run them.")
-            && detailSource.contains("Trigger this routine from Claude."),
-        "test2B detail view explains how to trigger Claude routines"
-    )
 }
 
 private func test2B_ClaudeSnapshotOrdering(_ tests: TestHarness) throws {
@@ -1773,23 +1785,22 @@ private func test2B_ClaudeSnapshotOrdering(_ tests: TestHarness) throws {
                 ofItemAtPath: test2B_scheduledTasksURL(root: root, session: "session").path
             )
         }
-        let forward = try require(
-            try ClaudeRoutineAdapter(searchRoots: [rootA, rootZ]).discover().first,
-            "test2B forward root order"
-        )
-        let reversed = try require(
-            try ClaudeRoutineAdapter(searchRoots: [rootZ, rootA]).discover().first,
-            "test2B reversed root order"
+        let forward = try ClaudeRoutineAdapter(searchRoots: [rootA, rootZ]).discover()
+        let reversed = try ClaudeRoutineAdapter(searchRoots: [rootZ, rootA]).discover()
+        tests.expectEqual(
+            forward.count,
+            2,
+            "test2B distinct absolute account directories remain distinct identities"
         )
         tests.expectEqual(
-            forward.cwd,
-            "/tmp/path-z",
-            "test2B final snapshot path tie-break has a defined winner"
+            Set(forward.compactMap(\.cwd)),
+            Set(["/tmp/path-a", "/tmp/path-z"]),
+            "test2B cross-root account directories retain both snapshots"
         )
         tests.expectEqual(
-            reversed.cwd,
-            forward.cwd,
-            "test2B never-run snapshots resolve identically regardless of root order"
+            forward,
+            reversed,
+            "test2B account-path identities resolve identically regardless of root order"
         )
     }
 }
@@ -1820,10 +1831,15 @@ private func test2B_ClaudeSkipDeduplication(_ tests: TestHarness) throws {
                 ],
             ]
         )
-        let records = try require(
-            try ClaudeRoutineAdapter(searchRoots: [root]).skips()["claude:daily-summary"],
-            "test2B deduplicated skips"
+        let skips = try ClaudeRoutineAdapter(searchRoots: [root]).skips()
+        tests.expect(
+            skips.keys.first?.range(
+                of: #"^claude:daily-summary#[0-9a-f]{12}$"#,
+                options: .regularExpression
+            ) != nil,
+            "test2B skip-only Claude task uses its account-directory digest"
         )
+        let records = try require(skips.values.first, "test2B deduplicated skips")
         tests.expectEqual(records.count, 3, "test2B copied snapshot skips are deduplicated")
         tests.expectEqual(
             Set(records.filter { $0.at.timeIntervalSince1970 == 2 }.map(\.reason)),
@@ -2063,7 +2079,244 @@ private func test3B_ClaudeAccountScopedIDs(_ tests: TestHarness) throws {
     }
 }
 
-private func test3B_AppBehavior(_ tests: TestHarness) throws {
+private func test4B_LaunchdIdentityExecutionAndAmbiguity(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round4b-launchd") { root in
+        let primaryDirectory = root.appendingPathComponent("primary", isDirectory: true)
+        let duplicateDirectory = root.appendingPathComponent("duplicate", isDirectory: true)
+        try FileManager.default.createDirectory(at: primaryDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: duplicateDirectory, withIntermediateDirectories: true)
+
+        let primaryPlist = primaryDirectory.appendingPathComponent("stable.plist")
+        try writePropertyList(
+            [
+                "Label": "com.example.stable",
+                "Program": "/bin/sh",
+                "ProgramArguments": ["nightly-shell", "-c", "exit 0"],
+            ],
+            to: primaryPlist
+        )
+
+        var detailedStatusQueries = 0
+        let runner: AdapterCommandRunner = { _, arguments in
+            if arguments == ["list"] {
+                return AdapterCommandResult(
+                    status: 0,
+                    stdout: "PID\tStatus\tLabel\n88\t256\tcom.example.stable\n",
+                    stderr: ""
+                )
+            }
+            if arguments == ["list", "com.example.stable"] {
+                detailedStatusQueries += 1
+                return AdapterCommandResult(
+                    status: 0,
+                    stdout: "{\n\t\"LastExitStatus\" = 256;\n}\n",
+                    stderr: ""
+                )
+            }
+            return AdapterCommandResult(status: 1, stdout: "", stderr: "unexpected launchctl request")
+        }
+
+        let adapter = LaunchdAdapter(
+            searchDirectories: [primaryDirectory, duplicateDirectory],
+            commandRunner: runner
+        )
+        let initial = try require(adapter.discover().first, "test4B initial launchd job")
+        tests.expect(
+            initial.id.range(
+                of: #"^launchd:com\.example\.stable#[0-9a-f]{12}$"#,
+                options: .regularExpression
+            ) != nil,
+            "test4B unique launchd id always includes a canonical path digest"
+        )
+        tests.expectEqual(
+            initial.command,
+            ["/bin/sh", "-c", "exit 0"],
+            "test4B launchd Program remains the executable"
+        )
+        tests.expectEqual(
+            initial.argv0,
+            "nightly-shell",
+            "test4B launchd preserves ProgramArguments[0] as explicit argv0"
+        )
+        tests.expectEqual(
+            initial.lastKnownExit?.code,
+            1,
+            "test4B unique loaded launchd job receives its exit status"
+        )
+        let encoded = try JSONEncoder().encode(initial)
+        tests.expectEqual(
+            try JSONDecoder().decode(Job.self, from: encoded).argv0,
+            "nightly-shell",
+            "test4B Job Codable preserves explicit argv0"
+        )
+
+        let duplicatePlist = duplicateDirectory.appendingPathComponent("stable.plist")
+        try writePropertyList(
+            [
+                "Label": "com.example.stable",
+                "ProgramArguments": ["/usr/bin/true"],
+            ],
+            to: duplicatePlist
+        )
+        detailedStatusQueries = 0
+        let withDuplicate = try adapter.discover().filter { $0.label == "com.example.stable" }
+        tests.expectEqual(withDuplicate.count, 2, "test4B duplicate-label launchd jobs both remain visible")
+        tests.expectEqual(
+            Set(withDuplicate.map(\.id)).count,
+            2,
+            "test4B same-label launchd plists receive distinct canonical path ids"
+        )
+        let initialWithDuplicate = try require(
+            withDuplicate.first { $0.configPath == initial.configPath },
+            "test4B original launchd job after duplicate appears"
+        )
+        tests.expectEqual(
+            initialWithDuplicate.id,
+            initial.id,
+            "test4B adding a duplicate does not change the original launchd id"
+        )
+        tests.expect(
+            withDuplicate.allSatisfy { $0.runtimeStatusAttribution == .ambiguous },
+            "test4B duplicate-label launchd jobs are marked runtime-ambiguous"
+        )
+        tests.expect(
+            withDuplicate.allSatisfy { $0.lastKnownExit == nil },
+            "test4B no duplicate-label plist claims the shared launchctl exit status"
+        )
+        tests.expect(
+            withDuplicate.allSatisfy { !$0.enabled },
+            "test4B no duplicate-label plist claims the shared launchctl loaded state"
+        )
+        tests.expectEqual(
+            detailedStatusQueries,
+            0,
+            "test4B ambiguous labels do not query and misattribute label-level exit status"
+        )
+        tests.expect(
+            withDuplicate.allSatisfy {
+                $0.runtimeStatusExplanation?.contains("cannot determine which plist") == true
+            },
+            "test4B ambiguous runtime status includes an explicit explanation"
+        )
+        let repeatedByPath = Dictionary(
+            uniqueKeysWithValues: try adapter.discover()
+                .filter { $0.label == "com.example.stable" }
+                .map { ($0.configPath ?? "", $0.id) }
+        )
+        let firstByPath = Dictionary(
+            uniqueKeysWithValues: withDuplicate.map { ($0.configPath ?? "", $0.id) }
+        )
+        tests.expectEqual(
+            repeatedByPath,
+            firstByPath,
+            "test4B duplicate-label launchd ids remain stable across scans"
+        )
+
+        try FileManager.default.removeItem(at: duplicatePlist)
+        let afterRemoval = try require(adapter.discover().first, "test4B launchd job after duplicate removal")
+        tests.expectEqual(
+            afterRemoval.id,
+            initial.id,
+            "test4B removing a duplicate does not change the original launchd id"
+        )
+
+        let aliasDirectory = root.appendingPathComponent("primary-alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: aliasDirectory, withDestinationURL: primaryDirectory)
+        let throughSymlink = try require(
+            LaunchdAdapter(searchDirectories: [aliasDirectory], commandRunner: runner).discover().first,
+            "test4B launchd job through symlinked directory"
+        )
+        tests.expectEqual(
+            throughSymlink.id,
+            initial.id,
+            "test4B launchd id hashes the symlink-resolved canonical plist path"
+        )
+    }
+}
+
+private func test4B_ClaudeTopologyIndependentIdentity(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round4b-claude") { root in
+        try test3B_writeScheduledTasks(
+            root: root,
+            account: "account-alpha",
+            session: "session-one",
+            object: [
+                "scheduledTasks": [[
+                    "id": "daily-summary",
+                    "cronExpression": "5 8 * * *",
+                    "enabled": true,
+                    "filePath": "/tmp/account-alpha/SKILL.md",
+                    "cwd": "/tmp/account-alpha",
+                ] as [String: Any]],
+            ]
+        )
+        let adapter = ClaudeRoutineAdapter(searchRoots: [root])
+        let alphaAlone = try require(adapter.discover().first, "test4B single-account Claude task")
+        tests.expect(
+            alphaAlone.id.range(
+                of: #"^claude:daily-summary#[0-9a-f]{12}$"#,
+                options: .regularExpression
+            ) != nil,
+            "test4B unique Claude task id always includes an account-directory digest"
+        )
+
+        try test3B_writeScheduledTasks(
+            root: root,
+            account: "account-beta",
+            session: "session-two",
+            object: [
+                "scheduledTasks": [[
+                    "id": "daily-summary",
+                    "cronExpression": "35 18 * * *",
+                    "enabled": true,
+                    "filePath": "/tmp/account-beta/SKILL.md",
+                    "cwd": "/tmp/account-beta",
+                ] as [String: Any]],
+            ]
+        )
+        let bothAccounts = try adapter.discover()
+        let alphaWithSibling = try require(
+            bothAccounts.first { $0.cwd == "/tmp/account-alpha" },
+            "test4B alpha Claude task with sibling"
+        )
+        tests.expectEqual(
+            alphaWithSibling.id,
+            alphaAlone.id,
+            "test4B adding a second Claude account does not change the first task id"
+        )
+        tests.expectEqual(
+            Set(bothAccounts.map(\.id)).count,
+            2,
+            "test4B same Claude task id in two accounts receives distinct ids"
+        )
+
+        try FileManager.default.removeItem(
+            at: root.appendingPathComponent("account-beta", isDirectory: true)
+        )
+        let alphaAfterRemoval = try require(adapter.discover().first, "test4B Claude task after account removal")
+        tests.expectEqual(
+            alphaAfterRemoval.id,
+            alphaAlone.id,
+            "test4B removing a second Claude account does not change the first task id"
+        )
+
+        let rootAlias = root.deletingLastPathComponent()
+            .appendingPathComponent("round4b-claude-alias-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: rootAlias, withDestinationURL: root)
+        defer { try? FileManager.default.removeItem(at: rootAlias) }
+        let throughSymlink = try require(
+            ClaudeRoutineAdapter(searchRoots: [rootAlias]).discover().first,
+            "test4B Claude task through symlinked root"
+        )
+        tests.expectEqual(
+            throughSymlink.id,
+            alphaAlone.id,
+            "test4B Claude id hashes the symlink-resolved canonical account path"
+        )
+    }
+}
+
+private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
     try withTemporaryDirectory("round3b-app-behavior") { buildDirectory in
         let repository = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let swiftc = "/usr/bin/swiftc"
@@ -2137,10 +2390,35 @@ private func test3B_AppBehavior(_ tests: TestHarness) throws {
             }
         }
 
+        private final class StaticAdapter: JobSourceAdapter {
+            let source: JobSource
+            let jobs: [Job]
+
+            init(source: JobSource, jobs: [Job]) {
+                self.source = source
+                self.jobs = jobs
+            }
+
+            func discover() throws -> [Job] {
+                jobs
+            }
+        }
+
         @main
         private enum AppBehaviorHarness {
             @MainActor
             static func main() throws {
+                if CommandLine.arguments.count == 3,
+                   CommandLine.arguments[1] == "--capture-argv0" {
+                    try CommandLine.arguments[0].write(
+                        toFile: CommandLine.arguments[2],
+                        atomically: true,
+                        encoding: .utf8
+                    )
+                    return
+                }
+                let harnessPath = CommandLine.arguments[0]
+
                 let root = FileManager.default.temporaryDirectory
                     .appendingPathComponent("TickerAppHarness-\(UUID().uuidString)", isDirectory: true)
                 try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -2150,12 +2428,22 @@ private func test3B_AppBehavior(_ tests: TestHarness) throws {
                 try FileManager.default.createDirectory(at: appOnlyBin, withIntermediateDirectories: true)
                 let ticker = appOnlyBin.appendingPathComponent("ticker")
                 try """
-                #!/bin/sh
+                #!/bin/bash
+                argv0=
                 while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
-                    shift
+                    if [ "$1" = "--argv0" ]; then
+                        [ "$#" -ge 2 ] || exit 64
+                        argv0=$2
+                        shift 2
+                    else
+                        shift
+                    fi
                 done
                 [ "$#" -gt 0 ] || exit 64
                 shift
+                if [ -n "$argv0" ]; then
+                    exec -a "$argv0" "$@"
+                fi
                 exec "$@"
                 """.write(to: ticker, atomically: true, encoding: .utf8)
                 try FileManager.default.setAttributes(
@@ -2239,6 +2527,88 @@ private func test3B_AppBehavior(_ tests: TestHarness) throws {
                     "asynchronous Run Now completion was not published"
                 )
 
+                let argv0Output = root.appendingPathComponent("observed-argv0.txt")
+                let argv0Job = makeJob(
+                    id: "launchd:argv0",
+                    source: .launchd,
+                    environment: [:],
+                    command: [harnessPath, "--capture-argv0", argv0Output.path],
+                    argv0: "nightly-shell"
+                )
+                model.runNow(argv0Job)
+                try check(
+                    waitUntil {
+                        model.actionMessages[argv0Job.id]?.contains("exit code 0") == true
+                    },
+                    "Run Now with explicit argv0 did not finish"
+                )
+                let observedArgv0 = try String(contentsOf: argv0Output, encoding: .utf8)
+                try check(observedArgv0 == "nightly-shell", "Run Now discarded launchd's explicit argv0")
+
+                let claudeJob = makeJob(
+                    id: "claude:disabled",
+                    source: .claudeRoutine,
+                    environment: [:],
+                    command: []
+                )
+                let claudeRunNow = JobRunNowPresentation(job: claudeJob, busy: false)
+                try check(!claudeRunNow.isEnabled, "Claude Run Now presentation was enabled")
+                try check(
+                    claudeRunNow.disabledTitle == "Claude routines cannot run from Ticker",
+                    "Claude Run Now disabled title changed"
+                )
+                try check(
+                    claudeRunNow.disabledDetail
+                        == "Ticker observes Claude routines but cannot faithfully re-run them. Trigger this routine from Claude.",
+                    "Claude Run Now explanation changed"
+                )
+                let busyRunNow = JobRunNowPresentation(job: declaredPathJob, busy: true)
+                try check(!busyRunNow.isEnabled, "busy Run Now presentation was enabled")
+
+                let migrationStore = try SQLiteRunStore(
+                    path: root.appendingPathComponent("migration.sqlite").path
+                )
+                let legacyJobID = "launchd:gui-migration"
+                let currentJob = makeJob(
+                    id: "launchd:gui-migration#0123456789ab",
+                    source: .launchd,
+                    label: "gui-migration",
+                    environment: [:],
+                    command: ["/usr/bin/true"]
+                )
+                let legacyRunID = try migrationStore.beginRun(
+                    jobID: legacyJobID,
+                    startedAt: Date(timeIntervalSince1970: 1_000)
+                )
+                try migrationStore.finishRun(
+                    id: legacyRunID,
+                    exitCode: 0,
+                    stdoutTail: "",
+                    stderrTail: "",
+                    finishedAt: Date(timeIntervalSince1970: 1_001)
+                )
+                let migrationModel = AppModel(
+                    registry: JobRegistry(
+                        adapters: [StaticAdapter(source: .launchd, jobs: [currentJob])]
+                    ),
+                    store: migrationStore
+                )
+                migrationModel.refresh()
+                try check(
+                    waitUntil { migrationModel.jobs == [currentJob] },
+                    "GUI refresh did not finish identity discovery"
+                )
+                let migratedRun = try migrationStore.latestRun(jobID: currentJob.id)
+                try check(
+                    migratedRun != nil,
+                    "GUI refresh did not migrate legacy run history before publishing"
+                )
+                let remainingLegacyRun = try migrationStore.latestRun(jobID: legacyJobID)
+                try check(
+                    remainingLegacyRun == nil,
+                    "GUI refresh left migrated history under the legacy id"
+                )
+
                 let nextFireLabels = [
                     JobNextFirePresentation.relativeText(for: .keepAlive, nextFire: nil),
                     JobNextFirePresentation.relativeText(for: .atLoad, nextFire: nil),
@@ -2284,15 +2654,19 @@ private func test3B_AppBehavior(_ tests: TestHarness) throws {
 
             private static func makeJob(
                 id: String,
+                source: JobSource = .crontab,
+                label: String? = nil,
                 environment: [String: String],
-                command: [String]
+                command: [String],
+                argv0: String? = nil
             ) -> Job {
                 Job(
                     id: id,
-                    source: .crontab,
-                    label: id,
+                    source: source,
+                    label: label ?? id,
                     schedule: .cron("* * * * *"),
                     command: command,
+                    argv0: argv0,
                     environment: environment,
                     cwd: nil,
                     enabled: true,
@@ -2334,12 +2708,370 @@ private func test3B_AppBehavior(_ tests: TestHarness) throws {
         )
         tests.expect(
             output.contains("APP HARNESS PASS"),
-            "test3B app behavior harness covers refresh, Run Now, environment, and next-fire text"
+            "test4B compiled app harness covers argv0 execution, Run Now presentation, refresh, and environment"
         )
     }
 }
 
 // End round 3B regression tests
+
+
+private func test4A_BackupAuthenticity(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round4a-backup-authenticity") { directory in
+        let plistURL = directory.appendingPathComponent("authenticated.plist")
+        try writePropertyList([
+            "Label": "com.example.authenticated",
+            "ProgramArguments": ["/bin/echo", "original"],
+            "KeepAlive": true,
+        ], to: plistURL)
+        let originalData = try Data(contentsOf: plistURL)
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+        let wrapper = JobWrapper(
+            store: store,
+            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
+        )
+        let job = test2A_makeLaunchdJob(
+            id: "launchd:com.example.authenticated#0123456789ab",
+            label: "com.example.authenticated",
+            command: ["/bin/echo", "original"],
+            plistURL: plistURL
+        )
+
+        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        let wrappedData = try Data(contentsOf: plistURL)
+        let backupPath = try require(
+            try store.managedBackupPath(jobID: job.id),
+            "test4A authenticated backup path"
+        )
+        let backupURL = URL(fileURLWithPath: backupPath)
+        try Data("unrelated backup bytes".utf8).write(to: backupURL)
+
+        tests.expectEqual(
+            try wrapper.recoveryState(job: job),
+            .wrappedBackupContentMismatch,
+            "test4A doctor state reports backup content mismatch"
+        )
+        tests.expectThrows(
+            try wrapper.unwrap(job: job),
+            "test4A unwrap refuses a backup whose authenticated bytes changed"
+        )
+        tests.expectEqual(
+            try Data(contentsOf: plistURL),
+            wrappedData,
+            "test4A refused mismatched restore leaves the live plist unchanged"
+        )
+
+        try originalData.write(to: backupURL)
+        let metadataURL = backupURL.appendingPathExtension("metadata.json")
+        let metadataData = try Data(contentsOf: metadataURL)
+        var legacyMetadata = try require(
+            try JSONSerialization.jsonObject(with: metadataData) as? [String: Any],
+            "test4A backup metadata dictionary"
+        )
+        legacyMetadata["version"] = 1
+        legacyMetadata.removeValue(forKey: "backupByteCount")
+        legacyMetadata.removeValue(forKey: "backupSHA256")
+        try JSONSerialization.data(withJSONObject: legacyMetadata, options: [.sortedKeys])
+            .write(to: metadataURL)
+
+        tests.expectEqual(
+            try wrapper.recoveryState(job: job),
+            .wrappedBackupUnverified,
+            "test4A digest-less legacy metadata is unverified"
+        )
+        tests.expectThrows(
+            try wrapper.unwrap(job: job),
+            "test4A unwrap refuses digest-less legacy metadata"
+        )
+    }
+}
+
+private func test4A_WrapperProvenance(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round4a-wrapper-provenance") { directory in
+        let plistURL = directory.appendingPathComponent("vendor-ticker.plist")
+        try writePropertyList([
+            "Label": "com.vendor.ticker",
+            "ProgramArguments": ["/bin/echo", "vendor"],
+        ], to: plistURL)
+        let adapter = LaunchdAdapter(searchDirectories: [directory]) { _, _ in
+            AdapterCommandResult(status: 0, stdout: "", stderr: "")
+        }
+        let jobID = try require(
+            try adapter.discover().first?.id,
+            "test4A canonical vendor fixture id"
+        )
+        try writePropertyList([
+            "Label": "com.vendor.ticker",
+            "ProgramArguments": [
+                "/opt/vendor/ticker",
+                "run",
+                "--label",
+                jobID,
+                "--",
+                "/bin/echo",
+                "vendor",
+            ],
+        ], to: plistURL)
+        let originalData = try Data(contentsOf: plistURL)
+        let job = try require(
+            try adapter.discover().first,
+            "test4A discovered vendor ticker job"
+        )
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+        let wrapper = JobWrapper(
+            store: store,
+            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
+        )
+
+        tests.expectEqual(
+            try wrapper.recoveryState(job: job),
+            .ambiguousTickerInvocation,
+            "test4A basename-only vendor ticker syntax is ambiguous without provenance"
+        )
+        tests.expect(!wrapper.isWrapped(job: job), "test4A ambiguous vendor ticker is not managed")
+        tests.expect(!job.managed, "test4A adapter does not mark legacy vendor ticker syntax managed")
+        tests.expectThrows(
+            try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"),
+            "test4A wrap refuses to rewrite an unproven vendor ticker command"
+        )
+        tests.expectThrows(
+            try wrapper.unwrap(job: job),
+            "test4A unwrap refuses an unproven vendor ticker command"
+        )
+        tests.expectEqual(
+            try Data(contentsOf: plistURL),
+            originalData,
+            "test4A provenance refusals preserve the vendor plist bytes"
+        )
+    }
+}
+
+private func test4A_IdentityStorageMigration(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round4a-identity-migration") { directory in
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+        let uniqueLegacy = "launchd:com.example.unique"
+        let uniqueCurrent = "\(uniqueLegacy)#111111111111"
+        let ambiguousLegacy = "launchd:com.example.ambiguous"
+        let unmatchedLegacy = "claude:unmatched-task"
+
+        let uniqueRun = try store.beginRun(
+            jobID: uniqueLegacy,
+            startedAt: Date(timeIntervalSince1970: 10)
+        )
+        try store.finishRun(
+            id: uniqueRun,
+            exitCode: 0,
+            stdoutTail: "unique",
+            stderrTail: "",
+            finishedAt: Date(timeIntervalSince1970: 11)
+        )
+        _ = try store.beginRun(jobID: ambiguousLegacy, startedAt: Date(timeIntervalSince1970: 20))
+        _ = try store.beginRun(jobID: unmatchedLegacy, startedAt: Date(timeIntervalSince1970: 30))
+        try store.markManaged(jobID: uniqueLegacy, backupPath: "/tmp/unique-backup")
+        try store.markManaged(jobID: ambiguousLegacy, backupPath: "/tmp/ambiguous-backup")
+
+        func makeJob(_ id: String, label: String) -> Job {
+            Job(
+                id: id,
+                source: .launchd,
+                label: label,
+                schedule: .onDemand,
+                command: ["/bin/true"],
+                cwd: nil,
+                enabled: true,
+                configPath: directory.appendingPathComponent("\(label).plist").path,
+                lastKnownExit: nil,
+                lastRunAt: nil,
+                lastScheduledFor: nil,
+                managed: false
+            )
+        }
+        let jobs = [
+            makeJob(uniqueCurrent, label: "unique"),
+            makeJob("\(ambiguousLegacy)#222222222222", label: "ambiguous-a"),
+            makeJob("\(ambiguousLegacy)#333333333333", label: "ambiguous-b"),
+        ]
+
+        let deferred = try store.migrateLegacyJobIDs(
+            discoveredJobs: jobs,
+            discoveryComplete: false
+        )
+        tests.expect(!deferred.performed, "test4A partial discovery defers the once-only migration")
+        tests.expectEqual(
+            try store.runs(jobID: uniqueLegacy, limit: 10).map(\.id),
+            [uniqueRun],
+            "test4A deferred migration leaves legacy rows unchanged"
+        )
+
+        let first = try store.migrateLegacyJobIDs(discoveredJobs: jobs)
+        tests.expect(first.performed, "test4A identity migration executes once")
+        tests.expectEqual(
+            first.migratedJobIDs,
+            [uniqueLegacy: uniqueCurrent],
+            "test4A identity migration rekeys only a uniquely mapped legacy id"
+        )
+        tests.expectEqual(
+            first.orphanedLegacyJobIDs,
+            [unmatchedLegacy, ambiguousLegacy].sorted(),
+            "test4A ambiguous and unmatched legacy history is reported as orphaned"
+        )
+        tests.expectEqual(
+            try store.runs(jobID: uniqueCurrent, limit: 10).map(\.id),
+            [uniqueRun],
+            "test4A run history moves to the topology-independent id without duplication"
+        )
+        tests.expectEqual(
+            try store.runs(jobID: uniqueLegacy, limit: 10).count,
+            0,
+            "test4A migrated legacy run key is removed"
+        )
+        tests.expectEqual(
+            try store.managedBackupPath(jobID: uniqueCurrent),
+            "/tmp/unique-backup",
+            "test4A managed backup row moves to the topology-independent id"
+        )
+        let managedIDsAfterMigration = try store.managedJobIDs()
+        tests.expect(
+            managedIDsAfterMigration.contains(ambiguousLegacy),
+            "test4A ambiguous managed row remains under its legacy id"
+        )
+
+        let second = try store.migrateLegacyJobIDs(
+            discoveredJobs: jobs.filter { !$0.id.hasSuffix("333333333333") }
+        )
+        tests.expect(!second.performed, "test4A identity migration marker prevents a second rewrite")
+        tests.expect(
+            second.orphanedLegacyJobIDs.contains(ambiguousLegacy),
+            "test4A once-only migration keeps a formerly ambiguous legacy key orphaned"
+        )
+
+        let doctor = try test3A_runProcess(
+            try test3A_builtCLIPath(),
+            ["doctor"],
+            environment: ["TICKER_STORE_PATH": directory.appendingPathComponent("ticker.db").path],
+            timeout: 30
+        )
+        tests.expectEqual(doctor.status, 0, "test4A doctor completes with orphaned legacy history")
+        tests.expect(
+            doctor.stdout.contains("\(ambiguousLegacy)\torphaned-history")
+                && doctor.stdout.contains("\(unmatchedLegacy)\torphaned-history"),
+            "test4A doctor reports ambiguous and unmatched legacy history as orphaned"
+        )
+    }
+}
+
+private func test4A_BlockedParentCapture(_ tests: TestHarness) throws {
+    let tickerPath = try test3A_builtCLIPath()
+    try withTemporaryDirectory("round4a-blocked-parent") { directory in
+        let storePath = directory.appendingPathComponent("ticker.db").path
+        let jobID = "test4A-blocked-parent"
+        let process = Process()
+        let blockedOutput = Pipe()
+        process.executableURL = URL(fileURLWithPath: tickerPath)
+        process.arguments = [
+            "run",
+            "--label", jobID,
+            "--tail-bytes", "64",
+            "--",
+            "/usr/bin/awk",
+            "BEGIN { for (i = 0; i < 300000; i++) printf \"x\"; printf \"TAIL-4A\\n\" }",
+        ]
+        var environment = ProcessInfo.processInfo.environment
+        environment["TICKER_STORE_PATH"] = storePath
+        process.environment = environment
+        process.standardOutput = blockedOutput
+        process.standardError = FileHandle.nullDevice
+
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        try process.run()
+        let timedOut = exited.wait(timeout: .now() + 10) == .timedOut
+        if timedOut {
+            _ = Darwin.kill(process.processIdentifier, SIGKILL)
+            _ = exited.wait(timeout: .now() + 2)
+        }
+        process.waitUntilExit()
+        try? blockedOutput.fileHandleForReading.close()
+
+        let stored = try require(
+            try SQLiteRunStore(path: storePath).latestRun(jobID: jobID),
+            "test4A blocked-parent run row"
+        )
+        print(
+            "TRANSCRIPT test4A N-013 status=\(process.terminationStatus) "
+                + "timedOut=\(timedOut) tail='\(stored.stdoutTail ?? "nil")'"
+        )
+        tests.expect(!timedOut, "test4A blocked parent output does not stall child capture")
+        tests.expectEqual(process.terminationStatus, 0, "test4A blocked-parent child exits successfully")
+        tests.expect(
+            stored.stdoutTail?.hasSuffix("TAIL-4A\n") == true,
+            "test4A blocked-parent history keeps the newest captured bytes"
+        )
+    }
+}
+
+private func test4A_SignalReapingStress(_ tests: TestHarness) throws {
+    let tickerPath = try test3A_builtCLIPath()
+    try withTemporaryDirectory("round4a-signal-stress") { directory in
+        let storePath = directory.appendingPathComponent("ticker.db").path
+        var unexpectedStatuses: [Int32] = []
+        var unfinishedRows = 0
+        let iterations = 50
+
+        for iteration in 0..<iterations {
+            let jobID = "test4A-signal-\(iteration)"
+            let readyURL = directory.appendingPathComponent("ready-\(iteration)")
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: tickerPath)
+            process.arguments = [
+                "run",
+                "--label", jobID,
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf ready > '\(readyURL.path)'",
+            ]
+            var environment = ProcessInfo.processInfo.environment
+            environment["TICKER_STORE_PATH"] = storePath
+            process.environment = environment
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+
+            let readyDeadline = Date().addingTimeInterval(2)
+            while !FileManager.default.fileExists(atPath: readyURL.path),
+                  process.isRunning,
+                  Date() < readyDeadline {
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            _ = Darwin.kill(process.processIdentifier, SIGTERM)
+            process.waitUntilExit()
+            if process.terminationStatus != 0 && process.terminationStatus != 143 {
+                unexpectedStatuses.append(process.terminationStatus)
+            }
+
+            let row = try SQLiteRunStore(path: storePath).latestRun(jobID: jobID)
+            if row?.finishedAt == nil || (row?.exitCode != 0 && row?.exitCode != 143) {
+                unfinishedRows += 1
+            }
+        }
+
+        print(
+            "TRANSCRIPT test4A N-014 iterations=\(iterations) "
+                + "unexpectedStatuses=\(unexpectedStatuses) unfinishedRows=\(unfinishedRows)"
+        )
+        tests.expectEqual(
+            unexpectedStatuses,
+            [],
+            "test4A signal/reap stress produces no unrelated or wrapper-level signal exits"
+        )
+        tests.expectEqual(
+            unfinishedRows,
+            0,
+            "test4A signal/reap stress records every short-lived child exactly to completion"
+        )
+    }
+}
 
 @main
 private enum TickerTests {
@@ -2377,7 +3109,22 @@ private enum TickerTests {
         tests.run("round 3B Claude account-scoped ids") {
             try test3B_ClaudeAccountScopedIDs(tests)
         }
-        tests.run("round 3B app behavior") { try test3B_AppBehavior(tests) }
+        tests.run("round 4B launchd identity, argv0, and ambiguity") {
+            try test4B_LaunchdIdentityExecutionAndAmbiguity(tests)
+        }
+        tests.run("round 4B Claude topology-independent ids") {
+            try test4B_ClaudeTopologyIndependentIdentity(tests)
+        }
+        tests.run("round 4B app execution and presentation") {
+            try test4B_AppExecutionAndPresentation(tests)
+        }
+        tests.run("round 4A backup authenticity") { try test4A_BackupAuthenticity(tests) }
+        tests.run("round 4A wrapper provenance") { try test4A_WrapperProvenance(tests) }
+        tests.run("round 4A identity storage migration") {
+            try test4A_IdentityStorageMigration(tests)
+        }
+        tests.run("round 4A blocked-parent capture") { try test4A_BlockedParentCapture(tests) }
+        tests.run("round 4A signal/reap stress") { try test4A_SignalReapingStress(tests) }
         tests.finish()
     }
 }

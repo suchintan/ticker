@@ -63,11 +63,11 @@ Ticker scans these local sources every 30 seconds:
 
 Ticker does not replace launchd. It puts the `ticker run` recorder in front of the job's existing command.
 
-When you run `ticker wrap launchd:com.foo.bar`, Ticker makes these on-disk changes:
+When you run `ticker wrap <launchd-job-id>`, Ticker makes these on-disk changes:
 
-1. It writes the original plist bytes to a same-volume temporary file under `~/.ticker/backups/`, syncs the file, renames it into place, and syncs the backup directory before it changes the original. A metadata file beside the backup records the job id and the source plist's absolute path.
+1. It writes the original plist bytes to a same-volume temporary file under `~/.ticker/backups/`, syncs the file, renames it into place, and syncs the backup directory before it changes the original. A versioned metadata file authenticates the backup with its byte count and SHA-256 digest. It also binds the backup to the job id and canonical source plist path. Ticker refuses legacy metadata without a digest and refuses any backup whose content no longer matches the metadata.
 2. It records the job and backup path in the `managed_jobs` table in `~/.ticker/ticker.db`.
-3. It removes `Program`, if present, and writes the Ticker command through `ProgramArguments`. For example:
+3. It removes `Program`, if present, and writes the Ticker command through `ProgramArguments`. The command includes a versioned provenance marker. For example:
 
    ```text
    ["/bin/bash", "/path/to/job.sh", "--flag"]
@@ -76,14 +76,14 @@ When you run `ticker wrap launchd:com.foo.bar`, Ticker makes these on-disk chang
    becomes:
 
    ```text
-   ["/Applications/Ticker.app/Contents/MacOS/ticker", "run", "--label", "launchd:com.foo.bar", "--",
-    "/bin/bash", "/path/to/job.sh", "--flag"]
+   ["/Applications/Ticker.app/Contents/MacOS/ticker", "run", "--ticker-wrapper-version", "1",
+    "--label", "launchd:com.foo.bar#0123456789ab", "--", "/bin/bash", "/path/to/job.sh", "--flag"]
    ```
 
    If a plist has both `Program` and `ProgramArguments`, Ticker keeps `Program` as the executable. It also passes `--argv0` so the child receives the original first argument. Ticker does not try to execute `ProgramArguments[0]` in this case.
 
    Non-command plist keys keep the same values. Property-list serialization can change formatting and key order. The backup preserves the original bytes exactly, and `ticker unwrap` restores those bytes.
-4. It makes repeat wrapping safe. If the Ticker executable moves, wrapping again updates only the executable path and keeps the original backup.
+4. It makes repeat wrapping safe. If the Ticker executable moves, wrapping again updates only the executable path and keeps the authenticated original backup. Ticker does not adopt a third-party executable merely because its filename is `ticker`.
 
 Ticker does **not** reload the launchd job for you. It prints ready-to-paste commands like these:
 
@@ -98,8 +98,8 @@ Run both commands to apply the changed plist.
 
 Use one of these two paths:
 
-- **Preferred:** Run `ticker unwrap launchd:com.foo.bar`. Then run the two `launchctl` commands that it prints.
-- **Manual:** Copy the matching backup over the original plist. Run `ticker doctor --clear-stale launchd:com.foo.bar` to clear the managed database row. Then unload and load the plist with `launchctl`. Ticker refuses a manual restore whose backup metadata names another plist.
+- **Preferred:** Find the internal job id with `ticker list --json`. Run `ticker unwrap <launchd-job-id>`. Then run the two `launchctl` commands that it prints.
+- **Manual:** Copy the matching backup over the original plist. Run `ticker doctor --clear-stale <launchd-job-id>` to clear the managed database row. Then unload and load the plist with `launchctl`. Ticker refuses a manual restore whose authenticated metadata names another plist or whose bytes fail authentication.
 
 Ticker never deletes backups. Unwrap jobs before deleting `Ticker.app`. A wrapped job whose `ticker` binary is missing will fail with exit 127, so removing the app first can leave that job unable to run until you restore its backup.
 
@@ -108,10 +108,10 @@ Ticker never deletes backups. Unwrap jobs before deleting `Ticker.app`. A wrappe
 Ticker uses hand-rolled argument parsing and has no CLI package dependency.
 
 ```text
-ticker run --label <job-id> [--argv0 VALUE] [--tail-bytes N] -- <argv>...
+ticker run --label <job-id> [--ticker-wrapper-version VERSION] [--argv0 VALUE] [--tail-bytes N] -- <argv>...
 ```
 
-Runs the child command and records it. `--argv0` sets the child process's first argument without changing the executable. Ticker streams stdout and stderr to its parent while capturing the last `N` bytes of each stream. The default is 8,192 bytes. Values above 1,048,576 bytes are clamped to that maximum, and `N` must be positive. Ticker records the child exit code and exits with that same code. It forwards SIGINT and SIGTERM to the child's process group, including pipelines and other descendants. It also bounds pipe draining after the child exits. If the child cannot start, Ticker records and returns exit 127. A history-store failure never prevents the child from running.
+Runs the child command and records it. The wrapper-generated provenance version distinguishes Ticker-managed launchd entries from unrelated executables with the same filename. `--argv0` sets the child process's first argument without changing the executable. Ticker streams stdout and stderr to its parent while capturing the last `N` bytes of each stream. The default is 8,192 bytes. Values above 1,048,576 bytes are clamped to that maximum, and `N` must be positive. Capture is independent of parent output backpressure. Forwarding uses a bounded pending buffer and can discard forwarded bytes when the parent stops reading, but the recorded tail still completes. Ticker records the child exit code and exits with that same code. It forwards SIGINT and SIGTERM to the child's process group, including pipelines and other descendants. Process-group signalling is serialized with child reaping so a reused process-group number cannot receive a late signal. If the child cannot start, Ticker records and returns exit 127. A history-store failure never prevents the child from running.
 
 ```text
 ticker list [--json]
@@ -137,7 +137,7 @@ ticker doctor
 ticker doctor --clear-stale <job-id>
 ```
 
-Reports the wrapper, managed-row, and verified-backup state for each launchd job. The clear option removes a managed row only when the plist has already been restored outside Ticker.
+Reports the wrapper, managed-row, and authenticated-backup state for each launchd job. It reports content mismatches, digest-less legacy backups, ambiguous basename-only `ticker` commands, and legacy history that cannot be mapped uniquely to a current job. The clear option removes a managed row only when the plist has already been restored outside Ticker.
 
 ```text
 ticker --help

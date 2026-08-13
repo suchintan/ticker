@@ -14,8 +14,25 @@ public struct SQLiteRunStoreError: Error, LocalizedError {
     }
 }
 
+public struct JobIdentityMigrationReport: Equatable {
+    public let performed: Bool
+    public let migratedJobIDs: [String: String]
+    public let orphanedLegacyJobIDs: [String]
+
+    public init(
+        performed: Bool,
+        migratedJobIDs: [String: String],
+        orphanedLegacyJobIDs: [String]
+    ) {
+        self.performed = performed
+        self.migratedJobIDs = migratedJobIDs
+        self.orphanedLegacyJobIDs = orphanedLegacyJobIDs
+    }
+}
+
 public final class SQLiteRunStore: RunStore {
     private static let schemaVersion = "1"
+    private static let jobIdentityMigrationKey = "job_identity_v2"
 
     private let database: OpaquePointer
     private let queue = DispatchQueue(label: "com.ticker.SQLiteRunStore")
@@ -284,6 +301,189 @@ public final class SQLiteRunStore: RunStore {
             }
             throw databaseError(operation: "read managed job backup", code: result)
         }
+    }
+
+    public func migrateLegacyJobIDs(
+        discoveredJobs: [Job],
+        discoveryComplete: Bool = true
+    ) throws -> JobIdentityMigrationReport {
+        let candidates = Self.legacyIdentityCandidates(discoveredJobs)
+        return try queue.sync {
+            if !discoveryComplete {
+                return JobIdentityMigrationReport(
+                    performed: false,
+                    migratedJobIDs: [:],
+                    orphanedLegacyJobIDs: try storedLegacyJobIDs()
+                )
+            }
+
+            try Self.execute(database: database, sql: "BEGIN IMMEDIATE TRANSACTION;")
+            var committed = false
+            defer {
+                if !committed {
+                    try? Self.execute(database: database, sql: "ROLLBACK;")
+                }
+            }
+
+            do {
+                let legacyIDs = try storedLegacyJobIDs()
+                if try schemaMetaValue(forKey: Self.jobIdentityMigrationKey) != nil {
+                    try Self.execute(database: database, sql: "COMMIT;")
+                    committed = true
+                    return JobIdentityMigrationReport(
+                        performed: false,
+                        migratedJobIDs: [:],
+                        orphanedLegacyJobIDs: legacyIDs
+                    )
+                }
+
+                var migrated: [String: String] = [:]
+                for legacyID in legacyIDs {
+                    guard let matches = candidates[legacyID], matches.count == 1,
+                          let newID = matches.first else {
+                        continue
+                    }
+                    try rekeyRuns(from: legacyID, to: newID)
+                    try rekeyManagedJob(from: legacyID, to: newID)
+                    migrated[legacyID] = newID
+                }
+                try setSchemaMetaValue("complete", forKey: Self.jobIdentityMigrationKey)
+                let orphaned = try storedLegacyJobIDs()
+                try Self.execute(database: database, sql: "COMMIT;")
+                committed = true
+                return JobIdentityMigrationReport(
+                    performed: true,
+                    migratedJobIDs: migrated,
+                    orphanedLegacyJobIDs: orphaned
+                )
+            } catch {
+                throw error
+            }
+        }
+    }
+
+    private static func legacyIdentityCandidates(_ jobs: [Job]) -> [String: Set<String>] {
+        var result: [String: Set<String>] = [:]
+        for job in jobs where job.source == .launchd || job.source == .claudeRoutine {
+            guard let separator = job.id.lastIndex(of: "#") else {
+                continue
+            }
+            let suffix = job.id[job.id.index(after: separator)...]
+            guard suffix.count == 12,
+                  suffix.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
+                continue
+            }
+            result[String(job.id[..<separator]), default: []].insert(job.id)
+        }
+        return result
+    }
+
+    private func storedLegacyJobIDs() throws -> [String] {
+        let statement = try prepare(
+            """
+            SELECT job_id FROM runs
+            WHERE instr(job_id, '#') = 0
+              AND (job_id LIKE 'launchd:%' OR job_id LIKE 'claude:%')
+            UNION
+            SELECT job_id FROM managed_jobs
+            WHERE instr(job_id, '#') = 0
+              AND (job_id LIKE 'launchd:%' OR job_id LIKE 'claude:%')
+            ORDER BY job_id;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+
+        var result: [String] = []
+        while true {
+            let stepResult = sqlite3_step(statement)
+            if stepResult == SQLITE_ROW {
+                if let jobID = textColumn(0, in: statement) {
+                    result.append(jobID)
+                }
+            } else if stepResult == SQLITE_DONE {
+                return result
+            } else {
+                throw databaseError(operation: "read legacy job ids", code: stepResult)
+            }
+        }
+    }
+
+    private func schemaMetaValue(forKey key: String) throws -> String? {
+        let statement = try prepare("SELECT value FROM schema_meta WHERE key = ? LIMIT 1;")
+        defer { sqlite3_finalize(statement) }
+        try bind(key, to: 1, in: statement)
+        let stepResult = sqlite3_step(statement)
+        if stepResult == SQLITE_ROW {
+            return textColumn(0, in: statement)
+        }
+        if stepResult == SQLITE_DONE {
+            return nil
+        }
+        throw databaseError(operation: "read schema metadata", code: stepResult)
+    }
+
+    private func setSchemaMetaValue(_ value: String, forKey key: String) throws {
+        let statement = try prepare(
+            """
+            INSERT INTO schema_meta(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(key, to: 1, in: statement)
+        try bind(value, to: 2, in: statement)
+        try stepDone(statement, operation: "write schema metadata")
+    }
+
+    private func rekeyRuns(from legacyID: String, to newID: String) throws {
+        let statement = try prepare("UPDATE runs SET job_id = ? WHERE job_id = ?;")
+        defer { sqlite3_finalize(statement) }
+        try bind(newID, to: 1, in: statement)
+        try bind(legacyID, to: 2, in: statement)
+        try stepDone(statement, operation: "migrate run job id")
+    }
+
+    private func rekeyManagedJob(from legacyID: String, to newID: String) throws {
+        let readStatement = try prepare(
+            "SELECT wrapped_at, backup_path FROM managed_jobs WHERE job_id = ? LIMIT 1;"
+        )
+        try bind(legacyID, to: 1, in: readStatement)
+        let readResult = sqlite3_step(readStatement)
+        if readResult == SQLITE_DONE {
+            sqlite3_finalize(readStatement)
+            return
+        }
+        guard readResult == SQLITE_ROW else {
+            sqlite3_finalize(readStatement)
+            throw databaseError(operation: "read managed job for migration", code: readResult)
+        }
+        let wrappedAt = sqlite3_column_double(readStatement, 0)
+        let backupPath = textColumn(1, in: readStatement)
+        sqlite3_finalize(readStatement)
+
+        let writeStatement = try prepare(
+            """
+            INSERT INTO managed_jobs(job_id, wrapped_at, backup_path)
+            VALUES(?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+              wrapped_at = MAX(managed_jobs.wrapped_at, excluded.wrapped_at),
+              backup_path = COALESCE(managed_jobs.backup_path, excluded.backup_path);
+            """
+        )
+        defer { sqlite3_finalize(writeStatement) }
+        try bind(newID, to: 1, in: writeStatement)
+        try bind(wrappedAt, to: 2, in: writeStatement)
+        if let backupPath {
+            try bind(backupPath, to: 3, in: writeStatement)
+        } else {
+            try bindNull(to: 3, in: writeStatement)
+        }
+        try stepDone(writeStatement, operation: "migrate managed job id")
+
+        let deleteStatement = try prepare("DELETE FROM managed_jobs WHERE job_id = ?;")
+        defer { sqlite3_finalize(deleteStatement) }
+        try bind(legacyID, to: 1, in: deleteStatement)
+        try stepDone(deleteStatement, operation: "delete legacy managed job id")
     }
 
     private static func execute(database: OpaquePointer, sql: String) throws {

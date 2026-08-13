@@ -196,7 +196,11 @@ private struct JobRow: View {
                         .lineLimit(1)
 
                     Spacer(minLength: 6)
-                    OutcomeChip(outcome: outcome)
+                    if job.runtimeStatusAttribution == .ambiguous {
+                        RuntimeAmbiguityChip()
+                    } else {
+                        OutcomeChip(outcome: outcome)
+                    }
                 }
 
                 HStack(spacing: 6) {
@@ -209,6 +213,13 @@ private struct JobRow: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
 
+
+                if job.runtimeStatusAttribution == .ambiguous {
+                    WarningLine(
+                        icon: "questionmark.diamond.fill",
+                        text: "runtime status cannot be attributed to this plist"
+                    )
+                }
                 if let skew = job.skew, skew > 3_600 {
                     WarningLine(
                         icon: "clock.badge.exclamationmark",
@@ -235,6 +246,9 @@ private struct JobRow: View {
     }
 
     private var statusColor: Color {
+        if job.runtimeStatusAttribution == .ambiguous {
+            return .orange
+        }
         switch outcome {
         case .success:
             return .green
@@ -246,6 +260,9 @@ private struct JobRow: View {
     }
 
     private var statusText: String {
+        if job.runtimeStatusAttribution == .ambiguous {
+            return "Ambiguous runtime status"
+        }
         switch outcome {
         case .running:
             return "Running"
@@ -260,6 +277,17 @@ private struct JobRow: View {
 
     private static func formatHours(_ interval: TimeInterval) -> String {
         String(format: "%.1fh", interval / 3_600)
+    }
+}
+
+private struct RuntimeAmbiguityChip: View {
+    var body: some View {
+        Text("ambiguous")
+            .font(.caption2.weight(.semibold))
+            .foregroundColor(.orange)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.orange.opacity(0.12), in: Capsule())
     }
 }
 
