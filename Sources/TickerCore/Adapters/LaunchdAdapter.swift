@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Dispatch
 
@@ -143,6 +144,10 @@ public final class LaunchdAdapter: JobSourceAdapter {
         let command: [String]
         let argv0: String?
         let environment: [String: String]
+        let domain: LaunchdDomain
+        let userName: String?
+        let groupName: String?
+        let runNowUnavailableReason: String?
         let managed: Bool
         let cwd: String?
         let standardOutPath: String?
@@ -152,6 +157,16 @@ public final class LaunchdAdapter: JobSourceAdapter {
         let disabled: Bool
         let manuallyDisabled: Bool
         let configPath: String
+    }
+
+    private struct RuntimeKey: Hashable {
+        let domain: LaunchdDomain
+        let label: String
+    }
+
+    private struct RuntimeStatus {
+        let exitStatus: ExitStatus?
+        let attribution: RuntimeStatusAttribution
     }
 
     private let searchDirectories: [URL]
@@ -186,38 +201,36 @@ public final class LaunchdAdapter: JobSourceAdapter {
     }
 
     public func discover() throws -> [Job] {
-        let listResult = try commandRunner(launchctlURL, ["list"])
-        guard listResult.status == 0 else {
-            throw AdapterCommandError.failed(
-                executable: launchctlURL.path,
-                arguments: ["list"],
-                status: listResult.status,
-                output: commandOutput(listResult)
-            )
-        }
-
-        let loadedLabels = parseLoadedLabels(listResult.stdout)
         let configurations = loadConfigurations()
-        let duplicateLabels = Set(
-            Dictionary(grouping: configurations, by: \.label)
+        let groupedConfigurations = Dictionary(
+            grouping: configurations,
+            by: { RuntimeKey(domain: $0.domain, label: $0.label) }
+        )
+        let duplicateKeys = Set(
+            groupedConfigurations
                 .filter { $0.value.count > 1 }
                 .keys
         )
-        let labelsNeedingStatus = Set(configurations.map(\.label))
-            .subtracting(duplicateLabels)
-            .intersection(loadedLabels)
-        var exitStatuses: [String: ExitStatus] = [:]
+        let uniqueKeys = Set(groupedConfigurations.keys).subtracting(duplicateKeys)
+        var runtimeStatuses: [RuntimeKey: RuntimeStatus] = [:]
 
-        for label in labelsNeedingStatus.sorted() {
-            guard let status = loadExitStatus(label: label) else {
+        for key in uniqueKeys.sorted(by: {
+            if $0.domain == $1.domain {
+                return $0.label < $1.label
+            }
+            return $0.domain.rawValue < $1.domain.rawValue
+        }) {
+            guard let status = loadRuntimeStatus(domain: key.domain, label: key.label) else {
                 continue
             }
-            exitStatuses[label] = status
+            runtimeStatuses[key] = status
         }
 
         return configurations.map { configuration in
-            let hasAmbiguousRuntimeStatus = duplicateLabels.contains(configuration.label)
-            let isLoaded = !hasAmbiguousRuntimeStatus && loadedLabels.contains(configuration.label)
+            let key = RuntimeKey(domain: configuration.domain, label: configuration.label)
+            let hasAmbiguousRuntimeStatus = duplicateKeys.contains(key)
+            let runtimeStatus = hasAmbiguousRuntimeStatus ? nil : runtimeStatuses[key]
+            let isLoaded = runtimeStatus != nil
             return Job(
                 id: jobID(label: configuration.label, configPath: configuration.configPath),
                 source: .launchd,
@@ -228,9 +241,15 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 environment: configuration.environment,
                 cwd: configuration.cwd,
                 enabled: isLoaded && !configuration.disabled && !configuration.manuallyDisabled,
-                runtimeStatusAttribution: hasAmbiguousRuntimeStatus ? .ambiguous : nil,
+                launchdDomain: configuration.domain,
+                launchdUserName: configuration.userName,
+                launchdGroupName: configuration.groupName,
+                runNowUnavailableReason: configuration.runNowUnavailableReason,
+                runtimeStatusAttribution: hasAmbiguousRuntimeStatus
+                    ? .ambiguous
+                    : (runtimeStatus?.attribution ?? .unavailable),
                 configPath: configuration.configPath,
-                lastKnownExit: isLoaded ? exitStatuses[configuration.label] : nil,
+                lastKnownExit: runtimeStatus?.exitStatus,
                 lastRunAt: nil,
                 lastScheduledFor: nil,
                 managed: configuration.managed
@@ -259,6 +278,7 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 }
                 guard let configuration = parse(
                     file: file,
+                    domain: launchdDomain(for: directory),
                     manuallyDisabled: classification.manuallyDisabled,
                     filenameLabel: classification.label
                 ) else {
@@ -288,6 +308,7 @@ public final class LaunchdAdapter: JobSourceAdapter {
 
     private func parse(
         file: URL,
+        domain: LaunchdDomain,
         manuallyDisabled: Bool,
         filenameLabel: String?
     ) -> ParsedConfiguration? {
@@ -326,12 +347,22 @@ public final class LaunchdAdapter: JobSourceAdapter {
             let observedWrapper = versionedWrapper
                 ?? LaunchdWrapper.decodeLegacy(programArguments ?? [])
 
+            let userName = nonEmptyString(dictionary["UserName"] as? String)
+            let groupName = nonEmptyString(dictionary["GroupName"] as? String)
             return ParsedConfiguration(
                 label: label,
                 schedule: parseSchedule(dictionary),
                 command: observedWrapper?.original ?? literalCommand,
                 argv0: observedWrapper?.argv0 ?? literalArgv0,
                 environment: parseEnvironment(dictionary["EnvironmentVariables"]),
+                domain: domain,
+                userName: userName,
+                groupName: groupName,
+                runNowUnavailableReason: manualRunUnavailableReason(
+                    domain: domain,
+                    userName: userName,
+                    groupName: groupName
+                ),
                 managed: versionedWrapper != nil,
                 cwd: dictionary["WorkingDirectory"] as? String,
                 standardOutPath: dictionary["StandardOutPath"] as? String,
@@ -454,39 +485,113 @@ public final class LaunchdAdapter: JobSourceAdapter {
         return value is [String: Any]
     }
 
-    private func parseLoadedLabels(_ output: String) -> Set<String> {
-        var labels: Set<String> = []
-        for line in output.split(whereSeparator: \.isNewline) {
-            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
-            guard fields.count >= 3 else {
-                continue
-            }
-            let label = fields[2].trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !label.isEmpty, label != "Label" else {
-                continue
-            }
-            labels.insert(label)
+    private func loadRuntimeStatus(
+        domain: LaunchdDomain,
+        label: String
+    ) -> RuntimeStatus? {
+        let target: String
+        switch domain {
+        case .userAgent:
+            target = "gui/\(geteuid())/\(label)"
+        case .systemDaemon:
+            target = "system/\(label)"
         }
-        return labels
-    }
-
-    private func loadExitStatus(label: String) -> ExitStatus? {
-        guard let result = try? commandRunner(launchctlURL, ["list", label]), result.status == 0 else {
+        guard let result = try? commandRunner(launchctlURL, ["print", target]),
+              result.status == 0 else {
             return nil
         }
 
-        for line in result.stdout.split(whereSeparator: \.isNewline) {
-            guard line.contains("LastExitStatus"), let equals = line.firstIndex(of: "=") else {
+        let exitStatus = parseExitStatus(result.stdout)
+        let attribution: RuntimeStatusAttribution
+        if exitStatus != nil {
+            attribution = .resolved
+        } else if reportsRunningAndNeverExited(result.stdout) {
+            attribution = .neverExited
+        } else {
+            attribution = .recordWithoutExit
+        }
+        return RuntimeStatus(exitStatus: exitStatus, attribution: attribution)
+    }
+
+    private func reportsRunningAndNeverExited(_ output: String) -> Bool {
+        let lines = output.split(whereSeparator: \.isNewline)
+        let isRunning = lines.contains {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "state = running"
+        }
+        let hasNeverExitedMarker = lines.contains {
+            $0.lowercased().contains("last exit code")
+                && $0.lowercased().contains("never exited")
+        }
+        return isRunning && hasNeverExitedMarker
+    }
+
+    private func parseExitStatus(_ output: String) -> ExitStatus? {
+        for line in output.split(whereSeparator: \.isNewline) {
+            let normalized = line.lowercased()
+            guard normalized.contains("last exit code")
+                    || normalized.contains("lastexitstatus"),
+                  let equals = line.firstIndex(of: "=") else {
                 continue
             }
             let rawValue = line[line.index(after: equals)...]
                 .trimmingCharacters(in: CharacterSet(charactersIn: " ;\t\r\n"))
-            guard let raw = Int32(rawValue) else {
+            guard let token = rawValue.split(whereSeparator: \.isWhitespace).first,
+                  let raw = Int32(token) else {
                 continue
             }
             return ExitStatus(raw: raw)
         }
         return nil
+    }
+
+    private func launchdDomain(for directory: URL) -> LaunchdDomain {
+        directory.lastPathComponent == "LaunchDaemons" ? .systemDaemon : .userAgent
+    }
+
+    private func nonEmptyString(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
+    private func manualRunUnavailableReason(
+        domain: LaunchdDomain,
+        userName: String?,
+        groupName: String?
+    ) -> String? {
+        let defaultUserID: uid_t = domain == .systemDaemon ? 0 : geteuid()
+        let defaultGroupID: gid_t = domain == .systemDaemon ? 0 : getegid()
+        var scheduledUserID = defaultUserID
+        var scheduledGroupID = defaultGroupID
+
+        if let userName {
+            guard let record = getpwnam(userName) else {
+                return "Ticker cannot resolve launchd UserName '\(userName)', so it cannot prove that Run Now would use the scheduled identity."
+            }
+            scheduledUserID = record.pointee.pw_uid
+            if groupName == nil {
+                scheduledGroupID = record.pointee.pw_gid
+            }
+        }
+        if let groupName {
+            guard let record = getgrnam(groupName) else {
+                return "Ticker cannot resolve launchd GroupName '\(groupName)', so it cannot prove that Run Now would use the scheduled identity."
+            }
+            scheduledGroupID = record.pointee.gr_gid
+        }
+
+        guard scheduledUserID == geteuid(), scheduledGroupID == getegid() else {
+            let schedulerDomain = domain == .systemDaemon ? "system domain" : "user agent domain"
+            return "launchd runs this job in the \(schedulerDomain) as \(identityDescription(uid: scheduledUserID, gid: scheduledGroupID)), but Ticker runs as \(identityDescription(uid: geteuid(), gid: getegid())). Run Now is disabled because those execution identities differ."
+        }
+        return nil
+    }
+
+    private func identityDescription(uid: uid_t, gid: gid_t) -> String {
+        let user = getpwuid(uid).map { String(cString: $0.pointee.pw_name) } ?? String(uid)
+        let group = getgrgid(gid).map { String(cString: $0.pointee.gr_name) } ?? String(gid)
+        return "\(user):\(group)"
     }
     private func jobID(label: String, configPath: String) -> String {
         let digest = SHA256.hash(data: Data(configPath.utf8))

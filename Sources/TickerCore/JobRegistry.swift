@@ -1,5 +1,15 @@
 import Foundation
 
+public struct DuplicateJobIDError: Error, LocalizedError {
+    public let jobID: String
+    public let firstLabel: String
+    public let duplicateLabel: String
+
+    public var errorDescription: String? {
+        "Job id collision for \(jobID): '\(firstLabel)' and '\(duplicateLabel)'. Ticker kept the first discovered job."
+    }
+}
+
 public final class JobRegistry {
     private let adapters: [JobSourceAdapter]
 
@@ -28,6 +38,26 @@ public final class JobRegistry {
                 errors.append(error)
             }
         }
+
+        var uniqueJobs: [Job] = []
+        uniqueJobs.reserveCapacity(jobs.count)
+        var jobsByID: [String: Job] = [:]
+        jobsByID.reserveCapacity(jobs.count)
+        for job in jobs {
+            if let existing = jobsByID[job.id] {
+                errors.append(
+                    DuplicateJobIDError(
+                        jobID: job.id,
+                        firstLabel: existing.label,
+                        duplicateLabel: job.label
+                    )
+                )
+                continue
+            }
+            jobsByID[job.id] = job
+            uniqueJobs.append(job)
+        }
+        jobs = uniqueJobs
 
         let scheduledJobs = jobs.map { (job: $0, nextFireAt: $0.nextFireAt) }
         let sortedJobs = scheduledJobs.sorted { lhs, rhs in

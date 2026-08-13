@@ -208,13 +208,10 @@ final class AppModel: ObservableObject {
     }
 
     func outcome(for job: Job) -> Outcome {
-        if let storedOutcome = health[job.id] {
-            return storedOutcome
-        }
-        if let exitStatus = job.lastKnownExit {
-            return exitStatus.isSuccess ? .success : .failure
-        }
-        return .unknown
+        JobHealthPolicy.outcome(
+            for: job,
+            scheduledHistory: health[job.id]
+        )
     }
 
     func isManaged(_ job: Job) -> Bool {
@@ -318,7 +315,9 @@ final class AppModel: ObservableObject {
 
     func runNow(_ job: Job) {
         guard job.canRunNow else {
-            appendError("Cannot run \(job.label): Ticker does not have a faithful command for this job.")
+            let reason = job.runNowUnavailableReason
+                ?? "Ticker does not have a faithful command for this job."
+            appendError("Cannot run \(job.label): \(reason)")
             return
         }
 
@@ -329,7 +328,7 @@ final class AppModel: ObservableObject {
             guard let tickerPath = resolveTickerCLIPath() else {
                 throw TickerAppError.tickerCLINotFound
             }
-            var processCommand = [tickerPath, "run", "--label", job.id]
+            var processCommand = [tickerPath, "run", "--manual", "--label", job.id]
             if let argv0 = job.argv0 {
                 processCommand += ["--argv0", argv0]
             }

@@ -6,6 +6,16 @@ public enum JobSource: String, Codable, CaseIterable {
     case claudeRoutine
 }
 
+public enum RunTrigger: String, Codable, Hashable {
+    case scheduled
+    case manual
+}
+
+public enum LaunchdDomain: String, Codable, Hashable {
+    case userAgent
+    case systemDaemon
+}
+
 public enum Outcome: String, Codable {
     case running
     case success
@@ -14,7 +24,27 @@ public enum Outcome: String, Codable {
 }
 
 public enum RuntimeStatusAttribution: String, Codable, Hashable {
+    case resolved
+    case neverExited
     case ambiguous
+    case unavailable
+    case recordWithoutExit
+}
+
+public enum JobHealthPolicy {
+    public static func outcome(
+        for job: Job,
+        scheduledHistory: Outcome?
+    ) -> Outcome {
+        let nativeOutcome = job.lastKnownExit.map {
+            $0.isSuccess ? Outcome.success : Outcome.failure
+        }
+
+        if job.source == .launchd, !job.managed {
+            return nativeOutcome ?? scheduledHistory ?? .unknown
+        }
+        return scheduledHistory ?? nativeOutcome ?? .unknown
+    }
 }
 
 public struct Job: Identifiable, Codable, Hashable {
@@ -28,6 +58,10 @@ public struct Job: Identifiable, Codable, Hashable {
     public let cwd: String?
     public let enabled: Bool
     public let runtimeStatusAttribution: RuntimeStatusAttribution?
+    public let launchdDomain: LaunchdDomain?
+    public let launchdUserName: String?
+    public let launchdGroupName: String?
+    public let runNowUnavailableReason: String?
     public let configPath: String?
     public let lastKnownExit: ExitStatus?
     public let lastRunAt: Date?
@@ -44,6 +78,10 @@ public struct Job: Identifiable, Codable, Hashable {
         environment: [String: String] = [:],
         cwd: String?,
         enabled: Bool,
+        launchdDomain: LaunchdDomain? = nil,
+        launchdUserName: String? = nil,
+        launchdGroupName: String? = nil,
+        runNowUnavailableReason: String? = nil,
         runtimeStatusAttribution: RuntimeStatusAttribution? = nil,
         configPath: String?,
         lastKnownExit: ExitStatus?,
@@ -61,6 +99,10 @@ public struct Job: Identifiable, Codable, Hashable {
         self.cwd = cwd
         self.enabled = enabled
         self.runtimeStatusAttribution = runtimeStatusAttribution
+        self.launchdDomain = launchdDomain
+        self.launchdUserName = launchdUserName
+        self.launchdGroupName = launchdGroupName
+        self.runNowUnavailableReason = runNowUnavailableReason
         self.configPath = configPath
         self.lastKnownExit = lastKnownExit
         self.lastRunAt = lastRunAt
@@ -73,14 +115,36 @@ public struct Job: Identifiable, Codable, Hashable {
     }
 
     public var canRunNow: Bool {
-        !command.isEmpty
+        !command.isEmpty && runNowUnavailableReason == nil
     }
 
     public var runtimeStatusExplanation: String? {
-        guard runtimeStatusAttribution == .ambiguous else {
+        guard source == .launchd, let runtimeStatusAttribution else {
             return nil
         }
-        return "Multiple launchd plists use this label, so Ticker cannot determine which plist owns launchd's loaded state or last exit status."
+
+        let domainDescription: String
+        switch launchdDomain {
+        case .userAgent:
+            domainDescription = "the signed-in user's gui domain"
+        case .systemDaemon:
+            domainDescription = "the system domain"
+        case nil:
+            domainDescription = "its launchd domain"
+        }
+
+        switch runtimeStatusAttribution {
+        case .resolved:
+            return "Ticker resolved the last-exit status from this job's own domain-qualified launchd record in \(domainDescription)."
+        case .neverExited:
+            return "Launchd's domain-qualified record for label '\(label)' in \(domainDescription) reports that this job is running and has never exited, so no last-exit record exists yet."
+        case .ambiguous:
+            return "Another discovered launchd plist also uses label '\(label)' in \(domainDescription), so Ticker cannot determine which plist owns launchd's single runtime record."
+        case .unavailable:
+            return "Launchd has no domain-qualified runtime record for label '\(label)' in \(domainDescription); the job is not loaded or its record is unavailable."
+        case .recordWithoutExit:
+            return "Launchd's domain-qualified runtime record for label '\(label)' in \(domainDescription) does not include a usable last-exit status."
+        }
     }
 
     public var skew: TimeInterval? {
@@ -100,6 +164,10 @@ public struct Job: Identifiable, Codable, Hashable {
         case environment
         case cwd
         case enabled
+        case launchdDomain
+        case launchdUserName
+        case launchdGroupName
+        case runNowUnavailableReason
         case runtimeStatusAttribution
         case configPath
         case lastKnownExit
@@ -117,6 +185,7 @@ public struct Run: Identifiable, Codable, Hashable {
     public let exitCode: Int32?
     public let stdoutTail: String?
     public let stderrTail: String?
+    public let trigger: RunTrigger
 
     public init(
         id: Int64,
@@ -125,6 +194,7 @@ public struct Run: Identifiable, Codable, Hashable {
         finishedAt: Date?,
         exitCode: Int32?,
         stdoutTail: String?,
+        trigger: RunTrigger = .scheduled,
         stderrTail: String?
     ) {
         self.id = id
@@ -133,6 +203,7 @@ public struct Run: Identifiable, Codable, Hashable {
         self.finishedAt = finishedAt
         self.exitCode = exitCode
         self.stdoutTail = stdoutTail
+        self.trigger = trigger
         self.stderrTail = stderrTail
     }
 
@@ -160,7 +231,32 @@ public struct Run: Identifiable, Codable, Hashable {
         case finishedAt
         case exitCode
         case stdoutTail
+        case trigger
         case stderrTail
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(Int64.self, forKey: .id)
+        jobID = try container.decode(String.self, forKey: .jobID)
+        startedAt = try container.decode(Date.self, forKey: .startedAt)
+        finishedAt = try container.decodeIfPresent(Date.self, forKey: .finishedAt)
+        exitCode = try container.decodeIfPresent(Int32.self, forKey: .exitCode)
+        stdoutTail = try container.decodeIfPresent(String.self, forKey: .stdoutTail)
+        stderrTail = try container.decodeIfPresent(String.self, forKey: .stderrTail)
+        trigger = try container.decodeIfPresent(RunTrigger.self, forKey: .trigger) ?? .scheduled
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(jobID, forKey: .jobID)
+        try container.encode(startedAt, forKey: .startedAt)
+        try container.encodeIfPresent(finishedAt, forKey: .finishedAt)
+        try container.encodeIfPresent(exitCode, forKey: .exitCode)
+        try container.encodeIfPresent(stdoutTail, forKey: .stdoutTail)
+        try container.encodeIfPresent(stderrTail, forKey: .stderrTail)
+        try container.encode(trigger, forKey: .trigger)
     }
 }
 
@@ -170,7 +266,7 @@ public protocol JobSourceAdapter {
 }
 
 public protocol RunStore: AnyObject {
-    func beginRun(jobID: String, startedAt: Date) throws -> Int64
+    func beginRun(jobID: String, startedAt: Date, trigger: RunTrigger) throws -> Int64
     func finishRun(
         id: Int64,
         exitCode: Int32,

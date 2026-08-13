@@ -51,6 +51,8 @@ bash Scripts/run-tests.sh
 | Claude routines | `lastRunAt` and `lastScheduledFor` timestamps only. There is no exit code, duration, output, or outcome. |
 | Wrapped by Ticker | Full local history: start, end, duration, exit code, and stdout/stderr tails. |
 
+Ticker separates scheduled runs from manual **Run Now** attempts. Manual runs stay visible in history, but they never determine job health. An unwrapped launchd job uses launchd's native exit status when available. A wrapped launchd job uses its latest recorded scheduled run.
+
 Ticker scans these local sources every 30 seconds:
 
 - `~/Library/LaunchAgents`
@@ -58,6 +60,8 @@ Ticker scans these local sources every 30 seconds:
 - `/Library/LaunchDaemons`
 - The current user's crontab
 - Claude scheduled-task files under `~/Library/Application Support/Claude`
+
+Launchd labels are unique only within a launchd domain. The same label in the signed-in user's `gui` domain and the `system` domain represents two different jobs. Ticker lists them separately and resolves each job from its own domain-qualified runtime record.
 
 ## How launchd wrapping works
 
@@ -108,10 +112,10 @@ Ticker never deletes backups. Unwrap jobs before deleting `Ticker.app`. A wrappe
 Ticker uses hand-rolled argument parsing and has no CLI package dependency.
 
 ```text
-ticker run --label <job-id> [--ticker-wrapper-version VERSION] [--argv0 VALUE] [--tail-bytes N] -- <argv>...
+ticker run --label <job-id> [--manual] [--ticker-wrapper-version VERSION] [--argv0 VALUE] [--tail-bytes N] -- <argv>...
 ```
 
-Runs the child command and records it. The wrapper-generated provenance version distinguishes Ticker-managed launchd entries from unrelated executables with the same filename. `--argv0` sets the child process's first argument without changing the executable. Ticker streams stdout and stderr to its parent while capturing the last `N` bytes of each stream. The default is 8,192 bytes. Values above 1,048,576 bytes are clamped to that maximum, and `N` must be positive. Capture is independent of parent output backpressure. Forwarding uses a bounded pending buffer and can discard forwarded bytes when the parent stops reading, but the recorded tail still completes. Ticker records the child exit code and exits with that same code. It forwards SIGINT and SIGTERM to the child's process group, including pipelines and other descendants. Process-group signalling is serialized with child reaping so a reused process-group number cannot receive a late signal. If the child cannot start, Ticker records and returns exit 127. A history-store failure never prevents the child from running.
+Runs the child command and records it. `--manual` marks a Run Now attempt, which appears in history but does not change scheduled health. Ticker validates manual jobs against current discovery and refuses jobs whose launchd uid or gid differs from Ticker's process. The wrapper-generated provenance version distinguishes Ticker-managed launchd entries from unrelated executables with the same filename. `--argv0` sets the child process's first argument without changing the executable. Ticker streams stdout and stderr to its parent while capturing the last `N` bytes of each stream. The default is 8,192 bytes. Values above 1,048,576 bytes are clamped to that maximum, and `N` must be positive. Capture is independent of parent output backpressure. Forwarding uses a bounded pending buffer and can discard forwarded bytes when the parent stops reading, but the recorded tail still completes. Ticker records the child exit code and exits with that same code. It forwards SIGINT and SIGTERM to the child's process group.
 
 ```text
 ticker list [--json]
@@ -123,7 +127,7 @@ Lists every discovered job with its source, label, schedule, next fire, and late
 ticker history <job-id> [--limit N] [--json]
 ```
 
-Shows recent runs with start time, duration, exit code, and captured output tails.
+Shows recent runs with their scheduled or manual trigger, start time, duration, exit code, and captured output tails.
 
 ```text
 ticker wrap <job-id>
@@ -156,6 +160,10 @@ Ticker keeps all state on your Mac:
 | `~/.ticker/backups/` | Plist backups made before wrapping |
 
 Ticker makes no network calls and sends no telemetry.
+
+## Run Now fidelity
+
+Ticker enables Run Now only when it can reproduce the scheduler's execution context. Crontab jobs run from their effective non-empty `HOME`, as cron does. Launchd jobs are disabled when their `UserName`, `GroupName`, or system-daemon domain would use a different effective uid or gid. The job detail view states the reason.
 
 ## Claude routine history limitations
 

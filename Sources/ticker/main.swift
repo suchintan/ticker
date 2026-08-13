@@ -56,6 +56,10 @@ private struct ListRecord: Encodable {
     let runtimeStatusAttribution: RuntimeStatusAttribution?
     let runtimeStatusExplanation: String?
     let configPath: String?
+    let launchdDomain: LaunchdDomain?
+    let launchdUserName: String?
+    let launchdGroupName: String?
+    let runNowUnavailableReason: String?
     let lastKnownExit: ExitStatusRecord?
     let lastRunAt: Date?
     let lastScheduledFor: Date?
@@ -76,6 +80,10 @@ private struct ListRecord: Encodable {
         enabled = job.enabled
         runtimeStatusAttribution = job.runtimeStatusAttribution
         runtimeStatusExplanation = job.runtimeStatusExplanation
+        launchdDomain = job.launchdDomain
+        launchdUserName = job.launchdUserName
+        launchdGroupName = job.launchdGroupName
+        runNowUnavailableReason = job.runNowUnavailableReason
         configPath = job.configPath
         lastKnownExit = job.lastKnownExit.map(ExitStatusRecord.init)
         lastRunAt = job.lastRunAt
@@ -101,6 +109,10 @@ private struct ListRecord: Encodable {
         try encode(cwd, into: &container, forKey: .cwd)
         try encode(runtimeStatusAttribution, into: &container, forKey: .runtimeStatusAttribution)
         try encode(runtimeStatusExplanation, into: &container, forKey: .runtimeStatusExplanation)
+        try encode(launchdDomain, into: &container, forKey: .launchdDomain)
+        try encode(launchdUserName, into: &container, forKey: .launchdUserName)
+        try encode(launchdGroupName, into: &container, forKey: .launchdGroupName)
+        try encode(runNowUnavailableReason, into: &container, forKey: .runNowUnavailableReason)
         try encode(configPath, into: &container, forKey: .configPath)
         try encode(lastKnownExit, into: &container, forKey: .lastKnownExit)
         try encode(lastRunAt, into: &container, forKey: .lastRunAt)
@@ -133,6 +145,10 @@ private struct ListRecord: Encodable {
         case enabled
         case runtimeStatusAttribution
         case runtimeStatusExplanation
+        case launchdDomain
+        case launchdUserName
+        case launchdGroupName
+        case runNowUnavailableReason
         case configPath
         case lastKnownExit
         case lastRunAt
@@ -151,6 +167,7 @@ private struct HistoryRecord: Encodable {
     let finishedAt: Date?
     let duration: TimeInterval?
     let exitCode: Int32?
+    let trigger: RunTrigger
     let outcome: Outcome
     let stdoutTail: String?
     let stderrTail: String?
@@ -367,9 +384,17 @@ private struct TickerCLI {
         var label: String?
         var originalArgv0: String?
         var tailBytes = defaultTailBytes
+        var trigger: RunTrigger = .scheduled
+        var wrapperVersionSeen = false
         var index = 0
         while index < options.count {
             switch options[index] {
+            case "--manual":
+                guard trigger != .manual else {
+                    throw CLIError.usage("--manual may be specified only once")
+                }
+                trigger = .manual
+                index += 1
             case "--label":
                 guard index + 1 < options.count else {
                     throw CLIError.usage("--label requires a job id")
@@ -377,6 +402,7 @@ private struct TickerCLI {
                 label = options[index + 1]
                 index += 2
             case "--ticker-wrapper-version":
+                wrapperVersionSeen = true
                 guard index + 1 < options.count,
                       options[index + 1] == LaunchdWrapper.currentVersion else {
                     throw CLIError.usage(
@@ -406,11 +432,48 @@ private struct TickerCLI {
             throw CLIError.usage("run requires --label <id>")
         }
 
+        if trigger == .manual {
+            guard !wrapperVersionSeen else {
+                throw CLIError.usage("--manual cannot be combined with --ticker-wrapper-version")
+            }
+            let discovery = JobRegistry.standard().discoverAll()
+            guard let job = discovery.jobs.first(where: { $0.id == jobID }) else {
+                throw CLIError.operation(
+                    "Cannot run \(jobID) manually because it is not a currently discovered job."
+                )
+            }
+            guard job.canRunNow else {
+                throw CLIError.operation(
+                    "Cannot run \(job.label) manually: "
+                        + (job.runNowUnavailableReason
+                            ?? "Ticker cannot faithfully reproduce its scheduled execution context.")
+                )
+            }
+            guard childArguments == job.command, originalArgv0 == job.argv0 else {
+                throw CLIError.operation(
+                    "Cannot run \(job.label) manually because the supplied command does not match the discovered job."
+                )
+            }
+        } else if !wrapperVersionSeen,
+                  jobID.hasPrefix("launchd:") || jobID.hasPrefix("claude:") {
+            let discoveredJob = JobRegistry.standard().discoverAll().jobs.first {
+                $0.id == jobID
+            }
+            if let discoveredJob, !discoveredJob.canRunNow {
+                throw CLIError.operation(
+                    "Cannot run \(discoveredJob.label): "
+                        + (discoveredJob.runNowUnavailableReason
+                            ?? "Ticker cannot faithfully reproduce its scheduled execution context.")
+                )
+            }
+        }
+
         executeChild(
             jobID: jobID,
             arguments: childArguments,
             originalArgv0: originalArgv0,
-            tailBytes: tailBytes
+            tailBytes: tailBytes,
+            trigger: trigger
         )
     }
 
@@ -418,7 +481,8 @@ private struct TickerCLI {
         jobID: String,
         arguments: [String],
         originalArgv0: String?,
-        tailBytes: Int
+        tailBytes: Int,
+        trigger: RunTrigger
     ) -> Never {
         let startedAt = Date()
         var store: SQLiteRunStore?
@@ -428,7 +492,11 @@ private struct TickerCLI {
             let openedStore = try SQLiteRunStore(path: configuredStorePath())
             store = openedStore
             do {
-                runID = try openedStore.beginRun(jobID: jobID, startedAt: startedAt)
+                runID = try openedStore.beginRun(
+                    jobID: jobID,
+                    startedAt: startedAt,
+                    trigger: trigger
+                )
             } catch {
                 writeStandardError("ticker: could not record run start: \(error.localizedDescription)\n")
             }
@@ -556,7 +624,10 @@ private struct TickerCLI {
         }.map { job in
             ListRecord(
                 job: job,
-                lastOutcome: health[job.id] ?? outcome(from: job.lastKnownExit)
+                lastOutcome: JobHealthPolicy.outcome(
+                    for: job,
+                    scheduledHistory: health[job.id]
+                )
             )
         }
 
@@ -575,16 +646,18 @@ private struct TickerCLI {
                 record.schedule,
                 record.nextFireAt.map(formatDate) ?? "—",
                 record.lastOutcome.rawValue,
+                record.runtimeStatusAttribution?.rawValue ?? "—",
             ]
         }
         printTable(
-            headers: ["SOURCE", "STATE", "ID", "JOB", "SCHEDULE", "NEXT FIRE", "OUTCOME"],
+            headers: ["SOURCE", "STATE", "ID", "JOB", "SCHEDULE", "NEXT FIRE", "OUTCOME", "RUNTIME"],
             rows: rows
         )
         print("\n* managed by Ticker")
-        for record in records where record.runtimeStatusAttribution == .ambiguous {
-            if let explanation = record.runtimeStatusExplanation {
-                print("\(record.label): \(explanation)")
+        for record in records where record.source == .launchd {
+            if let attribution = record.runtimeStatusAttribution,
+               let explanation = record.runtimeStatusExplanation {
+                print("\(record.id) [\(attribution.rawValue)]: \(explanation)")
             }
         }
     }
@@ -630,6 +703,7 @@ private struct TickerCLI {
                     finishedAt: run.finishedAt,
                     duration: run.duration,
                     exitCode: run.exitCode,
+                    trigger: run.trigger,
                     outcome: run.outcome,
                     stdoutTail: run.stdoutTail,
                     stderrTail: run.stderrTail
@@ -642,12 +716,16 @@ private struct TickerCLI {
         let rows = runs.map { run in
             [
                 formatDate(run.startedAt),
+                run.trigger.rawValue,
                 run.duration.map { String(format: "%.3fs", $0) } ?? "running",
                 run.exitCode.map(String.init) ?? "—",
                 run.outcome.rawValue,
             ]
         }
-        printTable(headers: ["STARTED", "DURATION", "EXIT", "OUTCOME"], rows: rows)
+        printTable(
+            headers: ["STARTED", "TRIGGER", "DURATION", "EXIT", "OUTCOME"],
+            rows: rows
+        )
 
         for run in runs {
             if let stdout = run.stdoutTail, !stdout.isEmpty {
@@ -772,12 +850,6 @@ private struct TickerCLI {
         FileHandle.standardOutput.write(Data("\n".utf8))
     }
 
-    private func outcome(from exitStatus: ExitStatus?) -> Outcome {
-        guard let exitStatus = exitStatus else {
-            return .unknown
-        }
-        return exitStatus.isSuccess ? .success : .failure
-    }
 
     private func currentExecutablePath() -> String {
         if let resolved = resolveExecutable(CommandLine.arguments[0]) {
@@ -792,7 +864,7 @@ private struct TickerCLI {
         Ticker tracks scheduled jobs on this Mac.
 
         Usage:
-          ticker run --label <id> [--ticker-wrapper-version VERSION] [--argv0 VALUE] [--tail-bytes N] -- <argv>...
+          ticker run --label <id> [--manual] [--ticker-wrapper-version VERSION] [--argv0 VALUE] [--tail-bytes N] -- <argv>...
           ticker list [--json]
           ticker history <job-id> [--limit N] [--json]
           ticker wrap <job-id>
@@ -801,6 +873,7 @@ private struct TickerCLI {
           ticker --help
           ticker --version
 
+        --manual records a Run Now invocation without changing scheduled health.
         --argv0 preserves a launchd job's original process name when it differs
         from the executable. --tail-bytes is clamped to 1,048,576 bytes.
 

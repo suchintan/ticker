@@ -31,7 +31,7 @@ public struct JobIdentityMigrationReport: Equatable {
 }
 
 public final class SQLiteRunStore: RunStore {
-    private static let schemaVersion = "1"
+    private static let schemaVersion = "2"
     private static let jobIdentityMigrationKey = "job_identity_v2"
 
     private let database: OpaquePointer
@@ -88,13 +88,17 @@ public final class SQLiteRunStore: RunStore {
                 CREATE TABLE IF NOT EXISTS runs(
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   job_id TEXT NOT NULL, started_at REAL NOT NULL, finished_at REAL,
-                  exit_code INTEGER, stdout_tail TEXT, stderr_tail TEXT);
+                  exit_code INTEGER, stdout_tail TEXT, stderr_tail TEXT,
+                  trigger TEXT NOT NULL DEFAULT 'scheduled');
                 CREATE INDEX IF NOT EXISTS idx_runs_job ON runs(job_id, started_at DESC);
                 CREATE TABLE IF NOT EXISTS managed_jobs(
                   job_id TEXT PRIMARY KEY, wrapped_at REAL NOT NULL, backup_path TEXT);
+                CREATE TABLE IF NOT EXISTS health_resets(
+                  job_id TEXT PRIMARY KEY, reset_after_run_id INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);
                 """
             )
+            try Self.ensureRunsTriggerColumn(database: validDatabase)
             try Self.stampSchemaVersion(database: validDatabase)
         } catch {
             sqlite3_close_v2(validDatabase)
@@ -110,13 +114,20 @@ public final class SQLiteRunStore: RunStore {
         }
     }
 
-    public func beginRun(jobID: String, startedAt: Date) throws -> Int64 {
+    public func beginRun(
+        jobID: String,
+        startedAt: Date,
+        trigger: RunTrigger = .scheduled
+    ) throws -> Int64 {
         return try queue.sync {
-            let statement = try prepare("INSERT INTO runs(job_id, started_at) VALUES(?, ?);")
+            let statement = try prepare(
+                "INSERT INTO runs(job_id, started_at, trigger) VALUES(?, ?, ?);"
+            )
             defer { sqlite3_finalize(statement) }
 
             try bind(jobID, to: 1, in: statement)
             try bind(startedAt.timeIntervalSince1970, to: 2, in: statement)
+            try bind(trigger.rawValue, to: 3, in: statement)
             try stepDone(statement, operation: "insert run")
             return sqlite3_last_insert_rowid(database)
         }
@@ -160,7 +171,8 @@ public final class SQLiteRunStore: RunStore {
         return try queue.sync {
             let statement = try prepare(
                 """
-                SELECT id, job_id, started_at, finished_at, exit_code, stdout_tail, stderr_tail
+                SELECT id, job_id, started_at, finished_at, exit_code, stdout_tail, stderr_tail,
+                       trigger
                 FROM runs
                 WHERE job_id = ?
                 ORDER BY started_at DESC, id DESC
@@ -179,7 +191,8 @@ public final class SQLiteRunStore: RunStore {
         return try queue.sync {
             let statement = try prepare(
                 """
-                SELECT id, job_id, started_at, finished_at, exit_code, stdout_tail, stderr_tail
+                SELECT id, job_id, started_at, finished_at, exit_code, stdout_tail, stderr_tail,
+                       trigger
                 FROM runs
                 WHERE job_id = ?
                 ORDER BY started_at DESC, id DESC
@@ -204,15 +217,25 @@ public final class SQLiteRunStore: RunStore {
         return try queue.sync {
             let statement = try prepare(
                 """
-                WITH ranked_runs AS (
-                  SELECT id, job_id, started_at, finished_at, exit_code, stdout_tail, stderr_tail,
+                WITH eligible_runs AS (
+                  SELECT r.id, r.job_id, r.started_at, r.finished_at, r.exit_code,
+                         r.stdout_tail, r.stderr_tail, r.trigger
+                  FROM runs AS r
+                  LEFT JOIN health_resets AS reset ON reset.job_id = r.job_id
+                  WHERE r.trigger = 'scheduled'
+                    AND (reset.reset_after_run_id IS NULL OR r.id > reset.reset_after_run_id)
+                ),
+                ranked_runs AS (
+                  SELECT id, job_id, started_at, finished_at, exit_code, stdout_tail,
+                         stderr_tail, trigger,
                          ROW_NUMBER() OVER (
                            PARTITION BY job_id
                            ORDER BY started_at DESC, id DESC
                          ) AS position
-                  FROM runs
+                  FROM eligible_runs
                 )
-                SELECT id, job_id, started_at, finished_at, exit_code, stdout_tail, stderr_tail
+                SELECT id, job_id, started_at, finished_at, exit_code, stdout_tail,
+                       stderr_tail, trigger
                 FROM ranked_runs
                 WHERE position = 1;
                 """
@@ -255,11 +278,38 @@ public final class SQLiteRunStore: RunStore {
 
     public func unmarkManaged(jobID: String) throws {
         try queue.sync {
-            let statement = try prepare("DELETE FROM managed_jobs WHERE job_id = ?;")
-            defer { sqlite3_finalize(statement) }
+            try Self.execute(database: database, sql: "BEGIN IMMEDIATE TRANSACTION;")
+            var committed = false
+            defer {
+                if !committed {
+                    try? Self.execute(database: database, sql: "ROLLBACK;")
+                }
+            }
 
-            try bind(jobID, to: 1, in: statement)
-            try stepDone(statement, operation: "unmark managed job")
+            do {
+                let resetStatement = try prepare(
+                    """
+                    INSERT INTO health_resets(job_id, reset_after_run_id)
+                    VALUES(?, COALESCE((SELECT MAX(id) FROM runs WHERE job_id = ?), 0))
+                    ON CONFLICT(job_id) DO UPDATE SET
+                      reset_after_run_id = excluded.reset_after_run_id;
+                    """
+                )
+                defer { sqlite3_finalize(resetStatement) }
+                try bind(jobID, to: 1, in: resetStatement)
+                try bind(jobID, to: 2, in: resetStatement)
+                try stepDone(resetStatement, operation: "reset stored job health")
+            }
+
+            do {
+                let deleteStatement = try prepare("DELETE FROM managed_jobs WHERE job_id = ?;")
+                defer { sqlite3_finalize(deleteStatement) }
+                try bind(jobID, to: 1, in: deleteStatement)
+                try stepDone(deleteStatement, operation: "unmark managed job")
+            }
+
+            try Self.execute(database: database, sql: "COMMIT;")
+            committed = true
         }
     }
 
@@ -346,6 +396,7 @@ public final class SQLiteRunStore: RunStore {
                     try rekeyRuns(from: legacyID, to: newID)
                     try rekeyManagedJob(from: legacyID, to: newID)
                     migrated[legacyID] = newID
+                    try rekeyHealthReset(from: legacyID, to: newID)
                 }
                 try setSchemaMetaValue("complete", forKey: Self.jobIdentityMigrationKey)
                 let orphaned = try storedLegacyJobIDs()
@@ -388,6 +439,10 @@ public final class SQLiteRunStore: RunStore {
             SELECT job_id FROM managed_jobs
             WHERE instr(job_id, '#') = 0
               AND (job_id LIKE 'launchd:%' OR job_id LIKE 'claude:%')
+            UNION
+            SELECT job_id FROM health_resets
+            WHERE instr(job_id, '#') = 0
+              AND job_id LIKE 'launchd:%'
             ORDER BY job_id;
             """
         )
@@ -486,6 +541,29 @@ public final class SQLiteRunStore: RunStore {
         try stepDone(deleteStatement, operation: "delete legacy managed job id")
     }
 
+    private func rekeyHealthReset(from legacyID: String, to newID: String) throws {
+        let statement = try prepare(
+            """
+            INSERT INTO health_resets(job_id, reset_after_run_id)
+            SELECT ?, reset_after_run_id FROM health_resets WHERE job_id = ?
+            ON CONFLICT(job_id) DO UPDATE SET
+              reset_after_run_id = MAX(
+                health_resets.reset_after_run_id,
+                excluded.reset_after_run_id
+              );
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(newID, to: 1, in: statement)
+        try bind(legacyID, to: 2, in: statement)
+        try stepDone(statement, operation: "migrate job health reset")
+
+        let deleteStatement = try prepare("DELETE FROM health_resets WHERE job_id = ?;")
+        defer { sqlite3_finalize(deleteStatement) }
+        try bind(legacyID, to: 1, in: deleteStatement)
+        try stepDone(deleteStatement, operation: "delete legacy job health reset")
+    }
+
     private static func execute(database: OpaquePointer, sql: String) throws {
         let deadline = Date().addingTimeInterval(5)
         while true {
@@ -550,6 +628,53 @@ public final class SQLiteRunStore: RunStore {
                 operation: "stamp schema version",
                 code: stepResult,
                 message: String(cString: sqlite3_errmsg(database))
+            )
+        }
+    }
+
+    private static func ensureRunsTriggerColumn(database: OpaquePointer) throws {
+        var statement: OpaquePointer?
+        let prepareResult = sqlite3_prepare_v2(
+            database,
+            "PRAGMA table_info(runs);",
+            -1,
+            &statement,
+            nil
+        )
+        guard prepareResult == SQLITE_OK, let validStatement = statement else {
+            throw SQLiteRunStoreError(
+                operation: "inspect runs schema",
+                code: prepareResult,
+                message: String(cString: sqlite3_errmsg(database))
+            )
+        }
+
+        var hasTriggerColumn = false
+        while true {
+            let stepResult = sqlite3_step(validStatement)
+            if stepResult == SQLITE_ROW {
+                if let name = sqlite3_column_text(validStatement, 1),
+                   String(cString: name) == "trigger" {
+                    hasTriggerColumn = true
+                }
+                continue
+            }
+            if stepResult != SQLITE_DONE {
+                sqlite3_finalize(validStatement)
+                throw SQLiteRunStoreError(
+                    operation: "inspect runs schema",
+                    code: stepResult,
+                    message: String(cString: sqlite3_errmsg(database))
+                )
+            }
+            break
+        }
+        sqlite3_finalize(validStatement)
+
+        if !hasTriggerColumn {
+            try execute(
+                database: database,
+                sql: "ALTER TABLE runs ADD COLUMN trigger TEXT NOT NULL DEFAULT 'scheduled';"
             )
         }
     }
@@ -655,6 +780,8 @@ public final class SQLiteRunStore: RunStore {
             exitCode = sqlite3_column_int(statement, 4)
         }
 
+        let trigger = textColumn(7, in: statement)
+            .flatMap(RunTrigger.init(rawValue:)) ?? .scheduled
         return Run(
             id: sqlite3_column_int64(statement, 0),
             jobID: textColumn(1, in: statement) ?? "",
@@ -662,6 +789,7 @@ public final class SQLiteRunStore: RunStore {
             finishedAt: finishedAt,
             exitCode: exitCode,
             stdoutTail: textColumn(5, in: statement),
+            trigger: trigger,
             stderrTail: textColumn(6, in: statement)
         )
     }

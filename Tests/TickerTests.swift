@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import SQLite3
 
 private final class TestHarness {
     private(set) var passed = 0
@@ -284,22 +285,15 @@ private func testCronAndSchedules(_ tests: TestHarness) throws {
 }
 
 private func launchdRunner(_ executable: URL, _ arguments: [String]) throws -> AdapterCommandResult {
-    if arguments == ["list"] {
-        return AdapterCommandResult(
-            status: 0,
-            stdout: "PID\tStatus\tLabel\n-\t32512\tcom.example.dictionary\n88\t0\tcom.example.array\n99\t0\tCyolo\n",
-            stderr: ""
-        )
+    guard arguments.count == 2, arguments[0] == "print" else {
+        return AdapterCommandResult(status: 1, stdout: "", stderr: "unexpected command")
     }
-    if arguments.count == 2, arguments[0] == "list" {
-        let raw = arguments[1] == "com.example.dictionary" ? 32_512 : 0
-        return AdapterCommandResult(
-            status: 0,
-            stdout: "{\n\t\"LastExitStatus\" = \(raw);\n}\n",
-            stderr: ""
-        )
-    }
-    return AdapterCommandResult(status: 1, stdout: "", stderr: "unexpected \(executable.path)")
+    let raw = arguments[1].hasSuffix("/com.example.dictionary") ? 32_512 : 0
+    return AdapterCommandResult(
+        status: 0,
+        stdout: "state = running\nlast exit code = \(raw)\n",
+        stderr: ""
+    )
 }
 
 private func testLaunchdAdapter(_ tests: TestHarness) throws {
@@ -2098,18 +2092,13 @@ private func test4B_LaunchdIdentityExecutionAndAmbiguity(_ tests: TestHarness) t
 
         var detailedStatusQueries = 0
         let runner: AdapterCommandRunner = { _, arguments in
-            if arguments == ["list"] {
-                return AdapterCommandResult(
-                    status: 0,
-                    stdout: "PID\tStatus\tLabel\n88\t256\tcom.example.stable\n",
-                    stderr: ""
-                )
-            }
-            if arguments == ["list", "com.example.stable"] {
+            if arguments.count == 2,
+               arguments[0] == "print",
+               arguments[1].hasSuffix("/com.example.stable") {
                 detailedStatusQueries += 1
                 return AdapterCommandResult(
                     status: 0,
-                    stdout: "{\n\t\"LastExitStatus\" = 256;\n}\n",
+                    stdout: "state = exited\nlast exit code = 256\n",
                     stderr: ""
                 )
             }
@@ -2562,6 +2551,27 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                         == "Ticker observes Claude routines but cannot faithfully re-run them. Trigger this routine from Claude.",
                     "Claude Run Now explanation changed"
                 )
+
+                let protectedLaunchdJob = makeJob(
+                    id: "launchd:test5-protected",
+                    source: .launchd,
+                    environment: [:],
+                    command: ["/usr/bin/true"],
+                    runNowUnavailableReason: "test5 scheduled identity differs"
+                )
+                let protectedRunNow = JobRunNowPresentation(
+                    job: protectedLaunchdJob,
+                    busy: false
+                )
+                try check(!protectedRunNow.isEnabled, "test5_identityMismatch_disablesRunNowInUI")
+                try check(
+                    protectedRunNow.disabledTitle == "Run Now is unavailable",
+                    "test5_identityMismatch_usesRunNowDisabledTitle"
+                )
+                try check(
+                    protectedRunNow.disabledDetail == "test5 scheduled identity differs",
+                    "test5_identityMismatch_surfacesExactReasonInUI"
+                )
                 let busyRunNow = JobRunNowPresentation(job: declaredPathJob, busy: true)
                 try check(!busyRunNow.isEnabled, "busy Run Now presentation was enabled")
 
@@ -2658,7 +2668,8 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                 label: String? = nil,
                 environment: [String: String],
                 command: [String],
-                argv0: String? = nil
+                argv0: String? = nil,
+                runNowUnavailableReason: String? = nil
             ) -> Job {
                 Job(
                     id: id,
@@ -2670,6 +2681,7 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                     environment: environment,
                     cwd: nil,
                     enabled: true,
+                    runNowUnavailableReason: runNowUnavailableReason,
                     configPath: nil,
                     lastKnownExit: nil,
                     lastRunAt: nil,
@@ -3073,6 +3085,655 @@ private func test4A_SignalReapingStress(_ tests: TestHarness) throws {
     }
 }
 
+private final class test5_StaticAdapter: JobSourceAdapter {
+    let source: JobSource
+    private let jobs: [Job]
+
+    init(source: JobSource, jobs: [Job]) {
+        self.source = source
+        self.jobs = jobs
+    }
+
+    func discover() throws -> [Job] {
+        jobs
+    }
+}
+
+private func test5_makeJob(
+    id: String,
+    source: JobSource = .launchd,
+    label: String? = nil,
+    command: [String] = ["/usr/bin/true"],
+    cwd: String? = nil,
+    lastKnownExit: ExitStatus? = nil,
+    managed: Bool = false
+) -> Job {
+    Job(
+        id: id,
+        source: source,
+        label: label ?? id,
+        schedule: .onDemand,
+        command: command,
+        cwd: cwd,
+        enabled: true,
+        configPath: nil,
+        lastKnownExit: lastKnownExit,
+        lastRunAt: nil,
+        lastScheduledFor: nil,
+        managed: managed
+    )
+}
+
+private func test5_finish(
+    store: SQLiteRunStore,
+    jobID: String,
+    trigger: RunTrigger,
+    startedAt: Date,
+    exitCode: Int32
+) throws -> Int64 {
+    let id = try store.beginRun(jobID: jobID, startedAt: startedAt, trigger: trigger)
+    try store.finishRun(
+        id: id,
+        exitCode: exitCode,
+        stdoutTail: "",
+        stderrTail: "",
+        finishedAt: startedAt.addingTimeInterval(1)
+    )
+    return id
+}
+
+private func test5_HealthPrecedenceAndManualIsolation(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round5-health") { directory in
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("runs.db").path)
+
+        let nativeFailureID = "launchd:test5-native-failure"
+        _ = try test5_finish(
+            store: store,
+            jobID: nativeFailureID,
+            trigger: .manual,
+            startedAt: Date(timeIntervalSince1970: 100),
+            exitCode: 0
+        )
+        let nativeFailure = test5_makeJob(
+            id: nativeFailureID,
+            lastKnownExit: ExitStatus(raw: 1)
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: nativeFailure,
+                scheduledHistory: try store.health()[nativeFailureID]
+            ),
+            .failure,
+            "test5_successThenNativeFailure_usesNativeFailure"
+        )
+
+        let nativeSuccessID = "launchd:test5-native-success"
+        _ = try test5_finish(
+            store: store,
+            jobID: nativeSuccessID,
+            trigger: .manual,
+            startedAt: Date(timeIntervalSince1970: 200),
+            exitCode: 1
+        )
+        let nativeSuccess = test5_makeJob(
+            id: nativeSuccessID,
+            lastKnownExit: ExitStatus(raw: 0)
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: nativeSuccess,
+                scheduledHistory: try store.health()[nativeSuccessID]
+            ),
+            .success,
+            "test5_failureThenNativeSuccess_usesNativeSuccess"
+        )
+
+        let manualIsolationID = "cron:test5-manual-isolation"
+        _ = try test5_finish(
+            store: store,
+            jobID: manualIsolationID,
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 300),
+            exitCode: 1
+        )
+        _ = try test5_finish(
+            store: store,
+            jobID: manualIsolationID,
+            trigger: .manual,
+            startedAt: Date(timeIntervalSince1970: 400),
+            exitCode: 0
+        )
+        let cronJob = test5_makeJob(id: manualIsolationID, source: .crontab)
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: cronJob,
+                scheduledHistory: try store.health()[manualIsolationID]
+            ),
+            .failure,
+            "test5_manualRun_neverChangesScheduledHealth"
+        )
+        tests.expectEqual(
+            try store.runs(jobID: manualIsolationID, limit: 2).map(\.trigger),
+            [.manual, .scheduled],
+            "test5_manualRun_remainsVisibleAndLabeledInHistory"
+        )
+
+        let wrappedID = "launchd:test5-wrapped"
+        _ = try test5_finish(
+            store: store,
+            jobID: wrappedID,
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 500),
+            exitCode: 0
+        )
+        let wrappedJob = test5_makeJob(
+            id: wrappedID,
+            lastKnownExit: ExitStatus(raw: 1),
+            managed: true
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: wrappedJob,
+                scheduledHistory: try store.health()[wrappedID]
+            ),
+            .success,
+            "test5_wrappedJob_prefersScheduledHistory"
+        )
+        _ = try store.beginRun(
+            jobID: wrappedID,
+            startedAt: Date(timeIntervalSince1970: 501),
+            trigger: .scheduled
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: wrappedJob,
+                scheduledHistory: try store.health()[wrappedID]
+            ),
+            .running,
+            "test5_wrappedInProgressRun_isNotHiddenByStaleNativeExit"
+        )
+    }
+}
+
+private func test5_UnwrapResetsHealthWithoutDeletingHistory(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round5-unwrap") { directory in
+        let plistURL = directory.appendingPathComponent("com.example.test5.plist")
+        try writePropertyList(
+            [
+                "Label": "com.example.test5",
+                "ProgramArguments": ["/usr/bin/true"],
+            ],
+            to: plistURL
+        )
+        let job = Job(
+            id: "launchd:com.example.test5#555555555555",
+            source: .launchd,
+            label: "com.example.test5",
+            schedule: .onDemand,
+            command: ["/usr/bin/true"],
+            cwd: nil,
+            enabled: true,
+            configPath: plistURL.path,
+            lastKnownExit: nil,
+            lastRunAt: nil,
+            lastScheduledFor: nil,
+            managed: false
+        )
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("runs.db").path)
+        let wrapper = JobWrapper(
+            store: store,
+            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
+        )
+
+        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        _ = try test5_finish(
+            store: store,
+            jobID: job.id,
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 600),
+            exitCode: 0
+        )
+        tests.expectEqual(
+            try store.health()[job.id],
+            .success,
+            "test5_unwrap_fixture_hasStoredScheduledHealthBeforeRestore"
+        )
+
+        _ = try wrapper.unwrap(job: job)
+        tests.expectEqual(
+            try store.health()[job.id],
+            nil,
+            "test5_unwrap_doesNotResurrectStaleStoredHealth"
+        )
+        tests.expectEqual(
+            try store.runs(jobID: job.id, limit: 10).map(\.outcome),
+            [.success],
+            "test5_unwrap_preservesHistoryForInspection"
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(for: job, scheduledHistory: try store.health()[job.id]),
+            .unknown,
+            "test5_unwrap_withoutNativeStatus_reportsUnknown"
+        )
+    }
+}
+
+private func test5_RunTriggerSchemaMigration(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round5-trigger-migration") { directory in
+        let databaseURL = directory.appendingPathComponent("legacy.db")
+        var database: OpaquePointer?
+        guard sqlite3_open(databaseURL.path, &database) == SQLITE_OK, let database else {
+            throw FixtureError.missing("test5 legacy sqlite database")
+        }
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(
+            database,
+            """
+            CREATE TABLE runs(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              job_id TEXT NOT NULL, started_at REAL NOT NULL, finished_at REAL,
+              exit_code INTEGER, stdout_tail TEXT, stderr_tail TEXT);
+            INSERT INTO runs(job_id, started_at, finished_at, exit_code)
+            VALUES('cron:test5-legacy', 10, 11, 0);
+            """,
+            nil,
+            nil,
+            &errorMessage
+        )
+        let sqliteMessage = errorMessage.map { String(cString: $0) }
+        if let errorMessage {
+            sqlite3_free(errorMessage)
+        }
+        _ = sqlite3_close(database)
+        guard result == SQLITE_OK else {
+            throw FixtureError.missing(sqliteMessage ?? "test5 legacy schema setup failed")
+        }
+
+        let migrated = try SQLiteRunStore(path: databaseURL.path)
+        tests.expectEqual(
+            try migrated.latestRun(jobID: "cron:test5-legacy")?.trigger,
+            .scheduled,
+            "test5_existingRunRows_migrateToScheduledTrigger"
+        )
+        tests.expectEqual(
+            try migrated.health()["cron:test5-legacy"],
+            .success,
+            "test5_migratedScheduledRun_contributesToHealth"
+        )
+        let reopened = try SQLiteRunStore(path: databaseURL.path)
+        tests.expectEqual(
+            try reopened.latestRun(jobID: "cron:test5-legacy")?.trigger,
+            .scheduled,
+            "test5_triggerMigration_isIdempotent"
+        )
+    }
+}
+
+private func test5_CrontabContextAndIdentity(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round5-crontab") { directory in
+        let fixtureHome = directory.appendingPathComponent("fixture-home", isDirectory: true)
+        let bin = fixtureHome.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let backup = bin.appendingPathComponent("backup")
+        try "#!/bin/sh\nprintf '%s|%s\\n' \"$PWD\" \"$FOO\"\n".write(
+            to: backup,
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: backup.path
+        )
+
+        let crontab = """
+        HOME=\(fixtureHome.path)
+        FOO=one
+        0 4 * * * ./bin/backup
+        FOO=two
+        0 4 * * * ./bin/backup
+        """
+        let adapter = CrontabAdapter { _, arguments in
+            guard arguments == ["-l"] else {
+                return AdapterCommandResult(status: 1, stdout: "", stderr: "unexpected")
+            }
+            return AdapterCommandResult(status: 0, stdout: crontab, stderr: "")
+        }
+        let firstDiscovery = try adapter.discover()
+        let secondDiscovery = try adapter.discover()
+        tests.expectEqual(
+            firstDiscovery.map(\.cwd),
+            [fixtureHome.path, fixtureHome.path],
+            "test5_crontabJobs_useEffectiveHomeAsWorkingDirectory"
+        )
+        tests.expectEqual(
+            Set(firstDiscovery.map(\.id)).count,
+            2,
+            "test5_sameCommandDifferentEnvironment_hasDistinctIDs"
+        )
+        tests.expectEqual(
+            firstDiscovery.map(\.id),
+            secondDiscovery.map(\.id),
+            "test5_environmentAwareCrontabIDs_areStable"
+        )
+
+        let firstJob = try require(
+            firstDiscovery.first { $0.environment["FOO"] == "one" },
+            "test5 first crontab environment"
+        )
+        let execution = try test3A_runProcess(
+            firstJob.command[0],
+            Array(firstJob.command.dropFirst()),
+            environment: firstJob.environment,
+            currentDirectory: URL(fileURLWithPath: try require(firstJob.cwd, "test5 cron cwd"))
+        )
+        tests.expectEqual(execution.status, 0, "test5_relativeCronCommand_exitsSuccessfully")
+        tests.expectEqual(
+            execution.stdout.replacingOccurrences(of: "/private/var/", with: "/var/"),
+            "\(fixtureHome.path)|one\n",
+            "test5_relativeCronCommand_runsFromFixtureHomeNotHarnessDirectory"
+        )
+    }
+}
+
+private func test5_RegistryEnforcesUniqueIDs(_ tests: TestHarness) {
+    let first = test5_makeJob(
+        id: "collision:test5",
+        source: .crontab,
+        label: "first"
+    )
+    let second = test5_makeJob(
+        id: "collision:test5",
+        source: .launchd,
+        label: "second"
+    )
+    let result = JobRegistry(
+        adapters: [
+            test5_StaticAdapter(source: .crontab, jobs: [first]),
+            test5_StaticAdapter(source: .launchd, jobs: [second]),
+        ]
+    ).discoverAll()
+
+    tests.expectEqual(result.jobs.map(\.id), ["collision:test5"], "test5_registry_neverEmitsDuplicateIDs")
+    tests.expect(
+        result.errors.contains {
+            ($0 as? DuplicateJobIDError)?.jobID == "collision:test5"
+        },
+        "test5_registry_reportsDetectedIDCollision"
+    )
+}
+
+private func test5_LaunchdDomainIdentityAndStatus(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round5-launchd-domain") { directory in
+        let daemons = directory
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("LaunchDaemons", isDirectory: true)
+        let agents = directory
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("LaunchAgents", isDirectory: true)
+        try FileManager.default.createDirectory(at: daemons, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: agents, withIntermediateDirectories: true)
+
+        try writePropertyList(
+            [
+                "Label": "com.example.test5.system",
+                "ProgramArguments": ["/usr/bin/true"],
+                "UserName": "root",
+                "GroupName": "wheel",
+            ],
+            to: daemons.appendingPathComponent("com.example.test5.system.plist")
+        )
+        try writePropertyList(
+            [
+                "Label": "com.example.test5.agent",
+                "ProgramArguments": ["/usr/bin/true"],
+            ],
+            to: agents.appendingPathComponent("com.example.test5.agent.plist")
+        )
+
+        var queriedTargets: [String] = []
+        let adapter = LaunchdAdapter(searchDirectories: [daemons, agents]) { _, arguments in
+            guard arguments.count == 2, arguments[0] == "print" else {
+                return AdapterCommandResult(status: 1, stdout: "", stderr: "unexpected")
+            }
+            queriedTargets.append(arguments[1])
+            return AdapterCommandResult(
+                status: 0,
+                stdout: "state = running\nlast exit code = 0\n",
+                stderr: ""
+            )
+        }
+        let jobs = try adapter.discover()
+        let daemon = try require(
+            jobs.first { $0.label == "com.example.test5.system" },
+            "test5 system daemon"
+        )
+        let agent = try require(
+            jobs.first { $0.label == "com.example.test5.agent" },
+            "test5 user agent"
+        )
+
+        tests.expectEqual(daemon.launchdDomain, .systemDaemon, "test5_daemon_carriesSystemDomain")
+        tests.expectEqual(daemon.launchdUserName, "root", "test5_daemon_carriesUserName")
+        tests.expectEqual(daemon.launchdGroupName, "wheel", "test5_daemon_carriesGroupName")
+        tests.expect(!daemon.canRunNow, "test5_systemDaemon_isNotRunnableAsSignedInUser")
+        tests.expect(
+            daemon.runNowUnavailableReason?.contains("system domain") == true
+                && daemon.runNowUnavailableReason?.contains("identities differ") == true,
+            "test5_systemDaemon_hasExplicitIdentityMismatchReason"
+        )
+        tests.expectEqual(agent.launchdDomain, .userAgent, "test5_agent_carriesUserDomain")
+        tests.expect(agent.canRunNow, "test5_plainCurrentUserAgent_remainsRunnable")
+        tests.expectEqual(agent.runNowUnavailableReason, nil, "test5_plainAgent_hasNoRunNowBlockReason")
+        tests.expectEqual(daemon.lastKnownExit?.code, 0, "test5_systemStatus_comesFromSystemTarget")
+        tests.expectEqual(agent.lastKnownExit?.code, 0, "test5_agentStatus_comesFromGUIUserTarget")
+        tests.expect(
+            queriedTargets.contains("system/com.example.test5.system"),
+            "test5_launchdStatus_queriesSystemDomainExplicitly"
+        )
+        tests.expect(
+            queriedTargets.contains("gui/\(geteuid())/com.example.test5.agent"),
+            "test5_launchdStatus_queriesGUIUserDomainExplicitly"
+        )
+    }
+}
+
+private func test6_LaunchdDuplicateStatusIsDomainScoped(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round6-launchd-duplicates") { root in
+        let firstAgents = root
+            .appendingPathComponent("first", isDirectory: true)
+            .appendingPathComponent("LaunchAgents", isDirectory: true)
+        let secondAgents = root
+            .appendingPathComponent("second", isDirectory: true)
+            .appendingPathComponent("LaunchAgents", isDirectory: true)
+        let daemons = root.appendingPathComponent("LaunchDaemons", isDirectory: true)
+        for directory in [firstAgents, secondAgents, daemons] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+
+        try writePropertyList(
+            ["Label": "Cyolo", "ProgramArguments": ["/usr/bin/true"]],
+            to: firstAgents.appendingPathComponent("cyolo-first.plist")
+        )
+        try writePropertyList(
+            ["Label": "Cyolo", "ProgramArguments": ["/usr/bin/false"]],
+            to: secondAgents.appendingPathComponent("cyolo-second.plist")
+        )
+        try writePropertyList(
+            ["Label": "Cyolo", "ProgramArguments": ["/usr/bin/true"]],
+            to: daemons.appendingPathComponent("cyolo-system.plist")
+        )
+
+        var queriedTargets: [String] = []
+        let adapter = LaunchdAdapter(
+            searchDirectories: [firstAgents, secondAgents, daemons]
+        ) { _, arguments in
+            guard arguments.count == 2, arguments[0] == "print" else {
+                return AdapterCommandResult(status: 1, stdout: "", stderr: "unexpected command")
+            }
+            queriedTargets.append(arguments[1])
+            if arguments[1] == "system/Cyolo" {
+                return AdapterCommandResult(
+                    status: 0,
+                    stdout: "state = exited\nlast exit code = 256\n",
+                    stderr: ""
+                )
+            }
+            return AdapterCommandResult(
+                status: 0,
+                stdout: "state = exited\nlast exit code = 0\n",
+                stderr: ""
+            )
+        }
+
+        let jobs = try adapter.discover().filter { $0.label == "Cyolo" }
+        let userJobs = jobs.filter { $0.launchdDomain == .userAgent }
+        let systemJob = try require(
+            jobs.first { $0.launchdDomain == .systemDaemon },
+            "test6 system Cyolo job"
+        )
+
+        tests.expectEqual(userJobs.count, 2, "test6_duplicate_sameDomain_keepsBothJobs")
+        tests.expect(
+            userJobs.allSatisfy { $0.runtimeStatusAttribution == .ambiguous },
+            "test6_duplicate_sameDomain_marksBothAmbiguous"
+        )
+        tests.expect(
+            userJobs.allSatisfy { $0.lastKnownExit == nil },
+            "test6_duplicate_sameDomain_attributesNoExitToEitherJob"
+        )
+        tests.expect(
+            userJobs.allSatisfy {
+                $0.runtimeStatusExplanation?.contains("label 'Cyolo'") == true
+                    && $0.runtimeStatusExplanation?.contains("gui domain") == true
+            },
+            "test6_duplicate_sameDomain_namesConflictingLabelAndDomain"
+        )
+        tests.expect(
+            !queriedTargets.contains("gui/\(geteuid())/Cyolo"),
+            "test6_duplicate_sameDomain_neverQueriesSharedRuntimeRecord"
+        )
+        tests.expectEqual(
+            systemJob.runtimeStatusAttribution,
+            .resolved,
+            "test6_sameLabel_differentDomain_remainsResolvable"
+        )
+        tests.expectEqual(
+            systemJob.lastKnownExit?.code,
+            1,
+            "test6_sameLabel_differentDomain_keepsOwnExitStatus"
+        )
+        tests.expectEqual(
+            queriedTargets.filter { $0 == "system/Cyolo" }.count,
+            1,
+            "test6_sameLabel_differentDomain_queriesOnlyItsOwnRecord"
+        )
+    }
+}
+
+private func test6_LaunchdRuntimeStatusExplanations(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round6-launchd-attribution") { root in
+        let agents = root.appendingPathComponent("LaunchAgents", isDirectory: true)
+        try FileManager.default.createDirectory(at: agents, withIntermediateDirectories: true)
+
+        for label in [
+            "com.example.resolved",
+            "com.example.never-exited",
+            "com.example.unavailable",
+            "com.example.record-without-exit",
+        ] {
+            try writePropertyList(
+                ["Label": label, "ProgramArguments": ["/usr/bin/true"]],
+                to: agents.appendingPathComponent("\(label).plist")
+            )
+        }
+
+        let adapter = LaunchdAdapter(searchDirectories: [agents]) { _, arguments in
+            guard arguments.count == 2, arguments[0] == "print" else {
+                return AdapterCommandResult(status: 1, stdout: "", stderr: "unexpected command")
+            }
+            switch arguments[1] {
+            case "gui/\(geteuid())/com.example.resolved":
+                return AdapterCommandResult(
+                    status: 0,
+                    stdout: "state = exited\nlast exit code = 0\n",
+                    stderr: ""
+                )
+            case "gui/\(geteuid())/com.example.never-exited":
+                return AdapterCommandResult(
+                    status: 0,
+                    stdout: "state = running\nlast exit code = (never exited)\n",
+                    stderr: ""
+                )
+            case "gui/\(geteuid())/com.example.record-without-exit":
+                return AdapterCommandResult(status: 0, stdout: "state = waiting\n", stderr: "")
+            default:
+                return AdapterCommandResult(status: 113, stdout: "", stderr: "Could not find service")
+            }
+        }
+        let jobs = try adapter.discover()
+        let byLabel = Dictionary(uniqueKeysWithValues: jobs.map { ($0.label, $0) })
+        let resolved = try require(byLabel["com.example.resolved"], "test6 resolved job")
+        let neverExited = try require(byLabel["com.example.never-exited"], "test6 never-exited job")
+        let unavailable = try require(byLabel["com.example.unavailable"], "test6 unavailable job")
+        let recordWithoutExit = try require(
+            byLabel["com.example.record-without-exit"],
+            "test6 record-without-exit job"
+        )
+
+        tests.expect(
+            jobs.allSatisfy {
+                $0.runtimeStatusAttribution != nil && $0.runtimeStatusExplanation != nil
+            },
+            "test6_everyLaunchdJob_hasRuntimeAttributionAndExplanation"
+        )
+        tests.expectEqual(
+            resolved.runtimeStatusAttribution,
+            .resolved,
+            "test6_resolvedRecord_hasResolvedAttribution"
+        )
+        tests.expect(
+            resolved.runtimeStatusExplanation?.contains("own domain-qualified launchd record") == true,
+            "test6_resolvedRecord_explainsStatusSource"
+        )
+        tests.expectEqual(
+            neverExited.runtimeStatusAttribution,
+            .neverExited,
+            "test6_runningNeverExited_hasDedicatedAttribution"
+        )
+        tests.expectEqual(
+            neverExited.lastKnownExit,
+            nil,
+            "test6_runningNeverExited_hasNoInventedExit"
+        )
+        tests.expect(neverExited.enabled, "test6_runningNeverExited_remainsLoaded")
+        tests.expect(
+            neverExited.runtimeStatusExplanation?.contains("running and has never exited") == true,
+            "test6_runningNeverExited_explainsWhyExitIsUnknown"
+        )
+        tests.expectEqual(
+            unavailable.runtimeStatusAttribution,
+            .unavailable,
+            "test6_missingRecord_hasUnavailableAttribution"
+        )
+        tests.expect(!unavailable.enabled, "test6_missingRecord_isNotLoaded")
+        tests.expect(
+            unavailable.runtimeStatusExplanation?.contains("not loaded or its record is unavailable") == true,
+            "test6_missingRecord_explainsUnavailableStatus"
+        )
+        tests.expectEqual(
+            recordWithoutExit.runtimeStatusAttribution,
+            .recordWithoutExit,
+            "test6_loadedRecordWithoutExit_hasDedicatedAttribution"
+        )
+        tests.expect(recordWithoutExit.enabled, "test6_loadedRecordWithoutExit_remainsLoaded")
+        tests.expect(
+            recordWithoutExit.runtimeStatusExplanation?.contains("does not include a usable last-exit status")
+                == true,
+            "test6_loadedRecordWithoutExit_explainsMissingValue"
+        )
+    }
+}
+
 @main
 private enum TickerTests {
     static func main() {
@@ -3125,6 +3786,30 @@ private enum TickerTests {
         }
         tests.run("round 4A blocked-parent capture") { try test4A_BlockedParentCapture(tests) }
         tests.run("round 4A signal/reap stress") { try test4A_SignalReapingStress(tests) }
+        tests.run("round 5 health precedence and manual isolation") {
+            try test5_HealthPrecedenceAndManualIsolation(tests)
+        }
+        tests.run("round 5 unwrap health reset") {
+            try test5_UnwrapResetsHealthWithoutDeletingHistory(tests)
+        }
+        tests.run("round 5 trigger schema migration") {
+            try test5_RunTriggerSchemaMigration(tests)
+        }
+        tests.run("round 5 crontab context and identity") {
+            try test5_CrontabContextAndIdentity(tests)
+        }
+        tests.run("round 5 registry id invariant") {
+            test5_RegistryEnforcesUniqueIDs(tests)
+        }
+        tests.run("round 5 launchd domain, identity, and status") {
+            try test5_LaunchdDomainIdentityAndStatus(tests)
+        }
+        tests.run("round 6 launchd duplicate status is domain-scoped") {
+            try test6_LaunchdDuplicateStatusIsDomainScoped(tests)
+        }
+        tests.run("round 6 launchd runtime status explanations") {
+            try test6_LaunchdRuntimeStatusExplanations(tests)
+        }
         tests.finish()
     }
 }

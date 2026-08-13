@@ -15,10 +15,16 @@ struct JobRunNowPresentation: Equatable {
             helpText = "Run this job now."
             disabledTitle = nil
             disabledDetail = nil
-        } else {
+        } else if job.source == .claudeRoutine {
             helpText = "Ticker observes this job but cannot faithfully re-run it. Trigger it from Claude."
             disabledTitle = "Claude routines cannot run from Ticker"
             disabledDetail = "Ticker observes Claude routines but cannot faithfully re-run them. Trigger this routine from Claude."
+        } else {
+            let reason = job.runNowUnavailableReason
+                ?? "Ticker cannot faithfully reproduce this job's scheduled execution context."
+            helpText = reason
+            disabledTitle = "Run Now is unavailable"
+            disabledDetail = reason
         }
     }
 }
@@ -72,17 +78,31 @@ struct JobDetailView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .firstTextBaseline) {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 5) {
                 Text(job.label)
                     .font(.title2.bold())
                     .textSelection(.enabled)
-                Spacer()
-                DetailOutcomeBadge(outcome: model.outcome(for: job))
+                Text(job.source == .claudeRoutine ? "Claude routine" : job.source.rawValue)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
-            Text(job.source == .claudeRoutine ? "Claude routine" : job.source.rawValue)
-                .font(.caption)
-                .foregroundColor(.secondary)
+            Spacer()
+            VStack(alignment: .trailing, spacing: 4) {
+                DetailOutcomeBadge(outcome: model.outcome(for: job))
+                if let attribution = job.runtimeStatusAttribution,
+                   let explanation = job.runtimeStatusExplanation {
+                    Text("Runtime: \(attribution.rawValue)")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundColor(attribution == .ambiguous ? .orange : .secondary)
+                    Text(explanation)
+                        .font(.caption2)
+                        .foregroundColor(attribution == .ambiguous ? .orange : .secondary)
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 320, alignment: .trailing)
+                        .textSelection(.enabled)
+                }
+            }
         }
     }
 
@@ -118,15 +138,6 @@ struct JobDetailView: View {
             )
         }
 
-
-        if let explanation = job.runtimeStatusExplanation {
-            DetailCallout(
-                color: .orange,
-                icon: "questionmark.diamond.fill",
-                title: "Runtime status is ambiguous",
-                detail: explanation
-            )
-        }
         if job.source == .launchd {
             if let recoveryError = model.recoveryStateError(for: job) {
                 DetailCallout(
@@ -517,6 +528,9 @@ private struct RunHistoryRow: View {
                     .frame(width: 7, height: 7)
                 Text(Self.dateTime(run.startedAt))
                     .frame(maxWidth: .infinity, alignment: .leading)
+                Text(run.trigger.rawValue)
+                    .foregroundColor(run.trigger == .manual ? .orange : .secondary)
+                    .frame(width: 64, alignment: .leading)
                 Text(durationText)
                     .foregroundColor(.secondary)
                     .frame(width: 62, alignment: .trailing)

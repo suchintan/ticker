@@ -105,12 +105,23 @@ public final class CrontabAdapter: JobSourceAdapter {
                 continue
             }
             // Merge order is cron's documented defaults first, followed by assignments
-            // declared above this entry. A crontab assignment always wins.
-            let jobEnvironment = schedulerDefaults.merging(parsedEnvironment) {
+            // declared above this entry. A crontab assignment always wins unless it
+            // makes HOME empty, which cron replaces with the passwd entry.
+            var jobEnvironment = schedulerDefaults.merging(parsedEnvironment) {
                 _, declaredValue in declaredValue
             }
-            let identifier = "cron:\(hashPrefix(rawLine))"
-            let shell = jobEnvironment["SHELL"].flatMap { $0.isEmpty ? nil : $0 } ?? "/bin/sh"
+            let cwd = nonEmpty(jobEnvironment["HOME"]) ?? nonEmpty(schedulerDefaults["HOME"])
+            if let cwd {
+                jobEnvironment["HOME"] = cwd
+            }
+            let shell = nonEmpty(jobEnvironment["SHELL"]) ?? "/bin/sh"
+            let identityHash = hashPrefix(
+                line: rawLine,
+                environment: jobEnvironment,
+                cwd: cwd,
+                shell: shell
+            )
+            let identifier = "cron:\(identityHash)"
             jobs.append(
                 Job(
                     id: identifier,
@@ -119,7 +130,7 @@ public final class CrontabAdapter: JobSourceAdapter {
                     schedule: entry.schedule,
                     command: [shell, "-c", entry.command],
                     environment: jobEnvironment,
-                    cwd: nil,
+                    cwd: cwd,
                     enabled: true,
                     configPath: nil,
                     lastKnownExit: nil,
@@ -132,6 +143,9 @@ public final class CrontabAdapter: JobSourceAdapter {
 
         environment = schedulerDefaults.merging(parsedEnvironment) {
             _, declaredValue in declaredValue
+        }
+        if nonEmpty(environment["HOME"]) == nil, let home = nonEmpty(schedulerDefaults["HOME"]) {
+            environment["HOME"] = home
         }
         return jobs
     }
@@ -231,10 +245,34 @@ public final class CrontabAdapter: JobSourceAdapter {
         return (tokens, String(line[index...]))
     }
 
-    private func hashPrefix(_ line: String) -> String {
-        SHA256.hash(data: Data(line.utf8))
+    private func nonEmpty(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
+    private func hashPrefix(
+        line: String,
+        environment: [String: String],
+        cwd: String?,
+        shell: String
+    ) -> String {
+        var identity = ""
+        appendIdentityField(line, to: &identity)
+        for key in environment.keys.sorted() {
+            appendIdentityField(key, to: &identity)
+            appendIdentityField(environment[key] ?? "", to: &identity)
+        }
+        appendIdentityField(cwd ?? "", to: &identity)
+        appendIdentityField(shell, to: &identity)
+        return SHA256.hash(data: Data(identity.utf8))
             .prefix(6)
             .map { String(format: "%02x", $0) }
             .joined()
+    }
+
+    private func appendIdentityField(_ value: String, to identity: inout String) {
+        identity += "\(value.utf8.count):\(value)"
     }
 }
