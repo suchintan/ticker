@@ -167,6 +167,7 @@ public final class LaunchdAdapter: JobSourceAdapter {
     private struct RuntimeStatus {
         let exitStatus: ExitStatus?
         let attribution: RuntimeStatusAttribution
+        let observedAt: Date
     }
 
     private let searchDirectories: [URL]
@@ -250,6 +251,7 @@ public final class LaunchdAdapter: JobSourceAdapter {
                     : (runtimeStatus?.attribution ?? .unavailable),
                 configPath: configuration.configPath,
                 lastKnownExit: runtimeStatus?.exitStatus,
+                nativeStatusObservedAt: runtimeStatus?.observedAt,
                 lastRunAt: nil,
                 lastScheduledFor: nil,
                 managed: configuration.managed
@@ -510,7 +512,11 @@ public final class LaunchdAdapter: JobSourceAdapter {
         } else {
             attribution = .recordWithoutExit
         }
-        return RuntimeStatus(exitStatus: exitStatus, attribution: attribution)
+        return RuntimeStatus(
+            exitStatus: exitStatus,
+            attribution: attribution,
+            observedAt: Date()
+        )
     }
 
     private func reportsRunningAndNeverExited(_ output: String) -> Bool {

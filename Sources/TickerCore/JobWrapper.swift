@@ -71,6 +71,7 @@ private enum BackupValidation {
     case verified
     case contentMismatch
     case unverified
+    case unrelated
 }
 
 private struct OriginalExecution: Equatable {
@@ -82,7 +83,7 @@ public final class JobWrapper {
     private let store: RunStore
     private let backupDirectory: URL
     private let fileManager: FileManager
-    private let beforeSourceRewrite: (() throws -> Void)?
+    private let immediatelyBeforeSourceExchange: (() throws -> Void)?
 
     public init(store: RunStore) {
         self.store = store
@@ -90,26 +91,26 @@ public final class JobWrapper {
         backupDirectory = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".ticker", isDirectory: true)
             .appendingPathComponent("backups", isDirectory: true)
-        beforeSourceRewrite = nil
+        immediatelyBeforeSourceExchange = nil
     }
 
     public init(store: RunStore, backupDirectory: URL, fileManager: FileManager = .default) {
         self.store = store
         self.backupDirectory = backupDirectory
         self.fileManager = fileManager
-        beforeSourceRewrite = nil
+        immediatelyBeforeSourceExchange = nil
     }
 
     init(
         store: RunStore,
         backupDirectory: URL,
         fileManager: FileManager = .default,
-        beforeSourceRewrite: @escaping () throws -> Void
+        immediatelyBeforeSourceExchange: @escaping () throws -> Void
     ) {
         self.store = store
         self.backupDirectory = backupDirectory
         self.fileManager = fileManager
-        self.beforeSourceRewrite = beforeSourceRewrite
+        self.immediatelyBeforeSourceExchange = immediatelyBeforeSourceExchange
     }
 
     public func wrap(job: Job, tickerPath: String) throws -> ReloadCommands {
@@ -152,6 +153,11 @@ public final class JobWrapper {
                 job: job,
                 tickerPath: tickerPath,
                 expectedSourceData: originalData
+            )
+            try migrateManagedIdentityIfNeeded(
+                job: job,
+                plistURL: plistURL,
+                embeddedJobID: decodedWrapper?.label
             )
             return commands
         case .wrappedBackupContentMismatch:
@@ -210,6 +216,11 @@ public final class JobWrapper {
                 tickerPath: tickerPath,
                 expectedSourceData: originalData
             )
+            try migrateManagedIdentityIfNeeded(
+                job: job,
+                plistURL: plistURL,
+                embeddedJobID: decodedWrapper.label
+            )
             return commands
         case .staleManagedRow:
             try store.unmarkManaged(jobID: job.id)
@@ -234,8 +245,6 @@ public final class JobWrapper {
             job: job,
             plistURL: plistURL
         )
-        try beforeSourceRewrite?()
-        try ensureSourceUnchanged(originalData, at: plistURL)
         try store.markManaged(jobID: job.id, backupPath: backupURL.path)
 
         dictionary.removeValue(forKey: "Program")
@@ -259,8 +268,11 @@ public final class JobWrapper {
         }
 
         do {
-            try ensureSourceUnchanged(originalData, at: plistURL)
-            try writeRewrittenData(rewrittenData, to: plistURL)
+            try writeRewrittenData(
+                rewrittenData,
+                to: plistURL,
+                expectedSourceData: originalData
+            )
         } catch {
             try? store.unmarkManaged(jobID: job.id)
             throw error
@@ -309,20 +321,27 @@ public final class JobWrapper {
             throw JobWrapperError(message: "Launchd job \(job.id) is not wrapped by Ticker")
         }
 
-        guard case .verified(let backupURL) = try backupResolution(for: job, plistURL: plistURL) else {
-            throw JobWrapperError(message: "No verified Ticker backup exists for \(job.id)")
-        }
-        let backupData = try authenticatedBackupData(
-            at: backupURL,
-            job: job,
-            plistURL: plistURL
-        )
         let liveData = try readData(at: plistURL)
         var liveFormat = PropertyListSerialization.PropertyListFormat.xml
         var liveDictionary = try propertyListDictionary(
             from: liveData,
             format: &liveFormat,
             plistURL: plistURL
+        )
+        let embeddedJobID = (liveDictionary["ProgramArguments"] as? [String])
+            .flatMap { LaunchdWrapper.decode($0) ?? LaunchdWrapper.decodeLegacy($0) }?.label
+        guard case .verified(let backupURL) = try backupResolution(
+            for: job,
+            plistURL: plistURL,
+            embeddedJobID: embeddedJobID
+        ) else {
+            throw JobWrapperError(message: "No verified Ticker backup exists for \(job.id)")
+        }
+        let backupData = try authenticatedBackupData(
+            at: backupURL,
+            job: job,
+            plistURL: plistURL,
+            embeddedJobID: embeddedJobID
         )
         let backupDictionary = try propertyListDictionary(
             from: backupData,
@@ -332,7 +351,9 @@ public final class JobWrapper {
         guard wrapperMatchesBackup(
             liveDictionary: liveDictionary,
             backupDictionary: backupDictionary,
-            job: job
+            job: job,
+            acceptedLabels: embeddedJobID.map { [$0] }
+                ?? acceptedWrapperLabels(for: job)
         ) else {
             throw ownedKeyConflictError(job: job, plistURL: plistURL, backupURL: backupURL)
         }
@@ -347,13 +368,16 @@ public final class JobWrapper {
         } else {
             liveDictionary.removeValue(forKey: "ProgramArguments")
         }
-        try ensureSourceUnchanged(liveData, at: plistURL)
         try writeRewrittenData(
             try serializedData(liveDictionary, format: liveFormat, plistURL: plistURL),
-            to: plistURL
+            to: plistURL,
+            expectedSourceData: liveData
         )
 
         try store.unmarkManaged(jobID: job.id)
+        if let embeddedJobID, embeddedJobID != job.id {
+            try store.unmarkManaged(jobID: embeddedJobID)
+        }
         return commands
     }
 
@@ -377,18 +401,50 @@ public final class JobWrapper {
         let arguments = dictionary["ProgramArguments"] as? [String]
         let acceptedLabels = acceptedWrapperLabels(for: job)
         if let arguments, let decoded = LaunchdWrapper.decode(arguments) {
-            guard acceptedLabels.contains(decoded.label) else {
-                return .wrappedForeignLabel(embeddedJobID: decoded.label)
+            if !acceptedLabels.contains(decoded.label) {
+                guard case .verified(let backupURL) = try backupResolution(
+                    for: job,
+                    plistURL: plistURL,
+                    embeddedJobID: decoded.label
+                ) else {
+                    return .wrappedForeignLabel(embeddedJobID: decoded.label)
+                }
+                let backupDictionary = try authenticatedBackupDictionary(
+                    at: backupURL,
+                    job: job,
+                    plistURL: plistURL,
+                    embeddedJobID: decoded.label
+                )
+                return wrapperMatchesBackup(
+                    liveDictionary: dictionary,
+                    backupDictionary: backupDictionary,
+                    job: job,
+                    acceptedLabels: [decoded.label]
+                ) ? .wrappedConsistent : .ambiguousTickerInvocation
             }
-            guard managedRowExists else {
-                return .wrappedMissingBackup
+            if !managedRowExists {
+                guard case .verified(let backupURL) = try backupResolution(
+                    for: job,
+                    plistURL: plistURL,
+                    embeddedJobID: decoded.label
+                ),
+                      let metadataData = try? Data(contentsOf: metadataURL(for: backupURL)),
+                      let metadata = try? JSONDecoder().decode(BackupMetadata.self, from: metadataData),
+                      managedIDs.contains(metadata.jobID) else {
+                    return .wrappedMissingBackup
+                }
             }
-            switch try backupResolution(for: job, plistURL: plistURL) {
+            switch try backupResolution(
+                for: job,
+                plistURL: plistURL,
+                embeddedJobID: decoded.label
+            ) {
             case .verified(let backupURL):
                 let backupDictionary = try authenticatedBackupDictionary(
                     at: backupURL,
                     job: job,
-                    plistURL: plistURL
+                    plistURL: plistURL,
+                    embeddedJobID: decoded.label
                 )
                 return wrapperMatchesBackup(
                     liveDictionary: dictionary,
@@ -407,13 +463,18 @@ public final class JobWrapper {
         if let arguments, let legacy = LaunchdWrapper.decodeLegacy(arguments) {
             guard acceptedLabels.contains(legacy.label),
                   managedRowExists,
-                  case .verified(let backupURL) = try backupResolution(for: job, plistURL: plistURL) else {
+                  case .verified(let backupURL) = try backupResolution(
+                    for: job,
+                    plistURL: plistURL,
+                    embeddedJobID: legacy.label
+                  ) else {
                 return .ambiguousTickerInvocation
             }
             let backupDictionary = try authenticatedBackupDictionary(
                 at: backupURL,
                 job: job,
-                plistURL: plistURL
+                plistURL: plistURL,
+                embeddedJobID: legacy.label
             )
             return wrapperMatchesBackup(
                 liveDictionary: dictionary,
@@ -468,7 +529,11 @@ public final class JobWrapper {
         )
     }
 
-    private func backupResolution(for job: Job, plistURL: URL) throws -> BackupResolution {
+    private func backupResolution(
+        for job: Job,
+        plistURL: URL,
+        embeddedJobID: String? = nil
+    ) throws -> BackupResolution {
         var candidates: [URL] = []
         var seenPaths = Set<String>()
         func appendCandidate(_ url: URL) {
@@ -482,14 +547,30 @@ public final class JobWrapper {
            let path = try managedBackupPath(for: job, in: sqliteStore) {
             let storedURL = URL(fileURLWithPath: path).standardizedFileURL
             if fileManager.fileExists(atPath: storedURL.path) {
-                switch backupValidation(backupURL: storedURL, job: job, plistURL: plistURL) {
+                switch try backupValidation(
+                    backupURL: storedURL,
+                    job: job,
+                    plistURL: plistURL,
+                    embeddedJobID: embeddedJobID
+                ) {
                 case .verified:
                     return .verified(storedURL)
                 case .contentMismatch:
                     return .contentMismatch([storedURL])
                 case .unverified:
                     return .unverified([storedURL])
+                case .unrelated:
+                    break
                 }
+            }
+        }
+
+        if let embeddedJobID,
+           let sqliteStore = store as? SQLiteRunStore,
+           let path = try sqliteStore.managedBackupPath(jobID: embeddedJobID) {
+            let storedURL = URL(fileURLWithPath: path)
+            if fileManager.fileExists(atPath: storedURL.path) {
+                appendCandidate(storedURL)
             }
         }
 
@@ -504,7 +585,9 @@ public final class JobWrapper {
                 ) {
                     let name = candidate.lastPathComponent
                     guard !name.hasSuffix(".metadata.json"),
-                          name.hasPrefix(currentPrefix) || name.hasPrefix(legacyPrefix) else {
+                          embeddedJobID != nil
+                            || name.hasPrefix(currentPrefix)
+                            || name.hasPrefix(legacyPrefix) else {
                         continue
                     }
                     appendCandidate(candidate)
@@ -522,13 +605,20 @@ public final class JobWrapper {
         var mismatched: [URL] = []
         var unverified: [URL] = []
         for candidate in candidates {
-            switch backupValidation(backupURL: candidate, job: job, plistURL: plistURL) {
+            switch try backupValidation(
+                backupURL: candidate,
+                job: job,
+                plistURL: plistURL,
+                embeddedJobID: embeddedJobID
+            ) {
             case .verified:
                 verified.append(candidate)
             case .contentMismatch:
                 mismatched.append(candidate)
             case .unverified:
                 unverified.append(candidate)
+            case .unrelated:
+                continue
             }
         }
         if let newest = newestBackup(in: verified) {
@@ -551,6 +641,25 @@ public final class JobWrapper {
             return try store.managedBackupPath(jobID: legacy)
         }
         return nil
+    }
+
+    private func migrateManagedIdentityIfNeeded(
+        job: Job,
+        plistURL: URL,
+        embeddedJobID: String?
+    ) throws {
+        guard case .verified(let backupURL) = try backupResolution(
+            for: job,
+            plistURL: plistURL,
+            embeddedJobID: embeddedJobID
+        ),
+              let metadataData = try? Data(contentsOf: metadataURL(for: backupURL)),
+              let metadata = try? JSONDecoder().decode(BackupMetadata.self, from: metadataData),
+              metadata.jobID != job.id,
+              try store.managedJobIDs().contains(metadata.jobID) else {
+            return
+        }
+        try store.migrateJobIdentity(from: metadata.jobID, to: job.id)
     }
 
     private func newestBackup(in candidates: [URL]) -> URL? {
@@ -594,17 +703,24 @@ public final class JobWrapper {
         backupURL.appendingPathExtension("metadata.json")
     }
 
-    private func backupValidation(backupURL: URL, job: Job, plistURL: URL) -> BackupValidation {
+    private func backupValidation(
+        backupURL: URL,
+        job: Job,
+        plistURL: URL,
+        embeddedJobID: String?
+    ) throws -> BackupValidation {
         guard let metadataData = try? Data(contentsOf: metadataURL(for: backupURL)),
               let metadata = try? JSONDecoder().decode(BackupMetadata.self, from: metadataData),
               let backupData = try? Data(contentsOf: backupURL) else {
             return .unverified
         }
-        return backupValidation(
+        return try backupValidation(
             metadata: metadata,
             backupData: backupData,
             job: job,
-            plistURL: plistURL
+            plistURL: plistURL,
+            backupURL: backupURL,
+            embeddedJobID: embeddedJobID
         )
     }
 
@@ -612,12 +728,28 @@ public final class JobWrapper {
         metadata: BackupMetadata,
         backupData: Data,
         job: Job,
-        plistURL: URL
-    ) -> BackupValidation {
-        guard metadata.version == 2,
-              acceptedBackupJobIDs(for: job).contains(metadata.jobID),
-              metadata.sourcePlistPath == canonicalPath(plistURL),
-              let expectedByteCount = metadata.backupByteCount,
+        plistURL: URL,
+        backupURL: URL,
+        embeddedJobID: String?
+    ) throws -> BackupValidation {
+        guard metadata.version == 2 else {
+            return .unverified
+        }
+
+        let currentIdentityMatches = acceptedBackupJobIDs(for: job).contains(metadata.jobID)
+            && metadata.sourcePlistPath == canonicalPath(plistURL)
+        let historicalIdentityMatches = try authenticatedSourceTransition(
+            metadata: metadata,
+            backupData: backupData,
+            backupURL: backupURL,
+            job: job,
+            plistURL: plistURL,
+            embeddedJobID: embeddedJobID
+        )
+        guard currentIdentityMatches || historicalIdentityMatches else {
+            return .unrelated
+        }
+        guard let expectedByteCount = metadata.backupByteCount,
               let expectedDigest = metadata.backupSHA256 else {
             return .unverified
         }
@@ -628,7 +760,55 @@ public final class JobWrapper {
         return .verified
     }
 
-    private func authenticatedBackupData(at backupURL: URL, job: Job, plistURL: URL) throws -> Data {
+    private func authenticatedSourceTransition(
+        metadata: BackupMetadata,
+        backupData: Data,
+        backupURL: URL,
+        job: Job,
+        plistURL: URL,
+        embeddedJobID: String?
+    ) throws -> Bool {
+        guard let embeddedJobID,
+              embeddedJobID == metadata.jobID || embeddedJobID == job.id,
+              let sqliteStore = store as? SQLiteRunStore else {
+            return false
+        }
+
+        let storedPaths = [
+            try sqliteStore.managedBackupPath(jobID: metadata.jobID),
+            try managedBackupPath(for: job, in: sqliteStore),
+        ].compactMap { $0 }.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        guard storedPaths.contains(backupURL.standardizedFileURL.path) else {
+            return false
+        }
+
+        guard let backupDictionary = try? propertyListDictionary(
+            from: backupData,
+            format: nil,
+            plistURL: backupURL
+        ),
+              let originalLabel = backupDictionary["Label"] as? String,
+              canonicalLaunchdJobID(
+                label: originalLabel,
+                configPath: metadata.sourcePlistPath
+              ) == metadata.jobID else {
+            return false
+        }
+
+        let currentPath = canonicalPath(plistURL)
+        if metadata.sourcePlistPath == currentPath {
+            return true
+        }
+        return originalLabel == job.label
+            && !fileManager.fileExists(atPath: metadata.sourcePlistPath)
+    }
+
+    private func authenticatedBackupData(
+        at backupURL: URL,
+        job: Job,
+        plistURL: URL,
+        embeddedJobID: String? = nil
+    ) throws -> Data {
         let metadataData = try readData(at: metadataURL(for: backupURL))
         let backupData = try readData(at: backupURL)
         let metadata: BackupMetadata
@@ -639,11 +819,13 @@ public final class JobWrapper {
                 message: "Backup metadata at \(metadataURL(for: backupURL).path) is not authenticated"
             )
         }
-        switch backupValidation(
+        switch try backupValidation(
             metadata: metadata,
             backupData: backupData,
             job: job,
-            plistURL: plistURL
+            plistURL: plistURL,
+            backupURL: backupURL,
+            embeddedJobID: embeddedJobID
         ) {
         case .verified:
             return backupData
@@ -655,16 +837,26 @@ public final class JobWrapper {
             throw JobWrapperError(
                 message: "Backup metadata at \(metadataURL(for: backupURL).path) has no valid content digest"
             )
+        case .unrelated:
+            throw JobWrapperError(
+                message: "Backup metadata at \(metadataURL(for: backupURL).path) belongs to another launchd source"
+            )
         }
     }
 
     private func authenticatedBackupDictionary(
         at backupURL: URL,
         job: Job,
-        plistURL: URL
+        plistURL: URL,
+        embeddedJobID: String? = nil
     ) throws -> [String: Any] {
         try propertyListDictionary(
-            from: authenticatedBackupData(at: backupURL, job: job, plistURL: plistURL),
+            from: authenticatedBackupData(
+                at: backupURL,
+                job: job,
+                plistURL: plistURL,
+                embeddedJobID: embeddedJobID
+            ),
             format: nil,
             plistURL: backupURL
         )
@@ -696,12 +888,13 @@ public final class JobWrapper {
     private func wrapperMatchesBackup(
         liveDictionary: [String: Any],
         backupDictionary: [String: Any],
-        job: Job
+        job: Job,
+        acceptedLabels: Set<String>? = nil
     ) -> Bool {
         guard !liveDictionary.keys.contains("Program"),
               let arguments = liveDictionary["ProgramArguments"] as? [String],
               let decoded = LaunchdWrapper.decode(arguments) ?? LaunchdWrapper.decodeLegacy(arguments),
-              acceptedWrapperLabels(for: job).contains(decoded.label),
+              (acceptedLabels ?? acceptedWrapperLabels(for: job)).contains(decoded.label),
               let originalExecution = try? execution(
                   from: backupDictionary,
                   fallback: job.command,
@@ -850,11 +1043,10 @@ public final class JobWrapper {
             return
         }
         dictionary["ProgramArguments"] = expected
-        try beforeSourceRewrite?()
-        try ensureSourceUnchanged(expectedSourceData, at: plistURL)
         try writeRewrittenData(
             try serializedData(dictionary, format: format, plistURL: plistURL),
-            to: plistURL
+            to: plistURL,
+            expectedSourceData: expectedSourceData
         )
     }
 
@@ -908,6 +1100,13 @@ public final class JobWrapper {
         return url.resolvingSymlinksInPath().standardizedFileURL.path
     }
 
+    private func canonicalLaunchdJobID(label: String, configPath: String) -> String {
+        let digest = SHA256.hash(data: Data(configPath.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "launchd:\(label)#\(digest.prefix(12))"
+    }
+
     private func sha256(_ data: Data) -> String {
         return SHA256.hash(data: data)
             .map { String(format: "%02x", $0) }
@@ -915,7 +1114,13 @@ public final class JobWrapper {
     }
 
     private func persistBackup(_ data: Data, to backupURL: URL) throws {
-        try atomicWrite(data, to: backupURL, preservingMetadataFrom: nil)
+        try atomicWrite(
+            data,
+            to: backupURL,
+            preservingMetadataFrom: nil,
+            expectedDestinationData: nil,
+            beforeReplace: nil
+        )
     }
 
     private func syncDirectory(_ directory: URL) throws {
@@ -961,14 +1166,26 @@ public final class JobWrapper {
         }
     }
 
-    private func writeRewrittenData(_ data: Data, to plistURL: URL) throws {
-        try atomicWrite(data, to: plistURL, preservingMetadataFrom: plistURL)
+    private func writeRewrittenData(
+        _ data: Data,
+        to plistURL: URL,
+        expectedSourceData: Data
+    ) throws {
+        try atomicWrite(
+            data,
+            to: plistURL,
+            preservingMetadataFrom: plistURL,
+            expectedDestinationData: expectedSourceData,
+            beforeReplace: immediatelyBeforeSourceExchange
+        )
     }
 
     private func atomicWrite(
         _ data: Data,
         to destinationURL: URL,
-        preservingMetadataFrom metadataSourceURL: URL?
+        preservingMetadataFrom metadataSourceURL: URL?,
+        expectedDestinationData: Data?,
+        beforeReplace: (() throws -> Void)?
     ) throws {
         let directory = destinationURL.deletingLastPathComponent()
         let temporaryURL = directory.appendingPathComponent(
@@ -1030,16 +1247,124 @@ public final class JobWrapper {
         }
         fileDescriptor = nil
 
-        let renameResult = temporaryURL.path.withCString { source in
-            destinationURL.path.withCString { destination in
-                Darwin.rename(source, destination)
+        if let expectedDestinationData {
+            try ensureSourceUnchanged(expectedDestinationData, at: destinationURL)
+            try beforeReplace?()
+            try exchangeAndVerify(
+                temporaryURL: temporaryURL,
+                destinationURL: destinationURL,
+                stagedData: data,
+                expectedDestinationData: expectedDestinationData,
+                temporaryFileExists: &temporaryFileExists
+            )
+        } else {
+            try beforeReplace?()
+            let renameResult = temporaryURL.path.withCString { source in
+                destinationURL.path.withCString { destination in
+                    Darwin.rename(source, destination)
+                }
             }
+            guard renameResult == 0 else {
+                throw posixError("rename temporary file into place at \(destinationURL.path)")
+            }
+            temporaryFileExists = false
         }
-        guard renameResult == 0 else {
-            throw posixError("rename temporary file into place at \(destinationURL.path)")
+        try syncDirectory(directory)
+    }
+
+    private func exchangeAndVerify(
+        temporaryURL: URL,
+        destinationURL: URL,
+        stagedData: Data,
+        expectedDestinationData: Data,
+        temporaryFileExists: inout Bool
+    ) throws {
+        guard exchange(temporaryURL, destinationURL) == 0 else {
+            throw posixError("exchange temporary file into place at \(destinationURL.path)")
+        }
+
+        let displacedData: Data
+        do {
+            displacedData = try readData(at: temporaryURL)
+        } catch {
+            guard exchange(temporaryURL, destinationURL) == 0 else {
+                temporaryFileExists = false
+                throw JobWrapperError(
+                    message: "Ticker exchanged the launchd plist at \(destinationURL.path) but could not "
+                        + "verify or restore it. The displaced bytes remain at \(temporaryURL.path)."
+                )
+            }
+            try syncDirectory(destinationURL.deletingLastPathComponent())
+            throw error
+        }
+        guard displacedData == expectedDestinationData else {
+            try restoreAfterChangedDestination(
+                temporaryURL: temporaryURL,
+                destinationURL: destinationURL,
+                stagedData: stagedData,
+                temporaryFileExists: &temporaryFileExists
+            )
+            throw sourceChangedError(at: destinationURL)
+        }
+        do {
+            try fileManager.removeItem(at: temporaryURL)
+            temporaryFileExists = false
+        } catch {
+            throw JobWrapperError(
+                message: "Could not remove exchanged source bytes at \(temporaryURL.path): "
+                    + error.localizedDescription
+            )
+        }
+    }
+
+    private func restoreAfterChangedDestination(
+        temporaryURL: URL,
+        destinationURL: URL,
+        stagedData: Data,
+        temporaryFileExists: inout Bool
+    ) throws {
+        guard exchange(temporaryURL, destinationURL) == 0 else {
+            temporaryFileExists = false
+            throw JobWrapperError(
+                message: "Launchd plist at \(destinationURL.path) changed while Ticker was replacing it, "
+                + "and Ticker could not restore the displaced bytes. They remain at \(temporaryURL.path)."
+            )
+        }
+        try syncDirectory(destinationURL.deletingLastPathComponent())
+
+        let replacedDuringVerification = try readData(at: temporaryURL)
+        guard replacedDuringVerification != stagedData else {
+            return
+        }
+
+        guard exchange(temporaryURL, destinationURL) == 0 else {
+            temporaryFileExists = false
+            throw JobWrapperError(
+                message: "Launchd plist at \(destinationURL.path) changed again while Ticker was restoring it. "
+                + "The later bytes remain at \(temporaryURL.path)."
+            )
         }
         temporaryFileExists = false
-        try syncDirectory(directory)
+        try? syncDirectory(destinationURL.deletingLastPathComponent())
+        throw JobWrapperError(
+            message: "Launchd plist at \(destinationURL.path) changed repeatedly while Ticker was replacing it. "
+                + "Ticker preserved the displaced version at \(temporaryURL.path); review both files before retrying."
+        )
+    }
+
+    private func exchange(_ firstURL: URL, _ secondURL: URL) -> Int32 {
+        firstURL.path.withCString { first in
+            secondURL.path.withCString { second in
+                Darwin.renamex_np(first, second, UInt32(RENAME_SWAP))
+            }
+        }
+    }
+
+    private func sourceChangedError(at plistURL: URL) -> JobWrapperError {
+        JobWrapperError(
+            message: "Launchd plist at \(plistURL.path) changed while Ticker was preparing "
+                + "to rewrite it. Ticker did not modify the plist. Review the current file and retry."
+        )
     }
 
     private func readData(at url: URL) throws -> Data {

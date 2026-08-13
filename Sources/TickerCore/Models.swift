@@ -34,16 +34,33 @@ public enum RuntimeStatusAttribution: String, Codable, Hashable {
 public enum JobHealthPolicy {
     public static func outcome(
         for job: Job,
-        scheduledHistory: Outcome?
+        scheduledHistory: Run?
     ) -> Outcome {
         let nativeOutcome = job.lastKnownExit.map {
             $0.isSuccess ? Outcome.success : Outcome.failure
         }
 
         if job.source == .launchd, !job.managed {
-            return nativeOutcome ?? scheduledHistory ?? .unknown
+            return nativeOutcome ?? scheduledHistory?.outcome ?? .unknown
         }
-        return scheduledHistory ?? nativeOutcome ?? .unknown
+
+        guard job.source == .launchd, job.managed,
+              let scheduledHistory else {
+            return scheduledHistory?.outcome ?? nativeOutcome ?? .unknown
+        }
+
+        if scheduledHistory.outcome == .running {
+            return .running
+        }
+
+        if nativeOutcome == .failure, scheduledHistory.outcome == .success {
+            guard let nativeStatusObservedAt = job.nativeStatusObservedAt,
+                  let scheduledFinishedAt = scheduledHistory.finishedAt,
+                  scheduledFinishedAt > nativeStatusObservedAt else {
+                return .failure
+            }
+        }
+        return scheduledHistory.outcome
     }
 }
 
@@ -64,6 +81,7 @@ public struct Job: Identifiable, Codable, Hashable {
     public let runNowUnavailableReason: String?
     public let configPath: String?
     public let lastKnownExit: ExitStatus?
+    public let nativeStatusObservedAt: Date?
     public let lastRunAt: Date?
     public let lastScheduledFor: Date?
     public let managed: Bool
@@ -85,6 +103,7 @@ public struct Job: Identifiable, Codable, Hashable {
         runtimeStatusAttribution: RuntimeStatusAttribution? = nil,
         configPath: String?,
         lastKnownExit: ExitStatus?,
+        nativeStatusObservedAt: Date? = nil,
         lastRunAt: Date?,
         lastScheduledFor: Date?,
         managed: Bool
@@ -105,6 +124,7 @@ public struct Job: Identifiable, Codable, Hashable {
         self.runNowUnavailableReason = runNowUnavailableReason
         self.configPath = configPath
         self.lastKnownExit = lastKnownExit
+        self.nativeStatusObservedAt = nativeStatusObservedAt
         self.lastRunAt = lastRunAt
         self.lastScheduledFor = lastScheduledFor
         self.managed = managed
@@ -171,6 +191,7 @@ public struct Job: Identifiable, Codable, Hashable {
         case runtimeStatusAttribution
         case configPath
         case lastKnownExit
+        case nativeStatusObservedAt
         case lastRunAt
         case lastScheduledFor
         case managed
@@ -276,8 +297,10 @@ public protocol RunStore: AnyObject {
     ) throws
     func runs(jobID: String, limit: Int) throws -> [Run]
     func latestRun(jobID: String) throws -> Run?
+    func scheduledHealthRuns() throws -> [String: Run]
     func health() throws -> [String: Outcome]
     func markManaged(jobID: String, backupPath: String?) throws
     func unmarkManaged(jobID: String) throws
+    func migrateJobIdentity(from oldJobID: String, to newJobID: String) throws
     func managedJobIDs() throws -> Set<String>
 }

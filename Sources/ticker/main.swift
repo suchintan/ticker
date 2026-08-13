@@ -61,6 +61,7 @@ private struct ListRecord: Encodable {
     let launchdGroupName: String?
     let runNowUnavailableReason: String?
     let lastKnownExit: ExitStatusRecord?
+    let nativeStatusObservedAt: Date?
     let lastRunAt: Date?
     let lastScheduledFor: Date?
     let managed: Bool
@@ -86,6 +87,7 @@ private struct ListRecord: Encodable {
         runNowUnavailableReason = job.runNowUnavailableReason
         configPath = job.configPath
         lastKnownExit = job.lastKnownExit.map(ExitStatusRecord.init)
+        nativeStatusObservedAt = job.nativeStatusObservedAt
         lastRunAt = job.lastRunAt
         lastScheduledFor = job.lastScheduledFor
         managed = job.managed
@@ -115,6 +117,7 @@ private struct ListRecord: Encodable {
         try encode(runNowUnavailableReason, into: &container, forKey: .runNowUnavailableReason)
         try encode(configPath, into: &container, forKey: .configPath)
         try encode(lastKnownExit, into: &container, forKey: .lastKnownExit)
+        try encode(nativeStatusObservedAt, into: &container, forKey: .nativeStatusObservedAt)
         try encode(lastRunAt, into: &container, forKey: .lastRunAt)
         try encode(lastScheduledFor, into: &container, forKey: .lastScheduledFor)
         try encode(nextFireAt, into: &container, forKey: .nextFireAt)
@@ -151,6 +154,7 @@ private struct ListRecord: Encodable {
         case runNowUnavailableReason
         case configPath
         case lastKnownExit
+        case nativeStatusObservedAt
         case lastRunAt
         case lastScheduledFor
         case managed
@@ -478,6 +482,7 @@ private struct TickerCLI {
             originalArgv0: originalArgv0,
             tailBytes: tailBytes,
             trigger: trigger,
+            scheduledWrapperInvocation: trigger == .scheduled && wrapperVersionSeen,
             environment: childEnvironment,
             currentDirectory: childWorkingDirectory
         )
@@ -489,6 +494,7 @@ private struct TickerCLI {
         originalArgv0: String?,
         tailBytes: Int,
         trigger: RunTrigger,
+        scheduledWrapperInvocation: Bool,
         environment: [String: String]?,
         currentDirectory: String?
     ) -> Never {
@@ -497,7 +503,11 @@ private struct TickerCLI {
         var runID: Int64?
 
         do {
-            let openedStore = try SQLiteRunStore(path: configuredStorePath())
+            let openedStore = try SQLiteRunStore(
+                path: configuredStorePath(
+                    scheduledWrapperInvocation: scheduledWrapperInvocation
+                )
+            )
             store = openedStore
             do {
                 runID = try openedStore.beginRun(
@@ -631,7 +641,7 @@ private struct TickerCLI {
             discoveredJobs: discovery.jobs,
             discoveryComplete: discovery.errors.isEmpty
         )
-        let health = try store.health()
+        let health = try store.scheduledHealthRuns()
         let records = discovery.jobs.sorted { left, right in
             if left.source.rawValue == right.source.rawValue {
                 return left.label.localizedCaseInsensitiveCompare(right.label) == .orderedAscending
@@ -911,8 +921,12 @@ private struct POSIXProcessError: Error, LocalizedError {
     }
 }
 
-private func configuredStorePath() -> String {
-    ProcessInfo.processInfo.environment["TICKER_STORE_PATH"] ?? SQLiteRunStore.defaultPath()
+private func configuredStorePath(scheduledWrapperInvocation: Bool = false) -> String {
+    RunStorePathPolicy.configuredPath(
+        environment: ProcessInfo.processInfo.environment,
+        scheduledWrapperInvocation: scheduledWrapperInvocation,
+        defaultPath: SQLiteRunStore.defaultPath()
+    )
 }
 
 private func spawnChild(

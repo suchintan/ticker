@@ -92,7 +92,7 @@ final class AppModel: ObservableObject {
     let store: SQLiteRunStore
 
     @Published var jobs: [Job] = []
-    @Published var health: [String: Outcome] = [:]
+    @Published var health: [String: Run] = [:]
     @Published var lastRefresh: Date = Date()
     @Published var errors: [String] = []
     @Published private(set) var skipStorms: [String: SkipStormSummary] = [:]
@@ -164,12 +164,12 @@ final class AppModel: ObservableObject {
                     )
                 }
             }
-            var latestHealth: [String: Outcome]?
+            var latestHealth: [String: Run]?
             var latestRecoveryStates: [String: JobRecoveryState] = [:]
             var latestRecoveryErrors: [String: String] = [:]
 
             do {
-                latestHealth = try self.store.health()
+                latestHealth = try self.store.scheduledHealthRuns()
             } catch {
                 refreshErrors.append("Could not read job health: \(error.localizedDescription)")
             }

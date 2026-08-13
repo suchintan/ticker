@@ -855,7 +855,7 @@ private func test2A_DurableBackupPrecedesRewrite(_ tests: TestHarness) throws {
         let wrapper = JobWrapper(
             store: store,
             backupDirectory: backupDirectory,
-            beforeSourceRewrite: {
+            immediatelyBeforeSourceExchange: {
                 throw FixtureError.missing("injected failure after durable backup")
             }
         )
@@ -2326,9 +2326,11 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
 
         let modulePath = buildDirectory.appendingPathComponent("TickerCore.swiftmodule").path
         let libraryPath = buildDirectory.appendingPathComponent("libTickerCore.a").path
+        let moduleCachePath = buildDirectory.appendingPathComponent("ModuleCache", isDirectory: true).path
         try test3B_runProcess(
             swiftc,
             [
+                "-module-cache-path", moduleCachePath,
                 "-target", "arm64-apple-macosx13.0",
                 "-parse-as-library",
                 "-emit-module", "-module-name", "TickerCore",
@@ -2703,6 +2705,7 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
         try test3B_runProcess(
             swiftc,
             [
+                "-module-cache-path", moduleCachePath,
                 "-target", "arm64-apple-macosx13.0",
                 "-parse-as-library",
                 "-I", buildDirectory.path,
@@ -3106,6 +3109,7 @@ private func test5_makeJob(
     command: [String] = ["/usr/bin/true"],
     cwd: String? = nil,
     lastKnownExit: ExitStatus? = nil,
+    nativeStatusObservedAt: Date? = nil,
     managed: Bool = false
 ) -> Job {
     Job(
@@ -3118,6 +3122,7 @@ private func test5_makeJob(
         enabled: true,
         configPath: nil,
         lastKnownExit: lastKnownExit,
+        nativeStatusObservedAt: nativeStatusObservedAt,
         lastRunAt: nil,
         lastScheduledFor: nil,
         managed: managed
@@ -3161,7 +3166,7 @@ private func test5_HealthPrecedenceAndManualIsolation(_ tests: TestHarness) thro
         tests.expectEqual(
             JobHealthPolicy.outcome(
                 for: nativeFailure,
-                scheduledHistory: try store.health()[nativeFailureID]
+                scheduledHistory: try store.scheduledHealthRuns()[nativeFailureID]
             ),
             .failure,
             "test5_successThenNativeFailure_usesNativeFailure"
@@ -3182,7 +3187,7 @@ private func test5_HealthPrecedenceAndManualIsolation(_ tests: TestHarness) thro
         tests.expectEqual(
             JobHealthPolicy.outcome(
                 for: nativeSuccess,
-                scheduledHistory: try store.health()[nativeSuccessID]
+                scheduledHistory: try store.scheduledHealthRuns()[nativeSuccessID]
             ),
             .success,
             "test5_failureThenNativeSuccess_usesNativeSuccess"
@@ -3207,7 +3212,7 @@ private func test5_HealthPrecedenceAndManualIsolation(_ tests: TestHarness) thro
         tests.expectEqual(
             JobHealthPolicy.outcome(
                 for: cronJob,
-                scheduledHistory: try store.health()[manualIsolationID]
+                scheduledHistory: try store.scheduledHealthRuns()[manualIsolationID]
             ),
             .failure,
             "test5_manualRun_neverChangesScheduledHealth"
@@ -3229,15 +3234,16 @@ private func test5_HealthPrecedenceAndManualIsolation(_ tests: TestHarness) thro
         let wrappedJob = test5_makeJob(
             id: wrappedID,
             lastKnownExit: ExitStatus(raw: 1),
+            nativeStatusObservedAt: Date(timeIntervalSince1970: 600),
             managed: true
         )
         tests.expectEqual(
             JobHealthPolicy.outcome(
                 for: wrappedJob,
-                scheduledHistory: try store.health()[wrappedID]
+                scheduledHistory: try store.scheduledHealthRuns()[wrappedID]
             ),
-            .success,
-            "test5_wrappedJob_prefersScheduledHistory"
+            .failure,
+            "test5_wrappedJob_nativeFailureVetoesOlderScheduledSuccess"
         )
         _ = try store.beginRun(
             jobID: wrappedID,
@@ -3247,10 +3253,117 @@ private func test5_HealthPrecedenceAndManualIsolation(_ tests: TestHarness) thro
         tests.expectEqual(
             JobHealthPolicy.outcome(
                 for: wrappedJob,
-                scheduledHistory: try store.health()[wrappedID]
+                scheduledHistory: try store.scheduledHealthRuns()[wrappedID]
             ),
             .running,
             "test5_wrappedInProgressRun_isNotHiddenByStaleNativeExit"
+        )
+    }
+}
+
+private func test8_WrappedHealthOrdering(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round8-wrapped-health") { directory in
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("runs.db").path)
+
+        let cannotStartID = "launchd:test8-wrapper-cannot-start"
+        _ = try test5_finish(
+            store: store,
+            jobID: cannotStartID,
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 10),
+            exitCode: 0
+        )
+        let cannotStart = test5_makeJob(
+            id: cannotStartID,
+            lastKnownExit: ExitStatus(raw: 78),
+            nativeStatusObservedAt: Date(timeIntervalSince1970: 20),
+            managed: true
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: cannotStart,
+                scheduledHistory: try store.scheduledHealthRuns()[cannotStartID]
+            ),
+            .failure,
+            "test8_wrapperCannotStart_nativeFailureCannotRemainGreen"
+        )
+
+        let inProgressID = "launchd:test8-in-progress"
+        _ = try test5_finish(
+            store: store,
+            jobID: inProgressID,
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 30),
+            exitCode: 0
+        )
+        _ = try store.beginRun(
+            jobID: inProgressID,
+            startedAt: Date(timeIntervalSince1970: 41),
+            trigger: .scheduled
+        )
+        let inProgress = test5_makeJob(
+            id: inProgressID,
+            lastKnownExit: ExitStatus(raw: 1),
+            nativeStatusObservedAt: Date(timeIntervalSince1970: 40),
+            managed: true
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: inProgress,
+                scheduledHistory: try store.scheduledHealthRuns()[inProgressID]
+            ),
+            .running,
+            "test8_inProgressScheduledRun_doesNotFlapToPreviousNativeFailure"
+        )
+
+        let newerSuccessID = "launchd:test8-newer-success"
+        _ = try test5_finish(
+            store: store,
+            jobID: newerSuccessID,
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 51),
+            exitCode: 0
+        )
+        let newerSuccess = test5_makeJob(
+            id: newerSuccessID,
+            lastKnownExit: ExitStatus(raw: 1),
+            nativeStatusObservedAt: Date(timeIntervalSince1970: 50),
+            managed: true
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: newerSuccess,
+                scheduledHistory: try store.scheduledHealthRuns()[newerSuccessID]
+            ),
+            .success,
+            "test8_newerScheduledSuccess_overridesOlderNativeFailure"
+        )
+    }
+}
+
+private func test8_LaunchdStatusObservationTimestamp(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round8-launchd-observation") { directory in
+        try writePropertyList([
+            "Label": "com.example.test8.observed",
+            "ProgramArguments": ["/usr/bin/true"],
+        ], to: directory.appendingPathComponent("observed.plist"))
+        let before = Date()
+        let adapter = LaunchdAdapter(searchDirectories: [directory]) { _, _ in
+            AdapterCommandResult(
+                status: 0,
+                stdout: "last exit code = 1\n",
+                stderr: ""
+            )
+        }
+        let job = try require(try adapter.discover().first, "test8 observed launchd job")
+        let after = Date()
+        let observedAt = try require(
+            job.nativeStatusObservedAt,
+            "test8 launchd native observation timestamp"
+        )
+        tests.expect(
+            observedAt >= before && observedAt <= after,
+            "test8_launchdFailure_carriesObservationTimeForHealthOrdering"
         )
     }
 }
@@ -3311,7 +3424,10 @@ private func test5_UnwrapResetsHealthWithoutDeletingHistory(_ tests: TestHarness
             "test5_unwrap_preservesHistoryForInspection"
         )
         tests.expectEqual(
-            JobHealthPolicy.outcome(for: job, scheduledHistory: try store.health()[job.id]),
+            JobHealthPolicy.outcome(
+                for: job,
+                scheduledHistory: try store.scheduledHealthRuns()[job.id]
+            ),
             .unknown,
             "test5_unwrap_withoutNativeStatus_reportsUnknown"
         )
@@ -3357,8 +3473,8 @@ private func test5_RunTriggerSchemaMigration(_ tests: TestHarness) throws {
         )
         tests.expectEqual(
             try migrated.health()["cron:test5-legacy"],
-            .success,
-            "test5_migratedScheduledRun_contributesToHealth"
+            nil,
+            "test5_migratedLegacyRun_isExcludedFromHealth"
         )
         let reopened = try SQLiteRunStore(path: databaseURL.path)
         tests.expectEqual(
@@ -3366,7 +3482,189 @@ private func test5_RunTriggerSchemaMigration(_ tests: TestHarness) throws {
             .scheduled,
             "test5_triggerMigration_isIdempotent"
         )
+        tests.expectEqual(
+            try reopened.runs(jobID: "cron:test5-legacy", limit: 10).map(\.outcome),
+            [.success],
+            "test8_legacyRun_remainsVisibleAfterHealthExclusion"
+        )
+        _ = try test5_finish(
+            store: reopened,
+            jobID: "cron:test5-legacy",
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 20),
+            exitCode: 1
+        )
+        tests.expectEqual(
+            try reopened.health()["cron:test5-legacy"],
+            .failure,
+            "test8_postMigrationScheduledRun_contributesToHealth"
+        )
     }
+}
+
+private func test8_ConcurrentTriggerMigration(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round8-concurrent-trigger-migration") { directory in
+        let databaseURL = directory.appendingPathComponent("legacy.db")
+        var database: OpaquePointer?
+        guard sqlite3_open(databaseURL.path, &database) == SQLITE_OK, let database else {
+            throw FixtureError.missing("test8 concurrent legacy sqlite database")
+        }
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let setupResult = sqlite3_exec(
+            database,
+            """
+            CREATE TABLE runs(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              job_id TEXT NOT NULL, started_at REAL NOT NULL, finished_at REAL,
+              exit_code INTEGER, stdout_tail TEXT, stderr_tail TEXT);
+            INSERT INTO runs(job_id, started_at, finished_at, exit_code)
+            VALUES('cron:test8-concurrent', 10, 11, 0);
+            """,
+            nil,
+            nil,
+            &errorMessage
+        )
+        let setupMessage = errorMessage.map { String(cString: $0) }
+        if let errorMessage {
+            sqlite3_free(errorMessage)
+        }
+        _ = sqlite3_close(database)
+        guard setupResult == SQLITE_OK else {
+            throw FixtureError.missing(setupMessage ?? "test8 concurrent schema setup failed")
+        }
+
+        let hookLock = NSLock()
+        let releaseHooks = DispatchSemaphore(value: 0)
+        var hookCount = 0
+        let migrationHook = {
+            hookLock.lock()
+            hookCount += 1
+            let shouldRelease = hookCount == 2
+            hookLock.unlock()
+            if shouldRelease {
+                releaseHooks.signal()
+                releaseHooks.signal()
+            }
+            _ = releaseHooks.wait(timeout: .now() + 5)
+        }
+
+        let resultLock = NSLock()
+        var errors: [String] = []
+        let workers = DispatchGroup()
+        for _ in 0..<2 {
+            workers.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { workers.leave() }
+                do {
+                    _ = try SQLiteRunStore(
+                        path: databaseURL.path,
+                        beforeRunsTriggerMigration: migrationHook
+                    )
+                } catch {
+                    resultLock.lock()
+                    errors.append(error.localizedDescription)
+                    resultLock.unlock()
+                }
+            }
+        }
+        let timedOut = workers.wait(timeout: .now() + 10) == .timedOut
+        hookLock.lock()
+        let observedHookCount = hookCount
+        hookLock.unlock()
+        resultLock.lock()
+        let observedErrors = errors
+        resultLock.unlock()
+
+        tests.expect(!timedOut, "test8_concurrentMigration_bothOpenersComplete")
+        tests.expectEqual(
+            observedHookCount,
+            2,
+            "test8_concurrentMigration_bothOpenersObserveLegacySchema"
+        )
+        tests.expectEqual(
+            observedErrors,
+            [],
+            "test8_concurrentMigration_loserToleratesWinner"
+        )
+        let reopened = try SQLiteRunStore(path: databaseURL.path)
+        tests.expectEqual(
+            try reopened.health()["cron:test8-concurrent"],
+            nil,
+            "test8_concurrentMigration_legacyRowRemainsExcludedFromHealth"
+        )
+    }
+}
+
+private func test8_AlreadyTriggeredRowsAreExcludedFromHealth(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round8-already-triggered-migration") { directory in
+        let databaseURL = directory.appendingPathComponent("version2.db")
+        var database: OpaquePointer?
+        guard sqlite3_open(databaseURL.path, &database) == SQLITE_OK, let database else {
+            throw FixtureError.missing("test8 version 2 sqlite database")
+        }
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let setupResult = sqlite3_exec(
+            database,
+            """
+            CREATE TABLE runs(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              job_id TEXT NOT NULL, started_at REAL NOT NULL, finished_at REAL,
+              exit_code INTEGER, stdout_tail TEXT, stderr_tail TEXT,
+              trigger TEXT NOT NULL DEFAULT 'scheduled');
+            CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO schema_meta(key, value) VALUES('schema_version', '2');
+            INSERT INTO runs(job_id, started_at, finished_at, exit_code, trigger)
+            VALUES('cron:test8-version2', 10, 11, 0, 'scheduled');
+            """,
+            nil,
+            nil,
+            &errorMessage
+        )
+        let setupMessage = errorMessage.map { String(cString: $0) }
+        if let errorMessage {
+            sqlite3_free(errorMessage)
+        }
+        _ = sqlite3_close(database)
+        guard setupResult == SQLITE_OK else {
+            throw FixtureError.missing(setupMessage ?? "test8 version 2 schema setup failed")
+        }
+
+        let migrated = try SQLiteRunStore(path: databaseURL.path)
+        tests.expectEqual(
+            try migrated.health()["cron:test8-version2"],
+            nil,
+            "test8_alreadyTriggeredLegacyRow_isExcludedFromHealth"
+        )
+        tests.expectEqual(
+            try migrated.runs(jobID: "cron:test8-version2", limit: 10).map(\.outcome),
+            [.success],
+            "test8_alreadyTriggeredLegacyRow_remainsVisibleInHistory"
+        )
+    }
+}
+
+private func test8_StorePathPolicy(_ tests: TestHarness) {
+    let defaultPath = "/tmp/test8-canonical/ticker.db"
+    let redirectedPath = "/tmp/test8-redirected/ticker.db"
+    let environment = ["TICKER_STORE_PATH": redirectedPath]
+    tests.expectEqual(
+        RunStorePathPolicy.configuredPath(
+            environment: environment,
+            scheduledWrapperInvocation: true,
+            defaultPath: defaultPath
+        ),
+        defaultPath,
+        "test8_provenanceMarkedScheduledWrapper_ignoresInheritedStorePath"
+    )
+    tests.expectEqual(
+        RunStorePathPolicy.configuredPath(
+            environment: environment,
+            scheduledWrapperInvocation: false,
+            defaultPath: defaultPath
+        ),
+        redirectedPath,
+        "test8_nonWrapperCLI_keepsExplicitStorePathTestSeam"
+    )
 }
 
 private func test5_CrontabContextAndIdentity(_ tests: TestHarness) throws {
@@ -3912,7 +4210,7 @@ private func test7_WrapRejectsConcurrentSourceChange(_ tests: TestHarness) throw
         let wrapper = JobWrapper(
             store: store,
             backupDirectory: directory.appendingPathComponent("backups", isDirectory: true),
-            beforeSourceRewrite: {
+            immediatelyBeforeSourceExchange: {
                 try writePropertyList(changed, to: plistURL)
             }
         )
@@ -4144,6 +4442,188 @@ private func test7_ManualCrontabRunUsesDiscoveredContext(_ tests: TestHarness) t
     }
 }
 
+private func test8_discoverLaunchdJob(
+    in directories: [URL],
+    label: String
+) throws -> Job {
+    let adapter = LaunchdAdapter(searchDirectories: directories) { _, _ in
+        AdapterCommandResult(status: 1, stdout: "", stderr: "not loaded")
+    }
+    return try require(
+        try adapter.discover().first { $0.label == label },
+        "test8 launchd job \(label)"
+    )
+}
+
+private func test8_RenamedWrappedJobRecovery(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round8-renamed-wrapper") { directory in
+        let plistURL = directory.appendingPathComponent("renamed.plist")
+        try writePropertyList([
+            "Label": "com.example.test8.before",
+            "ProgramArguments": ["/bin/echo", "renamed"],
+        ], to: plistURL)
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+        let wrapper = JobWrapper(
+            store: store,
+            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
+        )
+        let originalJob = try test8_discoverLaunchdJob(
+            in: [directory],
+            label: "com.example.test8.before"
+        )
+        _ = try wrapper.wrap(
+            job: originalJob,
+            tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"
+        )
+
+        var renamed = try test2A_readPropertyList(plistURL)
+        renamed["Label"] = "com.example.test8.after"
+        try writePropertyList(renamed, to: plistURL)
+        let renamedJob = try test8_discoverLaunchdJob(
+            in: [directory],
+            label: "com.example.test8.after"
+        )
+        tests.expect(originalJob.id != renamedJob.id, "test8_labelEdit_changesDiscoveredJobID")
+        tests.expectEqual(
+            try wrapper.recoveryState(job: renamedJob),
+            .wrappedConsistent,
+            "test8_labelEdit_authenticatedBackupRecoversOwnership"
+        )
+
+        _ = try wrapper.unwrap(job: renamedJob)
+        let restored = try test2A_readPropertyList(plistURL)
+        tests.expectEqual(
+            restored["Label"] as? String,
+            "com.example.test8.after",
+            "test8_labelEdit_unwrapPreservesNewLabel"
+        )
+        tests.expectEqual(
+            restored["ProgramArguments"] as? [String],
+            ["/bin/echo", "renamed"],
+            "test8_labelEdit_unwrapRestoresOriginalCommand"
+        )
+        let managedIDsAfterUnwrap = try store.managedJobIDs()
+        tests.expect(
+            !managedIDsAfterUnwrap.contains(originalJob.id),
+            "test8_labelEdit_unwrapClearsStaleManagedRow"
+        )
+    }
+}
+
+private func test8_MovedWrappedJobRecovery(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round8-moved-wrapper") { directory in
+        let originalDirectory = directory.appendingPathComponent("original", isDirectory: true)
+        let movedDirectory = directory.appendingPathComponent("moved", isDirectory: true)
+        try FileManager.default.createDirectory(at: originalDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: movedDirectory, withIntermediateDirectories: true)
+        let originalURL = originalDirectory.appendingPathComponent("job.plist")
+        let movedURL = movedDirectory.appendingPathComponent("job.plist")
+        try writePropertyList([
+            "Label": "com.example.test8.moved",
+            "ProgramArguments": ["/bin/echo", "moved"],
+        ], to: originalURL)
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+        let wrapper = JobWrapper(
+            store: store,
+            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
+        )
+        let originalJob = try test8_discoverLaunchdJob(
+            in: [originalDirectory, movedDirectory],
+            label: "com.example.test8.moved"
+        )
+        _ = try wrapper.wrap(
+            job: originalJob,
+            tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"
+        )
+        _ = try test5_finish(
+            store: store,
+            jobID: originalJob.id,
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 80),
+            exitCode: 0
+        )
+        try FileManager.default.moveItem(at: originalURL, to: movedURL)
+
+        let movedJob = try test8_discoverLaunchdJob(
+            in: [originalDirectory, movedDirectory],
+            label: "com.example.test8.moved"
+        )
+        tests.expect(originalJob.id != movedJob.id, "test8_pathMove_changesDiscoveredJobID")
+        tests.expectEqual(
+            try wrapper.recoveryState(job: movedJob),
+            .wrappedConsistent,
+            "test8_pathMove_authenticatedBackupRecoversOwnership"
+        )
+
+        _ = try wrapper.wrap(
+            job: movedJob,
+            tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"
+        )
+        let migratedArguments = try require(
+            try test2A_readPropertyList(movedURL)["ProgramArguments"] as? [String],
+            "test8 migrated wrapper arguments"
+        )
+        tests.expectEqual(
+            LaunchdWrapper.decode(migratedArguments)?.label,
+            movedJob.id,
+            "test8_pathMove_migratesEmbeddedWrapperID"
+        )
+        tests.expectEqual(
+            try store.managedBackupPath(jobID: originalJob.id),
+            nil,
+            "test8_pathMove_clearsOldManagedRow"
+        )
+        let movedBackupPath = try store.managedBackupPath(jobID: movedJob.id)
+        tests.expect(
+            movedBackupPath != nil,
+            "test8_pathMove_migratesManagedRowToCurrentID"
+        )
+        tests.expectEqual(
+            try store.runs(jobID: movedJob.id, limit: 10).map(\.outcome),
+            [.success],
+            "test8_pathMove_migratesExistingHistory"
+        )
+        tests.expectEqual(
+            try wrapper.recoveryState(job: movedJob),
+            .wrappedConsistent,
+            "test8_pathMove_migratedWrapperRemainsRecoverable"
+        )
+        _ = try wrapper.unwrap(job: movedJob)
+        tests.expectEqual(
+            try test2A_readPropertyList(movedURL)["ProgramArguments"] as? [String],
+            ["/bin/echo", "moved"],
+            "test8_pathMove_unwrapRestoresOriginalCommand"
+        )
+    }
+}
+
+private func test8_ForeignWrapperStillRejected(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round8-foreign-wrapper") { directory in
+        let originalURL = directory.appendingPathComponent("original.plist")
+        let copiedURL = directory.appendingPathComponent("copied.plist")
+        try writePropertyList([
+            "Label": "com.example.test8.owner",
+            "ProgramArguments": ["/bin/echo", "owner"],
+        ], to: originalURL)
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+        let wrapper = JobWrapper(
+            store: store,
+            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
+        )
+        let owner = try test8_discoverLaunchdJob(in: [directory], label: "com.example.test8.owner")
+        _ = try wrapper.wrap(job: owner, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        var copied = try test2A_readPropertyList(originalURL)
+        copied["Label"] = "com.example.test8.copy"
+        try writePropertyList(copied, to: copiedURL)
+        let foreign = try test8_discoverLaunchdJob(in: [directory], label: "com.example.test8.copy")
+        tests.expectEqual(
+            try wrapper.recoveryState(job: foreign),
+            .wrappedForeignLabel(embeddedJobID: owner.id),
+            "test8_copiedWrapper_withOriginalStillPresentRemainsForeign"
+        )
+    }
+}
+
 
 @main
 private enum TickerTests {
@@ -4200,11 +4680,26 @@ private enum TickerTests {
         tests.run("round 5 health precedence and manual isolation") {
             try test5_HealthPrecedenceAndManualIsolation(tests)
         }
+        tests.run("round 8 wrapped health ordering") {
+            try test8_WrappedHealthOrdering(tests)
+        }
+        tests.run("round 8 launchd status observation time") {
+            try test8_LaunchdStatusObservationTimestamp(tests)
+        }
         tests.run("round 5 unwrap health reset") {
             try test5_UnwrapResetsHealthWithoutDeletingHistory(tests)
         }
         tests.run("round 5 trigger schema migration") {
             try test5_RunTriggerSchemaMigration(tests)
+        }
+        tests.run("round 8 concurrent trigger migration") {
+            try test8_ConcurrentTriggerMigration(tests)
+        }
+        tests.run("round 8 already-triggered legacy migration") {
+            try test8_AlreadyTriggeredRowsAreExcludedFromHealth(tests)
+        }
+        tests.run("round 8 wrapper store path policy") {
+            test8_StorePathPolicy(tests)
         }
         tests.run("round 5 crontab context and identity") {
             try test5_CrontabContextAndIdentity(tests)
@@ -4241,6 +4736,15 @@ private enum TickerTests {
         }
         tests.run("round 7 manual crontab context") {
             try test7_ManualCrontabRunUsesDiscoveredContext(tests)
+        }
+        tests.run("round 8 renamed wrapped-job recovery") {
+            try test8_RenamedWrappedJobRecovery(tests)
+        }
+        tests.run("round 8 moved wrapped-job recovery") {
+            try test8_MovedWrappedJobRecovery(tests)
+        }
+        tests.run("round 8 foreign wrapper rejection") {
+            try test8_ForeignWrapperStillRejected(tests)
         }
         tests.finish()
     }

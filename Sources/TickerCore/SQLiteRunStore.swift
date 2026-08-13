@@ -4,6 +4,19 @@ import SQLite3
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+public enum RunStorePathPolicy {
+    public static func configuredPath(
+        environment: [String: String],
+        scheduledWrapperInvocation: Bool,
+        defaultPath: String
+    ) -> String {
+        if scheduledWrapperInvocation {
+            return defaultPath
+        }
+        return environment["TICKER_STORE_PATH"] ?? defaultPath
+    }
+}
+
 public struct SQLiteRunStoreError: Error, LocalizedError {
     public let operation: String
     public let code: Int32
@@ -31,8 +44,9 @@ public struct JobIdentityMigrationReport: Equatable {
 }
 
 public final class SQLiteRunStore: RunStore {
-    private static let schemaVersion = "2"
+    private static let schemaVersion = "3"
     private static let jobIdentityMigrationKey = "job_identity_v2"
+    private static let runTriggerHealthMigrationKey = "run_trigger_health_v3"
 
     private let database: OpaquePointer
     private let queue = DispatchQueue(label: "com.ticker.SQLiteRunStore")
@@ -52,7 +66,14 @@ public final class SQLiteRunStore: RunStore {
         try self.init(path: databaseURL.path)
     }
 
-    public init(path: String) throws {
+    public convenience init(path: String) throws {
+        try self.init(path: path, beforeRunsTriggerMigration: nil)
+    }
+
+    internal init(
+        path: String,
+        beforeRunsTriggerMigration: (() -> Void)?
+    ) throws {
         let databaseURL = URL(fileURLWithPath: path)
         let directory = databaseURL.deletingLastPathComponent()
         do {
@@ -98,7 +119,10 @@ public final class SQLiteRunStore: RunStore {
                 CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);
                 """
             )
-            try Self.ensureRunsTriggerColumn(database: validDatabase)
+            try Self.ensureRunsTriggerColumn(
+                database: validDatabase,
+                beforeMigration: beforeRunsTriggerMigration
+            )
             try Self.stampSchemaVersion(database: validDatabase)
         } catch {
             sqlite3_close_v2(validDatabase)
@@ -213,7 +237,7 @@ public final class SQLiteRunStore: RunStore {
         }
     }
 
-    public func health() throws -> [String: Outcome] {
+    public func scheduledHealthRuns() throws -> [String: Run] {
         return try queue.sync {
             let statement = try prepare(
                 """
@@ -243,13 +267,17 @@ public final class SQLiteRunStore: RunStore {
             defer { sqlite3_finalize(statement) }
 
             let latestRuns = try readRuns(statement, operation: "read health")
-            var result: [String: Outcome] = [:]
+            var result: [String: Run] = [:]
             result.reserveCapacity(latestRuns.count)
             for run in latestRuns {
-                result[run.jobID] = run.outcome
+                result[run.jobID] = run
             }
             return result
         }
+    }
+
+    public func health() throws -> [String: Outcome] {
+        try scheduledHealthRuns().mapValues(\.outcome)
     }
 
     public func markManaged(jobID: String, backupPath: String?) throws {
@@ -308,6 +336,27 @@ public final class SQLiteRunStore: RunStore {
                 try stepDone(deleteStatement, operation: "unmark managed job")
             }
 
+            try Self.execute(database: database, sql: "COMMIT;")
+            committed = true
+        }
+    }
+
+    public func migrateJobIdentity(from oldJobID: String, to newJobID: String) throws {
+        guard oldJobID != newJobID else {
+            return
+        }
+        try queue.sync {
+            try Self.execute(database: database, sql: "BEGIN IMMEDIATE TRANSACTION;")
+            var committed = false
+            defer {
+                if !committed {
+                    try? Self.execute(database: database, sql: "ROLLBACK;")
+                }
+            }
+
+            try rekeyRuns(from: oldJobID, to: newJobID)
+            try rekeyManagedJob(from: oldJobID, to: newJobID)
+            try rekeyHealthReset(from: oldJobID, to: newJobID)
             try Self.execute(database: database, sql: "COMMIT;")
             committed = true
         }
@@ -632,7 +681,133 @@ public final class SQLiteRunStore: RunStore {
         }
     }
 
-    private static func ensureRunsTriggerColumn(database: OpaquePointer) throws {
+    private static func ensureRunsTriggerColumn(
+        database: OpaquePointer,
+        beforeMigration: (() -> Void)?
+    ) throws {
+        guard try !runTriggerHealthMigrationCompleted(database: database) else {
+            return
+        }
+        if try !runsHasTriggerColumn(database: database) {
+            beforeMigration?()
+        }
+
+        try execute(database: database, sql: "BEGIN IMMEDIATE TRANSACTION;")
+        var committed = false
+        defer {
+            if !committed {
+                try? execute(database: database, sql: "ROLLBACK;")
+            }
+        }
+
+        if try !runTriggerHealthMigrationCompleted(database: database) {
+            if try !runsHasTriggerColumn(database: database) {
+                try execute(
+                    database: database,
+                    sql: "ALTER TABLE runs ADD COLUMN trigger TEXT NOT NULL DEFAULT 'scheduled';"
+                )
+            }
+            try execute(
+                database: database,
+                sql: """
+                    INSERT INTO health_resets(job_id, reset_after_run_id)
+                    SELECT job_id, MAX(id) FROM runs GROUP BY job_id
+                    ON CONFLICT(job_id) DO UPDATE SET
+                      reset_after_run_id = MAX(
+                        health_resets.reset_after_run_id,
+                        excluded.reset_after_run_id
+                      );
+                    """
+            )
+            try markRunTriggerHealthMigrationCompleted(database: database)
+        }
+
+        try execute(database: database, sql: "COMMIT;")
+        committed = true
+    }
+
+    private static func runTriggerHealthMigrationCompleted(
+        database: OpaquePointer
+    ) throws -> Bool {
+        var statement: OpaquePointer?
+        let prepareResult = sqlite3_prepare_v2(
+            database,
+            "SELECT 1 FROM schema_meta WHERE key = ? LIMIT 1;",
+            -1,
+            &statement,
+            nil
+        )
+        guard prepareResult == SQLITE_OK, let validStatement = statement else {
+            throw SQLiteRunStoreError(
+                operation: "prepare run-trigger health migration lookup",
+                code: prepareResult,
+                message: String(cString: sqlite3_errmsg(database))
+            )
+        }
+        defer { sqlite3_finalize(validStatement) }
+
+        let bindResult = bindText(runTriggerHealthMigrationKey, to: 1, in: validStatement)
+        guard bindResult == SQLITE_OK else {
+            throw SQLiteRunStoreError(
+                operation: "bind run-trigger health migration key",
+                code: bindResult,
+                message: String(cString: sqlite3_errmsg(database))
+            )
+        }
+
+        let stepResult = sqlite3_step(validStatement)
+        if stepResult == SQLITE_ROW {
+            return true
+        }
+        guard stepResult == SQLITE_DONE else {
+            throw SQLiteRunStoreError(
+                operation: "read run-trigger health migration marker",
+                code: stepResult,
+                message: String(cString: sqlite3_errmsg(database))
+            )
+        }
+        return false
+    }
+
+    private static func markRunTriggerHealthMigrationCompleted(
+        database: OpaquePointer
+    ) throws {
+        var statement: OpaquePointer?
+        let prepareResult = sqlite3_prepare_v2(
+            database,
+            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES(?, '1');",
+            -1,
+            &statement,
+            nil
+        )
+        guard prepareResult == SQLITE_OK, let validStatement = statement else {
+            throw SQLiteRunStoreError(
+                operation: "prepare run-trigger health migration marker",
+                code: prepareResult,
+                message: String(cString: sqlite3_errmsg(database))
+            )
+        }
+        defer { sqlite3_finalize(validStatement) }
+
+        let bindResult = bindText(runTriggerHealthMigrationKey, to: 1, in: validStatement)
+        guard bindResult == SQLITE_OK else {
+            throw SQLiteRunStoreError(
+                operation: "bind run-trigger health migration marker",
+                code: bindResult,
+                message: String(cString: sqlite3_errmsg(database))
+            )
+        }
+        let stepResult = sqlite3_step(validStatement)
+        guard stepResult == SQLITE_DONE else {
+            throw SQLiteRunStoreError(
+                operation: "write run-trigger health migration marker",
+                code: stepResult,
+                message: String(cString: sqlite3_errmsg(database))
+            )
+        }
+    }
+
+    private static func runsHasTriggerColumn(database: OpaquePointer) throws -> Bool {
         var statement: OpaquePointer?
         let prepareResult = sqlite3_prepare_v2(
             database,
@@ -671,12 +846,7 @@ public final class SQLiteRunStore: RunStore {
         }
         sqlite3_finalize(validStatement)
 
-        if !hasTriggerColumn {
-            try execute(
-                database: database,
-                sql: "ALTER TABLE runs ADD COLUMN trigger TEXT NOT NULL DEFAULT 'scheduled';"
-            )
-        }
+        return hasTriggerColumn
     }
 
     private func prepare(_ sql: String) throws -> OpaquePointer {
