@@ -103,16 +103,23 @@ final class AppModel: ObservableObject {
     @Published private(set) var busyJobIDs: Set<String> = []
 
     private let wrapper: JobWrapper
+    private let tickerPathOverride: String?
     private let workQueue = DispatchQueue(label: "com.suchintan.ticker.work", qos: .userInitiated)
     private var refreshInProgress = false
     private var refreshPending = false
     private var runningProcesses: [String: Process] = [:]
     private var refreshTimer: Timer?
 
-    init(registry: JobRegistry, store: SQLiteRunStore) {
+    init(
+        registry: JobRegistry,
+        store: SQLiteRunStore,
+        wrapper: JobWrapper? = nil,
+        tickerPathOverride: String? = nil
+    ) {
         self.registry = registry
         self.store = store
-        self.wrapper = JobWrapper(store: store)
+        self.wrapper = wrapper ?? JobWrapper(store: store)
+        self.tickerPathOverride = tickerPathOverride
     }
 
     deinit {
@@ -216,7 +223,7 @@ final class AppModel: ObservableObject {
 
     func isManaged(_ job: Job) -> Bool {
         switch recoveryStates[job.id] {
-        case .wrappedConsistent, .wrappedMissingBackup,
+        case .wrappedConsistent, .identityChanged, .wrappedMissingBackup,
              .wrappedBackupContentMismatch, .wrappedBackupUnverified:
             return true
         case .unwrapped, .wrappedForeignLabel, .ambiguousTickerInvocation, .staleManagedRow, .none:
@@ -243,7 +250,8 @@ final class AppModel: ObservableObject {
         case .wrappedForeignLabel, .wrappedBackupContentMismatch,
              .wrappedBackupUnverified, .ambiguousTickerInvocation:
             return false
-        case .unwrapped, .wrappedConsistent, .wrappedMissingBackup, .staleManagedRow:
+        case .unwrapped, .wrappedConsistent, .identityChanged,
+             .wrappedMissingBackup, .staleManagedRow:
             return true
         }
     }
@@ -257,6 +265,8 @@ final class AppModel: ObservableObject {
             return "Wrap for history"
         case .wrappedConsistent:
             return "Unwrap for history"
+        case .identityChanged:
+            return "Reconcile history identity"
         case .wrappedMissingBackup:
             return "Repair history wrapper"
         case .wrappedBackupContentMismatch:
@@ -276,6 +286,8 @@ final class AppModel: ObservableObject {
         switch recoveryStates[job.id] {
         case .wrappedConsistent:
             return "arrow.uturn.backward"
+        case .identityChanged:
+            return "arrow.triangle.2.circlepath"
         case .wrappedMissingBackup:
             return "wrench.and.screwdriver"
         case .wrappedBackupContentMismatch, .wrappedBackupUnverified,
@@ -394,6 +406,15 @@ final class AppModel: ObservableObject {
                 case .wrappedConsistent:
                     commands = try self.wrapper.unwrap(job: job)
                     verb = "Restored"
+                case .identityChanged:
+                    guard let tickerPath = self.resolveTickerCLIPath() else {
+                        throw TickerAppError.tickerCLINotFound
+                    }
+                    commands = try self.wrapper.reconcileIdentityChange(
+                        job: job,
+                        tickerPath: tickerPath
+                    )
+                    verb = "Reconciled"
                 case .unwrapped, .staleManagedRow, .wrappedMissingBackup:
                     guard let tickerPath = self.resolveTickerCLIPath() else {
                         throw TickerAppError.tickerCLINotFound
@@ -435,6 +456,9 @@ final class AppModel: ObservableObject {
     }
 
     nonisolated private func resolveTickerCLIPath() -> String? {
+        if let tickerPathOverride {
+            return tickerPathOverride
+        }
         let bundled = Bundle.main.bundleURL
             .appendingPathComponent("Contents", isDirectory: true)
             .appendingPathComponent("MacOS", isDirectory: true)

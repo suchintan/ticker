@@ -168,6 +168,8 @@ public final class LaunchdAdapter: JobSourceAdapter {
         let exitStatus: ExitStatus?
         let attribution: RuntimeStatusAttribution
         let observedAt: Date
+        let processID: Int32?
+        let runCount: Int64?
     }
 
     private let searchDirectories: [URL]
@@ -252,6 +254,8 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 configPath: configuration.configPath,
                 lastKnownExit: runtimeStatus?.exitStatus,
                 nativeStatusObservedAt: runtimeStatus?.observedAt,
+                launchdProcessID: runtimeStatus?.processID,
+                launchdRunCount: runtimeStatus?.runCount,
                 lastRunAt: nil,
                 lastScheduledFor: nil,
                 managed: configuration.managed
@@ -503,7 +507,8 @@ public final class LaunchdAdapter: JobSourceAdapter {
             return nil
         }
 
-        let exitStatus = parseExitStatus(result.stdout)
+        let snapshot = LaunchdRuntimeSnapshot.parse(result.stdout)
+        let exitStatus = snapshot.lastExitStatus
         let attribution: RuntimeStatusAttribution
         if exitStatus != nil {
             attribution = .resolved
@@ -515,7 +520,9 @@ public final class LaunchdAdapter: JobSourceAdapter {
         return RuntimeStatus(
             exitStatus: exitStatus,
             attribution: attribution,
-            observedAt: Date()
+            observedAt: Date(),
+            processID: snapshot.processID,
+            runCount: snapshot.runCount
         )
     }
 
@@ -529,25 +536,6 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 && $0.lowercased().contains("never exited")
         }
         return isRunning && hasNeverExitedMarker
-    }
-
-    private func parseExitStatus(_ output: String) -> ExitStatus? {
-        for line in output.split(whereSeparator: \.isNewline) {
-            let normalized = line.lowercased()
-            guard normalized.contains("last exit code")
-                    || normalized.contains("lastexitstatus"),
-                  let equals = line.firstIndex(of: "=") else {
-                continue
-            }
-            let rawValue = line[line.index(after: equals)...]
-                .trimmingCharacters(in: CharacterSet(charactersIn: " ;\t\r\n"))
-            guard let token = rawValue.split(whereSeparator: \.isWhitespace).first,
-                  let raw = Int32(token) else {
-                continue
-            }
-            return ExitStatus(raw: raw)
-        }
-        return nil
     }
 
     private func launchdDomain(for directory: URL) -> LaunchdDomain {

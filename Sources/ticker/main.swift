@@ -437,6 +437,8 @@ private struct TickerCLI {
         }
         var childEnvironment: [String: String]?
         var childWorkingDirectory: String?
+        var wrapperRuntimeSnapshot: LaunchdRuntimeSnapshot?
+        var recordingAuthorized = true
 
         if trigger == .manual {
             guard !wrapperVersionSeen else {
@@ -476,6 +478,28 @@ private struct TickerCLI {
             }
         }
 
+        if trigger == .scheduled && wrapperVersionSeen {
+            do {
+                let snapshot = try LaunchdRuntimeProbe.snapshot(
+                    jobID: jobID,
+                    launchctlURL: scheduledLaunchctlURL()
+                )
+                guard snapshot.processID == getpid() else {
+                    let reportedPID = snapshot.processID.map { String($0) } ?? "none"
+                    throw LaunchdRuntimeProbeError(
+                        message: "launchd reports pid \(reportedPID), not this wrapper pid \(getpid())"
+                    )
+                }
+                wrapperRuntimeSnapshot = snapshot
+            } catch {
+                recordingAuthorized = false
+                writeStandardError(
+                    "ticker: scheduled wrapper ownership not proven for \(jobID); "
+                        + "executing without recording history: \(error.localizedDescription)\n"
+                )
+            }
+        }
+
         executeChild(
             jobID: jobID,
             arguments: childArguments,
@@ -483,6 +507,8 @@ private struct TickerCLI {
             tailBytes: tailBytes,
             trigger: trigger,
             scheduledWrapperInvocation: trigger == .scheduled && wrapperVersionSeen,
+            recordingAuthorized: recordingAuthorized,
+            wrapperRuntimeSnapshot: wrapperRuntimeSnapshot,
             environment: childEnvironment,
             currentDirectory: childWorkingDirectory
         )
@@ -495,6 +521,8 @@ private struct TickerCLI {
         tailBytes: Int,
         trigger: RunTrigger,
         scheduledWrapperInvocation: Bool,
+        recordingAuthorized: Bool,
+        wrapperRuntimeSnapshot: LaunchdRuntimeSnapshot?,
         environment: [String: String]?,
         currentDirectory: String?
     ) -> Never {
@@ -502,24 +530,34 @@ private struct TickerCLI {
         var store: SQLiteRunStore?
         var runID: Int64?
 
-        do {
-            let openedStore = try SQLiteRunStore(
-                path: configuredStorePath(
-                    scheduledWrapperInvocation: scheduledWrapperInvocation
-                )
-            )
-            store = openedStore
+        if recordingAuthorized {
             do {
-                runID = try openedStore.beginRun(
-                    jobID: jobID,
-                    startedAt: startedAt,
-                    trigger: trigger
+                let openedStore = try SQLiteRunStore(
+                    path: configuredStorePath(
+                        scheduledWrapperInvocation: scheduledWrapperInvocation
+                    )
                 )
+                store = openedStore
+                do {
+                    runID = try openedStore.beginRun(
+                        jobID: jobID,
+                        startedAt: startedAt,
+                        trigger: trigger,
+                        context: wrapperRuntimeSnapshot.map {
+                            RunStartContext(
+                                processID: getpid(),
+                                bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+                                nativeExitStatusAtStart: $0.lastExitStatus?.raw,
+                                launchdRunCountAtStart: $0.runCount
+                            )
+                        }
+                    )
+                } catch {
+                    writeStandardError("ticker: could not record run start: \(error.localizedDescription)\n")
+                }
             } catch {
-                writeStandardError("ticker: could not record run start: \(error.localizedDescription)\n")
+                writeStandardError("ticker: could not open run store: \(error.localizedDescription)\n")
             }
-        } catch {
-            writeStandardError("ticker: could not open run store: \(error.localizedDescription)\n")
         }
 
         let stdoutTail = TailBuffer(capacity: tailBytes)
@@ -922,11 +960,29 @@ private struct POSIXProcessError: Error, LocalizedError {
 }
 
 private func configuredStorePath(scheduledWrapperInvocation: Bool = false) -> String {
-    RunStorePathPolicy.configuredPath(
+    #if TICKER_TESTING
+    let compiledDefaultPath = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ticker-compiled-test-default", isDirectory: true)
+        .appendingPathComponent("ticker-\(getppid()).db", isDirectory: false)
+        .path
+    #else
+    let compiledDefaultPath = SQLiteRunStore.defaultPath()
+    #endif
+    return RunStorePathPolicy.configuredPath(
         environment: ProcessInfo.processInfo.environment,
         scheduledWrapperInvocation: scheduledWrapperInvocation,
-        defaultPath: SQLiteRunStore.defaultPath()
+        defaultPath: compiledDefaultPath
     )
+}
+
+private func scheduledLaunchctlURL() -> URL {
+    #if TICKER_TESTING
+    if let path = ProcessInfo.processInfo.environment["TICKER_TEST_LAUNCHCTL_PATH"],
+       !path.isEmpty {
+        return URL(fileURLWithPath: path)
+    }
+    #endif
+    return URL(fileURLWithPath: "/bin/launchctl")
 }
 
 private func spawnChild(

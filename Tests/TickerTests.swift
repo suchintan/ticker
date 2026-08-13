@@ -1093,6 +1093,7 @@ private func test3A_builtCLIPath() throws -> String {
     let result = try test3A_runProcess(
         "/bin/bash",
         ["Scripts/build-app.sh"],
+        environment: ["TICKER_TESTING_BUILD": "1"],
         currentDirectory: repository,
         timeout: 240
     )
@@ -1194,8 +1195,7 @@ private func test3A_ProgramAndArgumentsExecution(_ tests: TestHarness) throws {
             "test3A launchd discovery uses Program as the executable"
         )
 
-        let storePath = directory.appendingPathComponent("ticker.db").path
-        let store = try SQLiteRunStore(path: storePath)
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
         let wrapper = JobWrapper(
             store: store,
             backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
@@ -1208,8 +1208,7 @@ private func test3A_ProgramAndArgumentsExecution(_ tests: TestHarness) throws {
         )
         let result = try test3A_runProcess(
             wrappedArguments[0],
-            Array(wrappedArguments.dropFirst()),
-            environment: ["TICKER_STORE_PATH": storePath]
+            Array(wrappedArguments.dropFirst())
         )
         let observed = String(
             decoding: try Data(contentsOf: observedURL),
@@ -2341,6 +2340,7 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
         )
 
         let harnessSource = #"""
+        import CryptoKit
         import Darwin
         import Foundation
         import TickerCore
@@ -2615,11 +2615,153 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                     migratedRun != nil,
                     "GUI refresh did not migrate legacy run history before publishing"
                 )
-                let remainingLegacyRun = try migrationStore.latestRun(jobID: legacyJobID)
+                let legacyAliasRun = try migrationStore.latestRun(jobID: legacyJobID)
                 try check(
-                    remainingLegacyRun == nil,
-                    "GUI refresh left migrated history under the legacy id"
+                    legacyAliasRun?.jobID == currentJob.id,
+                    "GUI refresh did not canonicalize legacy history lookup"
                 )
+
+                let identityOriginalDirectory = root.appendingPathComponent(
+                    "identity-original",
+                    isDirectory: true
+                )
+                let identityMovedDirectory = root.appendingPathComponent(
+                    "identity-moved",
+                    isDirectory: true
+                )
+                try FileManager.default.createDirectory(
+                    at: identityOriginalDirectory,
+                    withIntermediateDirectories: true
+                )
+                try FileManager.default.createDirectory(
+                    at: identityMovedDirectory,
+                    withIntermediateDirectories: true
+                )
+                let identityOriginalURL = identityOriginalDirectory.appendingPathComponent("job.plist")
+                let identityMovedURL = identityMovedDirectory.appendingPathComponent("job.plist")
+                let identityLabel = "com.example.test9.app-route"
+                let identityPlist = try PropertyListSerialization.data(
+                    fromPropertyList: [
+                        "Label": identityLabel,
+                        "ProgramArguments": ["/usr/bin/true"],
+                    ],
+                    format: .xml,
+                    options: 0
+                )
+                try identityPlist.write(to: identityOriginalURL)
+                func identityID(_ url: URL) -> String {
+                    let path = url.resolvingSymlinksInPath().standardizedFileURL.path
+                    let digest = SHA256.hash(data: Data(path.utf8))
+                        .map { String(format: "%02x", $0) }
+                        .joined()
+                    return "launchd:\(identityLabel)#\(digest.prefix(12))"
+                }
+                func identityJob(id: String, url: URL, managed: Bool) -> Job {
+                    Job(
+                        id: id,
+                        source: .launchd,
+                        label: identityLabel,
+                        schedule: .onDemand,
+                        command: ["/usr/bin/true"],
+                        cwd: nil,
+                        enabled: true,
+                        configPath: url.path,
+                        lastKnownExit: nil,
+                        lastRunAt: nil,
+                        lastScheduledFor: nil,
+                        managed: managed
+                    )
+                }
+                let identityStore = try SQLiteRunStore(
+                    path: root.appendingPathComponent("identity.sqlite").path
+                )
+                let identityWrapper = JobWrapper(
+                    store: identityStore,
+                    backupDirectory: root.appendingPathComponent("identity-backups", isDirectory: true)
+                )
+                let identityOldID = identityID(identityOriginalURL)
+                let identityOldJob = identityJob(
+                    id: identityOldID,
+                    url: identityOriginalURL,
+                    managed: false
+                )
+                _ = try identityWrapper.wrap(job: identityOldJob, tickerPath: ticker.path)
+                let identityFirstRun = try identityStore.beginRun(
+                    jobID: identityOldID,
+                    startedAt: Date(timeIntervalSince1970: 2_000)
+                )
+                try identityStore.finishRun(
+                    id: identityFirstRun,
+                    exitCode: 0,
+                    stdoutTail: "",
+                    stderrTail: "",
+                    finishedAt: Date(timeIntervalSince1970: 2_001)
+                )
+                try FileManager.default.moveItem(at: identityOriginalURL, to: identityMovedURL)
+                let identityCurrentID = identityID(identityMovedURL)
+                let identityCurrentJob = identityJob(
+                    id: identityCurrentID,
+                    url: identityMovedURL,
+                    managed: true
+                )
+                let identityModel = AppModel(
+                    registry: JobRegistry(
+                        adapters: [StaticAdapter(source: .launchd, jobs: [identityCurrentJob])]
+                    ),
+                    store: identityStore,
+                    wrapper: identityWrapper,
+                    tickerPathOverride: ticker.path
+                )
+                identityModel.refresh()
+                try check(
+                    waitUntil {
+                        identityModel.recoveryState(for: identityCurrentJob)
+                            == .identityChanged(previousJobID: identityOldID)
+                    },
+                    "test9 app route did not publish identity-changed recovery"
+                )
+                try check(
+                    identityModel.wrappingButtonTitle(for: identityCurrentJob)
+                        == "Reconcile history identity",
+                    "test9 app route offered unwrap before identity reconciliation"
+                )
+                identityModel.toggleWrapping(identityCurrentJob)
+                try check(
+                    waitUntil {
+                        identityModel.actionMessages[identityCurrentID]?.contains("Reconciled") == true
+                    },
+                    "test9 app route did not reconcile identity"
+                )
+                let reconciledPlist = try PropertyListSerialization.propertyList(
+                    from: Data(contentsOf: identityMovedURL),
+                    options: [],
+                    format: nil
+                ) as? [String: Any]
+                let reconciledArguments = reconciledPlist?["ProgramArguments"] as? [String]
+                try check(
+                    reconciledArguments.flatMap(LaunchdWrapper.decode)?.label == identityCurrentID,
+                    "test9 app route did not rewrite the embedded identity"
+                )
+                let lateOldRun = try identityStore.beginRun(
+                    jobID: identityOldID,
+                    startedAt: Date(timeIntervalSince1970: 3_000)
+                )
+                try identityStore.finishRun(
+                    id: lateOldRun,
+                    exitCode: 1,
+                    stdoutTail: "",
+                    stderrTail: "",
+                    finishedAt: Date(timeIntervalSince1970: 3_001)
+                )
+                let identityRunJobIDs = try identityStore.runs(
+                    jobID: identityCurrentID,
+                    limit: 10
+                ).map(\.jobID)
+                try check(
+                    identityRunJobIDs == [identityCurrentID, identityCurrentID],
+                    "test9 late old-id run did not land on the current identity"
+                )
+                print("APP HARNESS test9_identityRecoveryRoute PASS")
 
                 let nextFireLabels = [
                     JobNextFirePresentation.relativeText(for: .keepAlive, nextFire: nil),
@@ -2724,6 +2866,10 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
         tests.expect(
             output.contains("APP HARNESS PASS"),
             "test4B compiled app harness covers argv0 execution, Run Now presentation, refresh, and environment"
+        )
+        tests.expect(
+            output.contains("APP HARNESS test9_identityRecoveryRoute PASS"),
+            "test9_appRoute_reconcilesIdentityBeforeUnwrapAndAcceptsLateOldRuns"
         )
     }
 }
@@ -2936,9 +3082,9 @@ private func test4A_IdentityStorageMigration(_ tests: TestHarness) throws {
             "test4A run history moves to the topology-independent id without duplication"
         )
         tests.expectEqual(
-            try store.runs(jobID: uniqueLegacy, limit: 10).count,
-            0,
-            "test4A migrated legacy run key is removed"
+            try store.runs(jobID: uniqueLegacy, limit: 10).map(\.jobID),
+            [uniqueCurrent],
+            "test4A migrated legacy lookup resolves through the persistent alias"
         )
         tests.expectEqual(
             try store.managedBackupPath(jobID: uniqueCurrent),
@@ -3110,6 +3256,8 @@ private func test5_makeJob(
     cwd: String? = nil,
     lastKnownExit: ExitStatus? = nil,
     nativeStatusObservedAt: Date? = nil,
+    launchdProcessID: Int32? = nil,
+    launchdRunCount: Int64? = nil,
     managed: Bool = false
 ) -> Job {
     Job(
@@ -3123,6 +3271,8 @@ private func test5_makeJob(
         configPath: nil,
         lastKnownExit: lastKnownExit,
         nativeStatusObservedAt: nativeStatusObservedAt,
+        launchdProcessID: launchdProcessID,
+        launchdRunCount: launchdRunCount,
         lastRunAt: nil,
         lastScheduledFor: nil,
         managed: managed
@@ -3134,9 +3284,15 @@ private func test5_finish(
     jobID: String,
     trigger: RunTrigger,
     startedAt: Date,
-    exitCode: Int32
+    exitCode: Int32,
+    context: RunStartContext? = nil
 ) throws -> Int64 {
-    let id = try store.beginRun(jobID: jobID, startedAt: startedAt, trigger: trigger)
+    let id = try store.beginRun(
+        jobID: jobID,
+        startedAt: startedAt,
+        trigger: trigger,
+        context: context
+    )
     try store.finishRun(
         id: id,
         exitCode: exitCode,
@@ -3248,11 +3404,24 @@ private func test5_HealthPrecedenceAndManualIsolation(_ tests: TestHarness) thro
         _ = try store.beginRun(
             jobID: wrappedID,
             startedAt: Date(timeIntervalSince1970: 501),
-            trigger: .scheduled
+            trigger: .scheduled,
+            context: RunStartContext(
+                processID: getpid(),
+                bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+                nativeExitStatusAtStart: 1,
+                launchdRunCountAtStart: nil
+            )
+        )
+        let wrappedRunningJob = test5_makeJob(
+            id: wrappedID,
+            lastKnownExit: ExitStatus(raw: 1),
+            nativeStatusObservedAt: Date(timeIntervalSince1970: 600),
+            launchdProcessID: getpid(),
+            managed: true
         )
         tests.expectEqual(
             JobHealthPolicy.outcome(
-                for: wrappedJob,
+                for: wrappedRunningJob,
                 scheduledHistory: try store.scheduledHealthRuns()[wrappedID]
             ),
             .running,
@@ -3299,12 +3468,20 @@ private func test8_WrappedHealthOrdering(_ tests: TestHarness) throws {
         _ = try store.beginRun(
             jobID: inProgressID,
             startedAt: Date(timeIntervalSince1970: 41),
-            trigger: .scheduled
+            trigger: .scheduled,
+            context: RunStartContext(
+                processID: getpid(),
+                bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+                nativeExitStatusAtStart: 1,
+                launchdRunCountAtStart: 4
+            )
         )
         let inProgress = test5_makeJob(
             id: inProgressID,
             lastKnownExit: ExitStatus(raw: 1),
             nativeStatusObservedAt: Date(timeIntervalSince1970: 40),
+            launchdProcessID: getpid(),
+            launchdRunCount: 4,
             managed: true
         )
         tests.expectEqual(
@@ -3322,12 +3499,19 @@ private func test8_WrappedHealthOrdering(_ tests: TestHarness) throws {
             jobID: newerSuccessID,
             trigger: .scheduled,
             startedAt: Date(timeIntervalSince1970: 51),
-            exitCode: 0
+            exitCode: 0,
+            context: RunStartContext(
+                processID: getpid(),
+                bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+                nativeExitStatusAtStart: 1,
+                launchdRunCountAtStart: 8
+            )
         )
         let newerSuccess = test5_makeJob(
             id: newerSuccessID,
             lastKnownExit: ExitStatus(raw: 1),
             nativeStatusObservedAt: Date(timeIntervalSince1970: 50),
+            launchdRunCount: 8,
             managed: true
         )
         tests.expectEqual(
@@ -3341,29 +3525,29 @@ private func test8_WrappedHealthOrdering(_ tests: TestHarness) throws {
     }
 }
 
-private func test8_LaunchdStatusObservationTimestamp(_ tests: TestHarness) throws {
+private func test8_LaunchdRuntimeOrderingEvidence(_ tests: TestHarness) throws {
     try withTemporaryDirectory("round8-launchd-observation") { directory in
         try writePropertyList([
             "Label": "com.example.test8.observed",
             "ProgramArguments": ["/usr/bin/true"],
         ], to: directory.appendingPathComponent("observed.plist"))
-        let before = Date()
         let adapter = LaunchdAdapter(searchDirectories: [directory]) { _, _ in
             AdapterCommandResult(
                 status: 0,
-                stdout: "last exit code = 1\n",
+                stdout: "pid = 4321\nruns = 17\nlast exit code = 1\n",
                 stderr: ""
             )
         }
         let job = try require(try adapter.discover().first, "test8 observed launchd job")
-        let after = Date()
-        let observedAt = try require(
-            job.nativeStatusObservedAt,
-            "test8 launchd native observation timestamp"
+        tests.expectEqual(
+            job.launchdProcessID,
+            4321,
+            "test8_launchdStatus_carriesServicePID"
         )
-        tests.expect(
-            observedAt >= before && observedAt <= after,
-            "test8_launchdFailure_carriesObservationTimeForHealthOrdering"
+        tests.expectEqual(
+            job.launchdRunCount,
+            17,
+            "test8_launchdStatus_carriesMonotonicRunCount"
         )
     }
 }
@@ -4486,10 +4670,14 @@ private func test8_RenamedWrappedJobRecovery(_ tests: TestHarness) throws {
         tests.expect(originalJob.id != renamedJob.id, "test8_labelEdit_changesDiscoveredJobID")
         tests.expectEqual(
             try wrapper.recoveryState(job: renamedJob),
-            .wrappedConsistent,
-            "test8_labelEdit_authenticatedBackupRecoversOwnership"
+            .identityChanged(previousJobID: originalJob.id),
+            "test8_labelEdit_surfacesExplicitIdentityRecovery"
         )
 
+        _ = try wrapper.reconcileIdentityChange(
+            job: renamedJob,
+            tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"
+        )
         _ = try wrapper.unwrap(job: renamedJob)
         let restored = try test2A_readPropertyList(plistURL)
         tests.expectEqual(
@@ -4551,11 +4739,11 @@ private func test8_MovedWrappedJobRecovery(_ tests: TestHarness) throws {
         tests.expect(originalJob.id != movedJob.id, "test8_pathMove_changesDiscoveredJobID")
         tests.expectEqual(
             try wrapper.recoveryState(job: movedJob),
-            .wrappedConsistent,
-            "test8_pathMove_authenticatedBackupRecoversOwnership"
+            .identityChanged(previousJobID: originalJob.id),
+            "test8_pathMove_surfacesExplicitIdentityRecovery"
         )
 
-        _ = try wrapper.wrap(
+        _ = try wrapper.reconcileIdentityChange(
             job: movedJob,
             tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"
         )
@@ -4568,15 +4756,15 @@ private func test8_MovedWrappedJobRecovery(_ tests: TestHarness) throws {
             movedJob.id,
             "test8_pathMove_migratesEmbeddedWrapperID"
         )
-        tests.expectEqual(
-            try store.managedBackupPath(jobID: originalJob.id),
-            nil,
-            "test8_pathMove_clearsOldManagedRow"
-        )
         let movedBackupPath = try store.managedBackupPath(jobID: movedJob.id)
         tests.expect(
             movedBackupPath != nil,
             "test8_pathMove_migratesManagedRowToCurrentID"
+        )
+        tests.expectEqual(
+            try store.managedBackupPath(jobID: originalJob.id),
+            movedBackupPath,
+            "test8_pathMove_oldBackupLookupCanonicalizesThroughAlias"
         )
         tests.expectEqual(
             try store.runs(jobID: movedJob.id, limit: 10).map(\.outcome),
@@ -4624,10 +4812,508 @@ private func test8_ForeignWrapperStillRejected(_ tests: TestHarness) throws {
     }
 }
 
+private func test9_RunLivenessAndNativeOrdering(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round9-run-liveness") { directory in
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+        let bootSessionID = RunExecutionEvidence.currentBootSessionID()
+
+        let deadID = "launchd:test9-dead#111111111111"
+        _ = try store.beginRun(
+            jobID: deadID,
+            startedAt: Date(timeIntervalSince1970: 100),
+            trigger: .scheduled,
+            context: RunStartContext(
+                processID: Int32.max,
+                bootSessionID: bootSessionID,
+                nativeExitStatusAtStart: 1,
+                launchdRunCountAtStart: 10
+            )
+        )
+        let deadJob = test5_makeJob(
+            id: deadID,
+            lastKnownExit: ExitStatus(raw: 1),
+            launchdRunCount: 10,
+            managed: true
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: deadJob,
+                scheduledHistory: try store.scheduledHealthRuns()[deadID]
+            ),
+            .failure,
+            "test9_deadWrapper_nativeFailureWinsOverUnfinishedRow"
+        )
+
+        let previousBootID = "launchd:test9-previous-boot#222222222222"
+        _ = try store.beginRun(
+            jobID: previousBootID,
+            startedAt: Date(timeIntervalSince1970: 200),
+            trigger: .scheduled,
+            context: RunStartContext(
+                processID: getpid(),
+                bootSessionID: "previous-boot-session",
+                nativeExitStatusAtStart: 2,
+                launchdRunCountAtStart: 20
+            )
+        )
+        let previousBootJob = test5_makeJob(
+            id: previousBootID,
+            lastKnownExit: ExitStatus(raw: 2),
+            launchdRunCount: 20,
+            managed: true
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: previousBootJob,
+                scheduledHistory: try store.scheduledHealthRuns()[previousBootID]
+            ),
+            .failure,
+            "test9_previousBoot_unfinishedRowIsNotRunning"
+        )
+
+        let unavailableBootID = "launchd:test9-unavailable-boot#232323232323"
+        _ = try store.beginRun(
+            jobID: unavailableBootID,
+            startedAt: Date(timeIntervalSince1970: 250),
+            trigger: .scheduled,
+            context: RunStartContext(
+                processID: getpid(),
+                bootSessionID: RunExecutionEvidence.unavailableBootSessionID,
+                nativeExitStatusAtStart: 2,
+                launchdRunCountAtStart: 25
+            )
+        )
+        let unavailableBootJob = test5_makeJob(
+            id: unavailableBootID,
+            lastKnownExit: ExitStatus(raw: 2),
+            launchdProcessID: getpid(),
+            launchdRunCount: 25,
+            managed: true
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: unavailableBootJob,
+                scheduledHistory: try store.scheduledHealthRuns()[unavailableBootID]
+            ),
+            .failure,
+            "test9_unavailableBootEvidence_neverCorroboratesRunning"
+        )
+
+        let liveID = "launchd:test9-live#333333333333"
+        _ = try store.beginRun(
+            jobID: liveID,
+            startedAt: Date(timeIntervalSince1970: 300),
+            trigger: .scheduled,
+            context: RunStartContext(
+                processID: getpid(),
+                bootSessionID: bootSessionID,
+                nativeExitStatusAtStart: 1,
+                launchdRunCountAtStart: 30
+            )
+        )
+        let liveJob = test5_makeJob(
+            id: liveID,
+            lastKnownExit: ExitStatus(raw: 1),
+            launchdProcessID: getpid(),
+            launchdRunCount: 30,
+            managed: true
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: liveJob,
+                scheduledHistory: try store.scheduledHealthRuns()[liveID]
+            ),
+            .running,
+            "test9_liveLongRunningWrapper_remainsRunning"
+        )
+
+        let clockRollbackID = "launchd:test9-clock-rollback#444444444444"
+        _ = try test5_finish(
+            store: store,
+            jobID: clockRollbackID,
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 50),
+            exitCode: 0,
+            context: RunStartContext(
+                processID: getpid(),
+                bootSessionID: bootSessionID,
+                nativeExitStatusAtStart: 1,
+                launchdRunCountAtStart: 40
+            )
+        )
+        let clockRollbackJob = test5_makeJob(
+            id: clockRollbackID,
+            lastKnownExit: ExitStatus(raw: 1),
+            nativeStatusObservedAt: Date(timeIntervalSince1970: 5_000),
+            launchdRunCount: 40,
+            managed: true
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: clockRollbackJob,
+                scheduledHistory: try store.scheduledHealthRuns()[clockRollbackID]
+            ),
+            .success,
+            "test9_backwardWallClock_cannotReorderNativeAndStoredEvents"
+        )
+
+        let laterNativeID = "launchd:test9-later-native#555555555555"
+        _ = try test5_finish(
+            store: store,
+            jobID: laterNativeID,
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 400),
+            exitCode: 0,
+            context: RunStartContext(
+                processID: getpid(),
+                bootSessionID: bootSessionID,
+                nativeExitStatusAtStart: 1,
+                launchdRunCountAtStart: 50
+            )
+        )
+        let laterNativeJob = test5_makeJob(
+            id: laterNativeID,
+            lastKnownExit: ExitStatus(raw: 1),
+            launchdRunCount: 51,
+            managed: true
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: laterNativeJob,
+                scheduledHistory: try store.scheduledHealthRuns()[laterNativeID]
+            ),
+            .failure,
+            "test9_laterLaunchdRun_nativeFailureVetoesStoredSuccess"
+        )
+    }
+}
+
+private func test9_PersistentIdentityAliases(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round9-identity-aliases") { directory in
+        let databasePath = directory.appendingPathComponent("ticker.db").path
+        let oldID = "launchd:com.example.test9.alias#111111111111"
+        let middleID = "launchd:com.example.test9.alias#222222222222"
+        let currentID = "launchd:com.example.test9.alias#333333333333"
+        let foreignID = "launchd:com.example.test9.foreign#444444444444"
+        let backupPath = directory.appendingPathComponent("backup.plist").path
+
+        do {
+            let store = try SQLiteRunStore(path: databasePath)
+            try store.markManaged(jobID: oldID, backupPath: backupPath)
+            _ = try test5_finish(
+                store: store,
+                jobID: oldID,
+                trigger: .scheduled,
+                startedAt: Date(timeIntervalSince1970: 10),
+                exitCode: 0
+            )
+            try store.migrateJobIdentity(from: oldID, to: middleID)
+        }
+
+        let reopened = try SQLiteRunStore(path: databasePath)
+        tests.expectEqual(
+            try reopened.canonicalJobID(oldID),
+            middleID,
+            "test9_identityAlias_persistsAcrossStoreReopen"
+        )
+        _ = try test5_finish(
+            store: reopened,
+            jobID: oldID,
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 20),
+            exitCode: 1
+        )
+        tests.expectEqual(
+            try reopened.runs(jobID: middleID, limit: 10).map(\.jobID),
+            [middleID, middleID],
+            "test9_lateOldWrapperRun_landsOnCanonicalIdentity"
+        )
+
+        try reopened.migrateJobIdentity(from: middleID, to: currentID)
+        _ = try test5_finish(
+            store: reopened,
+            jobID: oldID,
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 30),
+            exitCode: 0
+        )
+        tests.expectEqual(
+            try reopened.canonicalJobID(oldID),
+            currentID,
+            "test9_subsequentIdentityMigration_resolvesAliasChain"
+        )
+        tests.expectEqual(
+            try reopened.managedBackupPath(jobID: oldID),
+            backupPath,
+            "test9_backupLookup_canonicalizesOldIdentity"
+        )
+        tests.expectEqual(
+            try reopened.managedJobIDs(),
+            Set([currentID]),
+            "test9_managedRows_exposeOnlyCanonicalIdentity"
+        )
+        tests.expectEqual(
+            Set(try reopened.scheduledHealthRuns().keys),
+            Set([currentID]),
+            "test9_healthLookup_exposesOnlyCanonicalIdentity"
+        )
+
+        try reopened.markManaged(jobID: foreignID, backupPath: "/tmp/foreign-test9-backup")
+        tests.expectThrows(
+            try reopened.migrateJobIdentity(from: currentID, to: foreignID),
+            "test9_aliasMigration_refusesManagedIdentityCollision"
+        )
+        tests.expectEqual(
+            try reopened.canonicalJobID(oldID),
+            currentID,
+            "test9_rejectedAliasCollision_doesNotHijackHistory"
+        )
+    }
+}
+
+private func test9_CopiedWrapperRuntimeOwnership(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round9-wrapper-ownership") { directory in
+        let compiledStoreDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ticker-compiled-test-default", isDirectory: true)
+        let compiledStorePath = compiledStoreDirectory
+            .appendingPathComponent("ticker-\(getpid()).db")
+            .path
+        try? FileManager.default.removeItem(atPath: compiledStorePath)
+        try? FileManager.default.removeItem(atPath: compiledStorePath + "-wal")
+        try? FileManager.default.removeItem(atPath: compiledStorePath + "-shm")
+        defer {
+            try? FileManager.default.removeItem(atPath: compiledStorePath)
+            try? FileManager.default.removeItem(atPath: compiledStorePath + "-wal")
+            try? FileManager.default.removeItem(atPath: compiledStorePath + "-shm")
+        }
+
+        let tickerPath = try test3A_builtCLIPath()
+        let originalURL = directory.appendingPathComponent("owner.plist")
+        let copiedURL = directory.appendingPathComponent("copy.plist")
+        try writePropertyList([
+            "Label": "com.example.test9.owner",
+            "ProgramArguments": ["/bin/echo", "owner"],
+        ], to: originalURL)
+        let store = try SQLiteRunStore(path: compiledStorePath)
+        let wrapper = JobWrapper(
+            store: store,
+            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
+        )
+        let owner = try test8_discoverLaunchdJob(in: [directory], label: "com.example.test9.owner")
+        _ = try wrapper.wrap(job: owner, tickerPath: tickerPath)
+        let ownerArguments = try require(
+            try test2A_readPropertyList(originalURL)["ProgramArguments"] as? [String],
+            "test9 owner wrapper arguments"
+        )
+
+        let fakeLaunchctl = directory.appendingPathComponent("launchctl")
+        try """
+        #!/bin/sh
+        printf 'pid = %s\nruns = 1\nlast exit code = 0\n' "$PPID"
+        """.write(to: fakeLaunchctl, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeLaunchctl.path
+        )
+        let redirectedStorePath = directory.appendingPathComponent("redirected.db").path
+        let environment = [
+            "TICKER_TEST_LAUNCHCTL_PATH": fakeLaunchctl.path,
+            "TICKER_STORE_PATH": redirectedStorePath,
+        ]
+        let ownerResult = try test3A_runProcess(
+            ownerArguments[0],
+            Array(ownerArguments.dropFirst()),
+            environment: environment
+        )
+        tests.expectEqual(ownerResult.status, 0, "test9_ownedWrapper_executesNormally")
+        tests.expectEqual(
+            try store.runs(jobID: owner.id, limit: 10).count,
+            1,
+            "test9_ownedWrapper_recordsAfterRuntimeOwnershipProof"
+        )
+        let redirectedStore = try SQLiteRunStore(path: redirectedStorePath)
+        tests.expectEqual(
+            try redirectedStore.runs(jobID: owner.id, limit: 10).count,
+            0,
+            "test9_testScheduledWrapper_usesCompiledIsolatedDefault"
+        )
+
+        var copied = try test2A_readPropertyList(originalURL)
+        copied["Label"] = "com.example.test9.copy"
+        try writePropertyList(copied, to: copiedURL)
+        let copiedArguments = try require(
+            try test2A_readPropertyList(copiedURL)["ProgramArguments"] as? [String],
+            "test9 copied wrapper arguments"
+        )
+        try """
+        #!/bin/sh
+        printf 'pid = 1\nruns = 1\nlast exit code = 0\n'
+        """.write(to: fakeLaunchctl, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeLaunchctl.path
+        )
+        let copiedResult = try test3A_runProcess(
+            copiedArguments[0],
+            Array(copiedArguments.dropFirst()),
+            environment: environment
+        )
+        tests.expectEqual(copiedResult.status, 0, "test9_copiedWrapper_stillExecutesChild")
+        tests.expect(
+            copiedResult.stderr.contains("scheduled wrapper ownership not proven"),
+            "test9_copiedWrapper_reportsOwnershipFailureClearly"
+        )
+        tests.expectEqual(
+            try store.runs(jobID: owner.id, limit: 10).count,
+            1,
+            "test9_copiedWrapper_leavesVictimHistoryUnchanged"
+        )
+    }
+}
+
+private func test9_MetadataOnlyConcurrentChange(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round9-metadata-change") { directory in
+        let plistURL = directory.appendingPathComponent("metadata.plist")
+        try writePropertyList([
+            "Label": "com.example.test9.metadata",
+            "ProgramArguments": ["/usr/bin/true"],
+        ], to: plistURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: plistURL.path
+        )
+        let originalData = try Data(contentsOf: plistURL)
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+        let wrapper = JobWrapper(
+            store: store,
+            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true),
+            immediatelyBeforeSourceExchange: {
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o640],
+                    ofItemAtPath: plistURL.path
+                )
+            }
+        )
+        let job = test2A_makeLaunchdJob(
+            id: "launchd:com.example.test9.metadata#555555555555",
+            label: "com.example.test9.metadata",
+            command: ["/usr/bin/true"],
+            plistURL: plistURL
+        )
+        tests.expectThrows(
+            try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"),
+            "test9_metadataOnlyConcurrentChange_abortsRewrite"
+        )
+        tests.expectEqual(
+            try Data(contentsOf: plistURL),
+            originalData,
+            "test9_metadataOnlyConcurrentChange_preservesPlistBytes"
+        )
+        tests.expectEqual(
+            try test7_fileMetadata(at: plistURL).mode,
+            0o640,
+            "test9_metadataOnlyConcurrentChange_restoresNewMode"
+        )
+        let managedIDs = try store.managedJobIDs()
+        tests.expect(
+            managedIDs.isEmpty,
+            "test9_metadataOnlyConcurrentChange_doesNotMarkJobManaged"
+        )
+    }
+}
+
+private func test9_crashAfterFirstExchange(arguments: [String]) -> Never {
+    guard arguments.count == 4 else {
+        Darwin._exit(64)
+    }
+    do {
+        let plistURL = URL(fileURLWithPath: arguments[1])
+        let store = try SQLiteRunStore(path: arguments[2])
+        let wrapper = JobWrapper(
+            store: store,
+            backupDirectory: URL(fileURLWithPath: arguments[3], isDirectory: true),
+            immediatelyBeforeSourceExchange: {},
+            immediatelyAfterSourceExchange: {
+                Darwin._exit(91)
+            }
+        )
+        let job = test2A_makeLaunchdJob(
+            id: "launchd:com.example.test9.crash#666666666666",
+            label: "com.example.test9.crash",
+            command: ["/usr/bin/true"],
+            plistURL: plistURL
+        )
+        _ = try wrapper.wrap(
+            job: job,
+            tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"
+        )
+    } catch {
+        Darwin._exit(92)
+    }
+    Darwin._exit(93)
+}
+
+private func test9_InterruptedExchangeRecovery(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round9-interrupted-exchange") { directory in
+        let plistURL = directory.appendingPathComponent("crash.plist")
+        let databasePath = directory.appendingPathComponent("ticker.db").path
+        let backupDirectory = directory.appendingPathComponent("backups", isDirectory: true)
+        try writePropertyList([
+            "Label": "com.example.test9.crash",
+            "ProgramArguments": ["/usr/bin/true"],
+        ], to: plistURL)
+        let originalData = try Data(contentsOf: plistURL)
+        let child = try test3A_runProcess(
+            CommandLine.arguments[0],
+            ["--test9-crash-after-exchange", plistURL.path, databasePath, backupDirectory.path]
+        )
+        tests.expectEqual(child.status, 91, "test9_crashFixture_stopsAfterFirstExchange")
+        let crashedData = try Data(contentsOf: plistURL)
+        tests.expect(
+            crashedData != originalData,
+            "test9_crashFixture_leavesStagedRewriteLive"
+        )
+
+        let store = try SQLiteRunStore(path: databasePath)
+        let wrapper = JobWrapper(store: store, backupDirectory: backupDirectory)
+        let job = test2A_makeLaunchdJob(
+            id: "launchd:com.example.test9.crash#666666666666",
+            label: "com.example.test9.crash",
+            command: ["/usr/bin/true"],
+            plistURL: plistURL
+        )
+        tests.expectEqual(
+            try wrapper.recoveryState(job: job),
+            .staleManagedRow,
+            "test9_recoveryScan_restoresDisplacedPlistAfterCrash"
+        )
+        tests.expectEqual(
+            try Data(contentsOf: plistURL),
+            originalData,
+            "test9_recoveryScan_restoresExactDisplacedBytes"
+        )
+        let residue = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).filter {
+            $0.lastPathComponent.contains("ticker-exchange")
+                || $0.lastPathComponent.hasSuffix(".tmp")
+        }
+        tests.expectEqual(
+            residue.map(\.lastPathComponent),
+            [],
+            "test9_recoveryScan_removesOnlyItsTransactionResidue"
+        )
+    }
+}
+
 
 @main
 private enum TickerTests {
     static func main() {
+        if CommandLine.arguments.dropFirst().first == "--test9-crash-after-exchange" {
+            test9_crashAfterFirstExchange(arguments: Array(CommandLine.arguments.dropFirst()))
+        }
         let tests = TestHarness()
         tests.run("ExitStatus tests") { testExitStatus(tests) }
         tests.run("cron and schedule tests") { try testCronAndSchedules(tests) }
@@ -4683,8 +5369,8 @@ private enum TickerTests {
         tests.run("round 8 wrapped health ordering") {
             try test8_WrappedHealthOrdering(tests)
         }
-        tests.run("round 8 launchd status observation time") {
-            try test8_LaunchdStatusObservationTimestamp(tests)
+        tests.run("round 8 launchd runtime ordering evidence") {
+            try test8_LaunchdRuntimeOrderingEvidence(tests)
         }
         tests.run("round 5 unwrap health reset") {
             try test5_UnwrapResetsHealthWithoutDeletingHistory(tests)
@@ -4745,6 +5431,21 @@ private enum TickerTests {
         }
         tests.run("round 8 foreign wrapper rejection") {
             try test8_ForeignWrapperStillRejected(tests)
+        }
+        tests.run("round 9 run liveness and native ordering") {
+            try test9_RunLivenessAndNativeOrdering(tests)
+        }
+        tests.run("round 9 persistent identity aliases") {
+            try test9_PersistentIdentityAliases(tests)
+        }
+        tests.run("round 9 copied wrapper runtime ownership") {
+            try test9_CopiedWrapperRuntimeOwnership(tests)
+        }
+        tests.run("round 9 metadata-only concurrent change") {
+            try test9_MetadataOnlyConcurrentChange(tests)
+        }
+        tests.run("round 9 interrupted exchange recovery") {
+            try test9_InterruptedExchangeRecovery(tests)
         }
         tests.finish()
     }

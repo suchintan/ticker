@@ -50,13 +50,19 @@ public enum JobHealthPolicy {
         }
 
         if scheduledHistory.outcome == .running {
-            return .running
+            return scheduledHistory.isCorroboratedRunning
+                    && scheduledHistory.processID == job.launchdProcessID
+                ? .running
+                : (nativeOutcome ?? .unknown)
         }
 
         if nativeOutcome == .failure, scheduledHistory.outcome == .success {
-            guard let nativeStatusObservedAt = job.nativeStatusObservedAt,
-                  let scheduledFinishedAt = scheduledHistory.finishedAt,
-                  scheduledFinishedAt > nativeStatusObservedAt else {
+            guard scheduledHistory.nativeExitStatusAtStart == job.lastKnownExit?.raw else {
+                return .failure
+            }
+            guard let currentRunCount = job.launchdRunCount,
+                  let startingRunCount = scheduledHistory.launchdRunCountAtStart,
+                  currentRunCount == startingRunCount else {
                 return .failure
             }
         }
@@ -82,6 +88,8 @@ public struct Job: Identifiable, Codable, Hashable {
     public let configPath: String?
     public let lastKnownExit: ExitStatus?
     public let nativeStatusObservedAt: Date?
+    public let launchdProcessID: Int32?
+    public let launchdRunCount: Int64?
     public let lastRunAt: Date?
     public let lastScheduledFor: Date?
     public let managed: Bool
@@ -104,6 +112,8 @@ public struct Job: Identifiable, Codable, Hashable {
         configPath: String?,
         lastKnownExit: ExitStatus?,
         nativeStatusObservedAt: Date? = nil,
+        launchdProcessID: Int32? = nil,
+        launchdRunCount: Int64? = nil,
         lastRunAt: Date?,
         lastScheduledFor: Date?,
         managed: Bool
@@ -125,6 +135,8 @@ public struct Job: Identifiable, Codable, Hashable {
         self.configPath = configPath
         self.lastKnownExit = lastKnownExit
         self.nativeStatusObservedAt = nativeStatusObservedAt
+        self.launchdProcessID = launchdProcessID
+        self.launchdRunCount = launchdRunCount
         self.lastRunAt = lastRunAt
         self.lastScheduledFor = lastScheduledFor
         self.managed = managed
@@ -192,6 +204,8 @@ public struct Job: Identifiable, Codable, Hashable {
         case configPath
         case lastKnownExit
         case nativeStatusObservedAt
+        case launchdProcessID
+        case launchdRunCount
         case lastRunAt
         case lastScheduledFor
         case managed
@@ -207,6 +221,10 @@ public struct Run: Identifiable, Codable, Hashable {
     public let stdoutTail: String?
     public let stderrTail: String?
     public let trigger: RunTrigger
+    public let processID: Int32?
+    public let bootSessionID: String?
+    public let nativeExitStatusAtStart: Int32?
+    public let launchdRunCountAtStart: Int64?
 
     public init(
         id: Int64,
@@ -216,7 +234,11 @@ public struct Run: Identifiable, Codable, Hashable {
         exitCode: Int32?,
         stdoutTail: String?,
         trigger: RunTrigger = .scheduled,
-        stderrTail: String?
+        stderrTail: String?,
+        processID: Int32? = nil,
+        bootSessionID: String? = nil,
+        nativeExitStatusAtStart: Int32? = nil,
+        launchdRunCountAtStart: Int64? = nil
     ) {
         self.id = id
         self.jobID = jobID
@@ -226,6 +248,10 @@ public struct Run: Identifiable, Codable, Hashable {
         self.stdoutTail = stdoutTail
         self.trigger = trigger
         self.stderrTail = stderrTail
+        self.processID = processID
+        self.bootSessionID = bootSessionID
+        self.nativeExitStatusAtStart = nativeExitStatusAtStart
+        self.launchdRunCountAtStart = launchdRunCountAtStart
     }
 
     public var duration: TimeInterval? {
@@ -245,6 +271,17 @@ public struct Run: Identifiable, Codable, Hashable {
         return exitCode == 0 ? .success : .failure
     }
 
+    public var isCorroboratedRunning: Bool {
+        guard finishedAt == nil,
+              let processID,
+              let bootSessionID,
+              bootSessionID != RunExecutionEvidence.unavailableBootSessionID,
+              bootSessionID == RunExecutionEvidence.currentBootSessionID() else {
+            return false
+        }
+        return RunExecutionEvidence.processIsAlive(processID)
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id
         case jobID
@@ -254,6 +291,10 @@ public struct Run: Identifiable, Codable, Hashable {
         case stdoutTail
         case trigger
         case stderrTail
+        case processID
+        case bootSessionID
+        case nativeExitStatusAtStart
+        case launchdRunCountAtStart
     }
 
     public init(from decoder: Decoder) throws {
@@ -266,6 +307,16 @@ public struct Run: Identifiable, Codable, Hashable {
         stdoutTail = try container.decodeIfPresent(String.self, forKey: .stdoutTail)
         stderrTail = try container.decodeIfPresent(String.self, forKey: .stderrTail)
         trigger = try container.decodeIfPresent(RunTrigger.self, forKey: .trigger) ?? .scheduled
+        processID = try container.decodeIfPresent(Int32.self, forKey: .processID)
+        bootSessionID = try container.decodeIfPresent(String.self, forKey: .bootSessionID)
+        nativeExitStatusAtStart = try container.decodeIfPresent(
+            Int32.self,
+            forKey: .nativeExitStatusAtStart
+        )
+        launchdRunCountAtStart = try container.decodeIfPresent(
+            Int64.self,
+            forKey: .launchdRunCountAtStart
+        )
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -278,6 +329,29 @@ public struct Run: Identifiable, Codable, Hashable {
         try container.encodeIfPresent(stdoutTail, forKey: .stdoutTail)
         try container.encodeIfPresent(stderrTail, forKey: .stderrTail)
         try container.encode(trigger, forKey: .trigger)
+        try container.encodeIfPresent(processID, forKey: .processID)
+        try container.encodeIfPresent(bootSessionID, forKey: .bootSessionID)
+        try container.encodeIfPresent(nativeExitStatusAtStart, forKey: .nativeExitStatusAtStart)
+        try container.encodeIfPresent(launchdRunCountAtStart, forKey: .launchdRunCountAtStart)
+    }
+}
+
+public struct RunStartContext: Hashable {
+    public let processID: Int32
+    public let bootSessionID: String
+    public let nativeExitStatusAtStart: Int32?
+    public let launchdRunCountAtStart: Int64?
+
+    public init(
+        processID: Int32,
+        bootSessionID: String,
+        nativeExitStatusAtStart: Int32?,
+        launchdRunCountAtStart: Int64?
+    ) {
+        self.processID = processID
+        self.bootSessionID = bootSessionID
+        self.nativeExitStatusAtStart = nativeExitStatusAtStart
+        self.launchdRunCountAtStart = launchdRunCountAtStart
     }
 }
 
@@ -287,7 +361,12 @@ public protocol JobSourceAdapter {
 }
 
 public protocol RunStore: AnyObject {
-    func beginRun(jobID: String, startedAt: Date, trigger: RunTrigger) throws -> Int64
+    func beginRun(
+        jobID: String,
+        startedAt: Date,
+        trigger: RunTrigger,
+        context: RunStartContext?
+    ) throws -> Int64
     func finishRun(
         id: Int64,
         exitCode: Int32,
@@ -302,5 +381,16 @@ public protocol RunStore: AnyObject {
     func markManaged(jobID: String, backupPath: String?) throws
     func unmarkManaged(jobID: String) throws
     func migrateJobIdentity(from oldJobID: String, to newJobID: String) throws
+    func canonicalJobID(_ jobID: String) throws -> String
     func managedJobIDs() throws -> Set<String>
+}
+
+public extension RunStore {
+    func beginRun(
+        jobID: String,
+        startedAt: Date,
+        trigger: RunTrigger = .scheduled
+    ) throws -> Int64 {
+        try beginRun(jobID: jobID, startedAt: startedAt, trigger: trigger, context: nil)
+    }
 }

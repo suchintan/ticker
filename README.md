@@ -51,7 +51,15 @@ bash Scripts/run-tests.sh
 | Claude routines | `lastRunAt` and `lastScheduledFor` timestamps only. There is no exit code, duration, output, or outcome. |
 | Wrapped by Ticker | Full local history: start, end, duration, exit code, and stdout/stderr tails. |
 
-Ticker separates scheduled runs from manual **Run Now** attempts. Manual runs stay visible in history, but they never determine job health. An unwrapped launchd job uses launchd's native exit status when available. A wrapped launchd job uses its latest recorded scheduled run.
+Ticker separates scheduled runs from manual **Run Now** attempts. Manual runs stay visible in history, but they never determine job health.
+
+An unwrapped launchd job uses launchd's native exit status when it is available. A wrapped job uses fail-safe precedence:
+
+- Ticker reports an unfinished stored run as `running` only while its wrapper PID is alive in the same macOS boot session and launchd reports that same PID for the service.
+- An orphaned unfinished row cannot hide a native launchd failure. Ticker uses the native status when it cannot verify the wrapper process.
+- Each wrapper records launchd's native exit status and run count before it starts the child. An unchanged native failure predates a later stored success and does not veto that success.
+- If the current native exit status or launchd run count differs from the wrapper's start snapshot, launchd observed an event that the wrapper did not record. A current native failure then overrides the stored success.
+- A stored failure remains a failure until a later scheduled wrapper run records success. Native success alone does not erase detailed stored failure evidence.
 
 Ticker scans these local sources every 30 seconds:
 

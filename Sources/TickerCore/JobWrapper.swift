@@ -23,6 +23,7 @@ public struct JobWrapperError: Error, LocalizedError {
 public enum JobRecoveryState: Equatable {
     case unwrapped
     case wrappedConsistent
+    case identityChanged(previousJobID: String)
     case wrappedMissingBackup
     case wrappedBackupContentMismatch
     case wrappedBackupUnverified
@@ -36,6 +37,8 @@ public enum JobRecoveryState: Equatable {
             return "unwrapped"
         case .wrappedConsistent:
             return "wrapped-consistent"
+        case .identityChanged(let previousJobID):
+            return "identity-changed (\(previousJobID))"
         case .wrappedMissingBackup:
             return "wrapped-missing-backup"
         case .wrappedBackupContentMismatch:
@@ -79,11 +82,31 @@ private struct OriginalExecution: Equatable {
     let argv0: String?
 }
 
+private struct FileMetadataSnapshot: Codable, Equatable {
+    let ownerID: uid_t
+    let groupID: gid_t
+    let mode: mode_t
+    let flags: UInt32
+    let aclText: String?
+    let extendedAttributes: [String: Data]
+}
+
+private struct ExchangeTransactionRecord: Codable {
+    let version: Int
+    let destinationPath: String
+    let temporaryPath: String
+    let expectedDataSHA256: String
+    let stagedDataSHA256: String
+    let expectedMetadata: FileMetadataSnapshot
+    let stagedMetadata: FileMetadataSnapshot
+}
+
 public final class JobWrapper {
     private let store: RunStore
     private let backupDirectory: URL
     private let fileManager: FileManager
     private let immediatelyBeforeSourceExchange: (() throws -> Void)?
+    private let immediatelyAfterSourceExchange: (() -> Void)?
 
     public init(store: RunStore) {
         self.store = store
@@ -92,6 +115,7 @@ public final class JobWrapper {
             .appendingPathComponent(".ticker", isDirectory: true)
             .appendingPathComponent("backups", isDirectory: true)
         immediatelyBeforeSourceExchange = nil
+        immediatelyAfterSourceExchange = nil
     }
 
     public init(store: RunStore, backupDirectory: URL, fileManager: FileManager = .default) {
@@ -99,22 +123,26 @@ public final class JobWrapper {
         self.backupDirectory = backupDirectory
         self.fileManager = fileManager
         immediatelyBeforeSourceExchange = nil
+        immediatelyAfterSourceExchange = nil
     }
 
     init(
         store: RunStore,
         backupDirectory: URL,
         fileManager: FileManager = .default,
-        immediatelyBeforeSourceExchange: @escaping () throws -> Void
+        immediatelyBeforeSourceExchange: @escaping () throws -> Void,
+        immediatelyAfterSourceExchange: (() -> Void)? = nil
     ) {
         self.store = store
         self.backupDirectory = backupDirectory
         self.fileManager = fileManager
         self.immediatelyBeforeSourceExchange = immediatelyBeforeSourceExchange
+        self.immediatelyAfterSourceExchange = immediatelyAfterSourceExchange
     }
 
     public func wrap(job: Job, tickerPath: String) throws -> ReloadCommands {
         let plistURL = try configurationURL(for: job)
+        try recoverInterruptedExchange(at: plistURL)
         let commands = reloadCommands(for: plistURL)
         guard job.canRunNow else {
             throw JobWrapperError(
@@ -146,6 +174,11 @@ public final class JobWrapper {
         let state = try recoveryState(job: job)
         switch state {
         case .wrappedConsistent:
+            try migrateManagedIdentityIfNeeded(
+                job: job,
+                plistURL: plistURL,
+                embeddedJobID: decodedWrapper?.label
+            )
             try migrateWrapperIfNeeded(
                 dictionary: &dictionary,
                 format: format,
@@ -154,12 +187,9 @@ public final class JobWrapper {
                 tickerPath: tickerPath,
                 expectedSourceData: originalData
             )
-            try migrateManagedIdentityIfNeeded(
-                job: job,
-                plistURL: plistURL,
-                embeddedJobID: decodedWrapper?.label
-            )
             return commands
+        case .identityChanged:
+            return try reconcileIdentityChange(job: job, tickerPath: tickerPath)
         case .wrappedBackupContentMismatch:
             throw JobWrapperError(
                 message: "Ticker backup content for \(job.id) does not match its authenticated metadata; refusing to rewrite the plist"
@@ -208,6 +238,11 @@ public final class JobWrapper {
                 try store.markManaged(jobID: job.id, backupPath: backupURL.path)
             }
 
+            try migrateManagedIdentityIfNeeded(
+                job: job,
+                plistURL: plistURL,
+                embeddedJobID: decodedWrapper.label
+            )
             try migrateWrapperIfNeeded(
                 dictionary: &dictionary,
                 format: format,
@@ -215,11 +250,6 @@ public final class JobWrapper {
                 job: job,
                 tickerPath: tickerPath,
                 expectedSourceData: originalData
-            )
-            try migrateManagedIdentityIfNeeded(
-                job: job,
-                plistURL: plistURL,
-                embeddedJobID: decodedWrapper.label
             )
             return commands
         case .staleManagedRow:
@@ -283,11 +313,16 @@ public final class JobWrapper {
 
     public func unwrap(job: Job) throws -> ReloadCommands {
         let plistURL = try configurationURL(for: job)
+        try recoverInterruptedExchange(at: plistURL)
         let commands = reloadCommands(for: plistURL)
         let state = try recoveryState(job: job)
         switch state {
         case .wrappedConsistent:
             break
+        case .identityChanged:
+            throw JobWrapperError(
+                message: "Launchd job \(job.id) changed identity; reconcile its history before unwrapping"
+            )
         case .wrappedMissingBackup:
             guard case .verified = try backupResolution(for: job, plistURL: plistURL) else {
                 throw JobWrapperError(
@@ -381,8 +416,43 @@ public final class JobWrapper {
         return commands
     }
 
+    public func reconcileIdentityChange(job: Job, tickerPath: String) throws -> ReloadCommands {
+        let plistURL = try configurationURL(for: job)
+        let originalData = try readData(at: plistURL)
+        var format = PropertyListSerialization.PropertyListFormat.xml
+        var dictionary = try propertyListDictionary(
+            from: originalData,
+            format: &format,
+            plistURL: plistURL
+        )
+        guard case .identityChanged(let previousJobID) = try recoveryState(job: job),
+              let arguments = dictionary["ProgramArguments"] as? [String],
+              let decoded = LaunchdWrapper.decode(arguments) ?? LaunchdWrapper.decodeLegacy(arguments),
+              decoded.label == previousJobID else {
+            throw JobWrapperError(
+                message: "Launchd job \(job.id) has no authenticated identity change to reconcile"
+            )
+        }
+
+        try migrateManagedIdentityIfNeeded(
+            job: job,
+            plistURL: plistURL,
+            embeddedJobID: previousJobID
+        )
+        try migrateWrapperIfNeeded(
+            dictionary: &dictionary,
+            format: format,
+            plistURL: plistURL,
+            job: job,
+            tickerPath: tickerPath,
+            expectedSourceData: originalData
+        )
+        return reloadCommands(for: plistURL)
+    }
+
     public func recoveryState(job: Job) throws -> JobRecoveryState {
         let plistURL = try configurationURL(for: job)
+        try recoverInterruptedExchange(at: plistURL)
         let data = try readData(at: plistURL)
         let propertyList: Any
         do {
@@ -415,12 +485,15 @@ public final class JobWrapper {
                     plistURL: plistURL,
                     embeddedJobID: decoded.label
                 )
-                return wrapperMatchesBackup(
+                let matches = wrapperMatchesBackup(
                     liveDictionary: dictionary,
                     backupDictionary: backupDictionary,
                     job: job,
                     acceptedLabels: [decoded.label]
-                ) ? .wrappedConsistent : .ambiguousTickerInvocation
+                )
+                return matches
+                    ? .identityChanged(previousJobID: decoded.label)
+                    : .ambiguousTickerInvocation
             }
             if !managedRowExists {
                 guard case .verified(let backupURL) = try backupResolution(
@@ -446,11 +519,15 @@ public final class JobWrapper {
                     plistURL: plistURL,
                     embeddedJobID: decoded.label
                 )
-                return wrapperMatchesBackup(
+                let matches = wrapperMatchesBackup(
                     liveDictionary: dictionary,
                     backupDictionary: backupDictionary,
                     job: job
-                ) ? .wrappedConsistent : .ambiguousTickerInvocation
+                )
+                if matches, decoded.label != job.id {
+                    return .identityChanged(previousJobID: decoded.label)
+                }
+                return matches ? .wrappedConsistent : .ambiguousTickerInvocation
             case .missing:
                 return .wrappedMissingBackup
             case .contentMismatch:
@@ -476,11 +553,15 @@ public final class JobWrapper {
                 plistURL: plistURL,
                 embeddedJobID: legacy.label
             )
-            return wrapperMatchesBackup(
+            let matches = wrapperMatchesBackup(
                 liveDictionary: dictionary,
                 backupDictionary: backupDictionary,
                 job: job
-            ) ? .wrappedConsistent : .ambiguousTickerInvocation
+            )
+            if matches, legacy.label != job.id {
+                return .identityChanged(previousJobID: legacy.label)
+            }
+            return matches ? .wrappedConsistent : .ambiguousTickerInvocation
         }
 
         guard managedRowExists else {
@@ -654,12 +735,15 @@ public final class JobWrapper {
             embeddedJobID: embeddedJobID
         ),
               let metadataData = try? Data(contentsOf: metadataURL(for: backupURL)),
-              let metadata = try? JSONDecoder().decode(BackupMetadata.self, from: metadataData),
-              metadata.jobID != job.id,
-              try store.managedJobIDs().contains(metadata.jobID) else {
+              let metadata = try? JSONDecoder().decode(BackupMetadata.self, from: metadataData) else {
             return
         }
-        try store.migrateJobIdentity(from: metadata.jobID, to: job.id)
+        let canonicalMetadataID = try store.canonicalJobID(metadata.jobID)
+        guard canonicalMetadataID != job.id,
+              try store.managedJobIDs().contains(canonicalMetadataID) else {
+            return
+        }
+        try store.migrateJobIdentity(from: canonicalMetadataID, to: job.id)
     }
 
     private func newestBackup(in candidates: [URL]) -> URL? {
@@ -673,17 +757,11 @@ public final class JobWrapper {
     }
 
     private func uniqueBackupURL(for job: Job) -> URL {
-        var epoch = Int64(Date().timeIntervalSince1970 * 1_000)
-        while true {
-            let candidate = backupDirectory.appendingPathComponent(
-                "\(backupStem(for: job)).plist.\(epoch)",
-                isDirectory: false
-            )
-            if !fileManager.fileExists(atPath: candidate.path) {
-                return candidate
-            }
-            epoch += 1
-        }
+        let epoch = Int64(Date().timeIntervalSince1970 * 1_000)
+        return backupDirectory.appendingPathComponent(
+            "\(backupStem(for: job)).plist.\(epoch).\(UUID().uuidString)",
+            isDirectory: false
+        )
     }
 
     private func backupStem(for job: Job) -> String {
@@ -1188,6 +1266,9 @@ public final class JobWrapper {
         beforeReplace: (() throws -> Void)?
     ) throws {
         let directory = destinationURL.deletingLastPathComponent()
+        let expectedDestinationMetadata = try expectedDestinationData.map { _ in
+            try metadataSnapshot(at: destinationURL)
+        }
         let temporaryURL = directory.appendingPathComponent(
             ".\(destinationURL.lastPathComponent).\(UUID().uuidString).tmp",
             isDirectory: false
@@ -1201,12 +1282,16 @@ public final class JobWrapper {
 
         var fileDescriptor: Int32? = descriptor
         var temporaryFileExists = true
+        var transactionURL: URL?
         defer {
             if let fileDescriptor {
                 _ = Darwin.close(fileDescriptor)
             }
             if temporaryFileExists {
                 try? fileManager.removeItem(at: temporaryURL)
+            }
+            if let transactionURL {
+                try? fileManager.removeItem(at: transactionURL)
             }
         }
 
@@ -1246,22 +1331,42 @@ public final class JobWrapper {
             throw posixError("close temporary file at \(temporaryURL.path)")
         }
         fileDescriptor = nil
+        let stagedMetadata = try metadataSnapshot(at: temporaryURL)
 
         if let expectedDestinationData {
             try ensureSourceUnchanged(expectedDestinationData, at: destinationURL)
+            if let expectedDestinationMetadata {
+                try ensureMetadataUnchanged(expectedDestinationMetadata, at: destinationURL)
+                let recordURL = exchangeTransactionURL(for: destinationURL)
+                try persistExchangeTransaction(
+                    ExchangeTransactionRecord(
+                        version: 1,
+                        destinationPath: canonicalPath(destinationURL),
+                        temporaryPath: canonicalPath(temporaryURL),
+                        expectedDataSHA256: sha256(expectedDestinationData),
+                        stagedDataSHA256: sha256(data),
+                        expectedMetadata: expectedDestinationMetadata,
+                        stagedMetadata: stagedMetadata
+                    ),
+                    to: recordURL
+                )
+                transactionURL = recordURL
+            }
             try beforeReplace?()
             try exchangeAndVerify(
                 temporaryURL: temporaryURL,
                 destinationURL: destinationURL,
                 stagedData: data,
                 expectedDestinationData: expectedDestinationData,
+                stagedMetadata: stagedMetadata,
+                expectedDestinationMetadata: expectedDestinationMetadata,
                 temporaryFileExists: &temporaryFileExists
             )
         } else {
             try beforeReplace?()
             let renameResult = temporaryURL.path.withCString { source in
                 destinationURL.path.withCString { destination in
-                    Darwin.rename(source, destination)
+                    Darwin.renamex_np(source, destination, UInt32(RENAME_EXCL))
                 }
             }
             guard renameResult == 0 else {
@@ -1270,6 +1375,11 @@ public final class JobWrapper {
             temporaryFileExists = false
         }
         try syncDirectory(directory)
+        if let completedTransactionURL = transactionURL {
+            try fileManager.removeItem(at: completedTransactionURL)
+            transactionURL = nil
+            try syncDirectory(directory)
+        }
     }
 
     private func exchangeAndVerify(
@@ -1277,15 +1387,20 @@ public final class JobWrapper {
         destinationURL: URL,
         stagedData: Data,
         expectedDestinationData: Data,
+        stagedMetadata: FileMetadataSnapshot,
+        expectedDestinationMetadata: FileMetadataSnapshot?,
         temporaryFileExists: inout Bool
     ) throws {
         guard exchange(temporaryURL, destinationURL) == 0 else {
             throw posixError("exchange temporary file into place at \(destinationURL.path)")
         }
+        immediatelyAfterSourceExchange?()
 
         let displacedData: Data
+        let displacedMetadata: FileMetadataSnapshot
         do {
             displacedData = try readData(at: temporaryURL)
+            displacedMetadata = try metadataSnapshot(at: temporaryURL)
         } catch {
             guard exchange(temporaryURL, destinationURL) == 0 else {
                 temporaryFileExists = false
@@ -1297,11 +1412,13 @@ public final class JobWrapper {
             try syncDirectory(destinationURL.deletingLastPathComponent())
             throw error
         }
-        guard displacedData == expectedDestinationData else {
+        guard displacedData == expectedDestinationData,
+              expectedDestinationMetadata.map({ displacedMetadata == $0 }) == true else {
             try restoreAfterChangedDestination(
                 temporaryURL: temporaryURL,
                 destinationURL: destinationURL,
                 stagedData: stagedData,
+                stagedMetadata: stagedMetadata,
                 temporaryFileExists: &temporaryFileExists
             )
             throw sourceChangedError(at: destinationURL)
@@ -1321,6 +1438,7 @@ public final class JobWrapper {
         temporaryURL: URL,
         destinationURL: URL,
         stagedData: Data,
+        stagedMetadata: FileMetadataSnapshot,
         temporaryFileExists: inout Bool
     ) throws {
         guard exchange(temporaryURL, destinationURL) == 0 else {
@@ -1333,7 +1451,9 @@ public final class JobWrapper {
         try syncDirectory(destinationURL.deletingLastPathComponent())
 
         let replacedDuringVerification = try readData(at: temporaryURL)
-        guard replacedDuringVerification != stagedData else {
+        let metadataDuringVerification = try metadataSnapshot(at: temporaryURL)
+        guard replacedDuringVerification != stagedData
+                || metadataDuringVerification != stagedMetadata else {
             return
         }
 
@@ -1360,11 +1480,259 @@ public final class JobWrapper {
         }
     }
 
+    private func exchangeTransactionURL(for destinationURL: URL) -> URL {
+        destinationURL.deletingLastPathComponent().appendingPathComponent(
+            ".\(destinationURL.lastPathComponent).ticker-exchange.\(UUID().uuidString).json",
+            isDirectory: false
+        )
+    }
+
+    private func persistExchangeTransaction(
+        _ record: ExchangeTransactionRecord,
+        to url: URL
+    ) throws {
+        let data = try JSONEncoder().encode(record)
+        let descriptor = url.path.withCString {
+            Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)
+        }
+        guard descriptor >= 0 else {
+            throw posixError("create exchange transaction at \(url.path)")
+        }
+        var closed = false
+        var completed = false
+        defer {
+            if !closed {
+                _ = Darwin.close(descriptor)
+            }
+            if !completed {
+                try? fileManager.removeItem(at: url)
+            }
+        }
+        try data.withUnsafeBytes { buffer in
+            var offset = 0
+            while offset < buffer.count {
+                let result = Darwin.write(
+                    descriptor,
+                    buffer.baseAddress!.advanced(by: offset),
+                    buffer.count - offset
+                )
+                if result < 0 && errno == EINTR {
+                    continue
+                }
+                guard result > 0 else {
+                    throw posixError("write exchange transaction at \(url.path)")
+                }
+                offset += result
+            }
+        }
+        try fullySync(descriptor, description: "exchange transaction at \(url.path)")
+        guard Darwin.close(descriptor) == 0 else {
+            throw posixError("close exchange transaction at \(url.path)")
+        }
+        closed = true
+        try syncDirectory(url.deletingLastPathComponent())
+        completed = true
+    }
+
+    private func recoverInterruptedExchange(at destinationURL: URL) throws {
+        let directory = destinationURL.deletingLastPathComponent()
+        let prefix = ".\(destinationURL.lastPathComponent).ticker-exchange."
+        let records: [URL]
+        do {
+            records = try fileManager.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: []
+            ).filter {
+                $0.lastPathComponent.hasPrefix(prefix)
+                    && $0.pathExtension == "json"
+            }.sorted { $0.path < $1.path }
+        } catch let error as CocoaError where error.code == .fileNoSuchFile {
+            return
+        }
+
+        for recordURL in records {
+            let record: ExchangeTransactionRecord
+            do {
+                record = try JSONDecoder().decode(
+                    ExchangeTransactionRecord.self,
+                    from: Data(contentsOf: recordURL)
+                )
+            } catch {
+                throw JobWrapperError(
+                    message: "Ticker found an unreadable interrupted-exchange record at "
+                        + "\(recordURL.path). Preserve it and inspect the plist before retrying."
+                )
+            }
+            guard record.version == 1,
+                  record.destinationPath == canonicalPath(destinationURL) else {
+                throw JobWrapperError(
+                    message: "Ticker found an invalid interrupted-exchange record at "
+                        + "\(recordURL.path). Preserve it and inspect the plist before retrying."
+                )
+            }
+
+            let temporaryURL = URL(fileURLWithPath: record.temporaryPath).standardizedFileURL
+            let expectedTemporaryPrefix = ".\(destinationURL.lastPathComponent)."
+            guard temporaryURL.deletingLastPathComponent().standardizedFileURL == directory.standardizedFileURL,
+                  temporaryURL.lastPathComponent.hasPrefix(expectedTemporaryPrefix),
+                  temporaryURL.lastPathComponent.hasSuffix(".tmp") else {
+                throw JobWrapperError(
+                    message: "Ticker refused an interrupted-exchange record with an unsafe temporary path at "
+                        + "\(recordURL.path)."
+                )
+            }
+
+            let destinationData = try readData(at: destinationURL)
+            let destinationMetadata = try metadataSnapshot(at: destinationURL)
+            let destinationIsStaged = sha256(destinationData) == record.stagedDataSHA256
+                && destinationMetadata == record.stagedMetadata
+            guard fileManager.fileExists(atPath: temporaryURL.path) else {
+                if destinationIsStaged
+                    || (sha256(destinationData) == record.expectedDataSHA256
+                        && destinationMetadata == record.expectedMetadata) {
+                    try fileManager.removeItem(at: recordURL)
+                    try syncDirectory(directory)
+                    continue
+                }
+                throw interruptedExchangeError(recordURL: recordURL, temporaryURL: temporaryURL)
+            }
+
+            let temporaryData = try readData(at: temporaryURL)
+            let temporaryMetadata = try metadataSnapshot(at: temporaryURL)
+            let temporaryIsStaged = sha256(temporaryData) == record.stagedDataSHA256
+                && temporaryMetadata == record.stagedMetadata
+            if temporaryIsStaged && !destinationIsStaged {
+                try fileManager.removeItem(at: temporaryURL)
+                try fileManager.removeItem(at: recordURL)
+                try syncDirectory(directory)
+                continue
+            }
+            if destinationIsStaged && !temporaryIsStaged {
+                guard exchange(temporaryURL, destinationURL) == 0 else {
+                    throw posixError("restore interrupted exchange at \(destinationURL.path)")
+                }
+                try syncDirectory(directory)
+                try fileManager.removeItem(at: temporaryURL)
+                try fileManager.removeItem(at: recordURL)
+                try syncDirectory(directory)
+                continue
+            }
+            throw interruptedExchangeError(recordURL: recordURL, temporaryURL: temporaryURL)
+        }
+    }
+
+    private func interruptedExchangeError(recordURL: URL, temporaryURL: URL) -> JobWrapperError {
+        JobWrapperError(
+            message: "Ticker could not safely reconcile an interrupted plist exchange. "
+                + "Preserve \(recordURL.path) and \(temporaryURL.path), then compare them with the live plist."
+        )
+    }
+
     private func sourceChangedError(at plistURL: URL) -> JobWrapperError {
         JobWrapperError(
             message: "Launchd plist at \(plistURL.path) changed while Ticker was preparing "
                 + "to rewrite it. Ticker did not modify the plist. Review the current file and retry."
         )
+    }
+
+    private func ensureMetadataUnchanged(
+        _ expectedMetadata: FileMetadataSnapshot,
+        at url: URL
+    ) throws {
+        guard try metadataSnapshot(at: url) == expectedMetadata else {
+            throw sourceChangedError(at: url)
+        }
+    }
+
+    private func metadataSnapshot(at url: URL) throws -> FileMetadataSnapshot {
+        var info = stat()
+        guard Darwin.lstat(url.path, &info) == 0 else {
+            throw posixError("inspect metadata at \(url.path)")
+        }
+        return FileMetadataSnapshot(
+            ownerID: info.st_uid,
+            groupID: info.st_gid,
+            mode: info.st_mode,
+            flags: info.st_flags,
+            aclText: try aclText(at: url),
+            extendedAttributes: try extendedAttributes(at: url)
+        )
+    }
+
+    private func aclText(at url: URL) throws -> String? {
+        errno = 0
+        guard let acl = url.path.withCString({ acl_get_file($0, ACL_TYPE_EXTENDED) }) else {
+            if errno == ENOENT || errno == ENOTSUP {
+                return nil
+            }
+            throw posixError("read ACL at \(url.path)")
+        }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        var length = ssize_t(0)
+        guard let text = acl_to_text(acl, &length) else {
+            throw posixError("serialize ACL at \(url.path)")
+        }
+        defer { acl_free(UnsafeMutableRawPointer(text)) }
+        return String(cString: text)
+    }
+
+    private func extendedAttributes(at url: URL) throws -> [String: Data] {
+        let size = url.path.withCString {
+            Darwin.listxattr($0, nil, 0, XATTR_NOFOLLOW)
+        }
+        guard size >= 0 else {
+            throw posixError("list extended attributes at \(url.path)")
+        }
+        guard size > 0 else {
+            return [:]
+        }
+        var names = [CChar](repeating: 0, count: size)
+        let readSize = names.withUnsafeMutableBufferPointer { buffer in
+            url.path.withCString {
+                Darwin.listxattr($0, buffer.baseAddress, buffer.count, XATTR_NOFOLLOW)
+            }
+        }
+        guard readSize == size else {
+            throw posixError("read extended-attribute names at \(url.path)")
+        }
+
+        var result: [String: Data] = [:]
+        var offset = 0
+        while offset < readSize {
+            let name = names.withUnsafeBufferPointer { buffer -> String in
+                String(cString: buffer.baseAddress!.advanced(by: offset))
+            }
+            offset += name.utf8.count + 1
+            let valueSize = url.path.withCString { path in
+                name.withCString { attribute in
+                    Darwin.getxattr(path, attribute, nil, 0, 0, XATTR_NOFOLLOW)
+                }
+            }
+            guard valueSize >= 0 else {
+                throw posixError("read extended attribute \(name) at \(url.path)")
+            }
+            var value = Data(count: valueSize)
+            let bytesRead = value.withUnsafeMutableBytes { buffer in
+                url.path.withCString { path in
+                    name.withCString { attribute in
+                        Darwin.getxattr(
+                            path,
+                            attribute,
+                            buffer.baseAddress,
+                            buffer.count,
+                            0,
+                            XATTR_NOFOLLOW
+                        )
+                    }
+                }
+            }
+            guard bytesRead == valueSize else {
+                throw posixError("read extended attribute \(name) at \(url.path)")
+            }
+            result[name] = value
+        }
+        return result
     }
 
     private func readData(at url: URL) throws -> Data {

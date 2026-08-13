@@ -183,6 +183,13 @@ struct JobDetailView: View {
                         title: "Unsafe wrapper label",
                         detail: "This plist contains a Ticker wrapper for another job. Ticker will not modify it."
                     )
+                case .identityChanged(let previousJobID):
+                    DetailCallout(
+                        color: .orange,
+                        icon: "arrow.triangle.2.circlepath",
+                        title: "History identity changed",
+                        detail: "This authenticated wrapper still records as \(previousJobID). Reconcile it before unwrapping so existing and late history follow this job."
+                    )
                 case .staleManagedRow:
                     DetailCallout(
                         color: .orange,
