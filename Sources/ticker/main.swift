@@ -431,6 +431,8 @@ private struct TickerCLI {
         guard let jobID = label, !jobID.isEmpty else {
             throw CLIError.usage("run requires --label <id>")
         }
+        var childEnvironment: [String: String]?
+        var childWorkingDirectory: String?
 
         if trigger == .manual {
             guard !wrapperVersionSeen else {
@@ -454,6 +456,8 @@ private struct TickerCLI {
                     "Cannot run \(job.label) manually because the supplied command does not match the discovered job."
                 )
             }
+            childEnvironment = SchedulerEnvironment.effectiveEnvironment(for: job)
+            childWorkingDirectory = job.cwd
         } else if !wrapperVersionSeen,
                   jobID.hasPrefix("launchd:") || jobID.hasPrefix("claude:") {
             let discoveredJob = JobRegistry.standard().discoverAll().jobs.first {
@@ -473,7 +477,9 @@ private struct TickerCLI {
             arguments: childArguments,
             originalArgv0: originalArgv0,
             tailBytes: tailBytes,
-            trigger: trigger
+            trigger: trigger,
+            environment: childEnvironment,
+            currentDirectory: childWorkingDirectory
         )
     }
 
@@ -482,7 +488,9 @@ private struct TickerCLI {
         arguments: [String],
         originalArgv0: String?,
         tailBytes: Int,
-        trigger: RunTrigger
+        trigger: RunTrigger,
+        environment: [String: String]?,
+        currentDirectory: String?
     ) -> Never {
         let startedAt = Date()
         var store: SQLiteRunStore?
@@ -507,7 +515,13 @@ private struct TickerCLI {
         let stdoutTail = TailBuffer(capacity: tailBytes)
         let stderrTail = TailBuffer(capacity: tailBytes)
 
-        guard let executablePath = resolveExecutable(arguments[0]) else {
+        let effectiveEnvironment = environment ?? ProcessInfo.processInfo.environment
+        let effectiveDirectory = currentDirectory ?? FileManager.default.currentDirectoryPath
+        guard let executablePath = resolveExecutable(
+            arguments[0],
+            environment: effectiveEnvironment,
+            currentDirectory: effectiveDirectory
+        ) else {
             let message = "ticker: could not execute \(arguments[0]): command not found\n"
             let messageData = Data(message.utf8)
             stderrTail.append(messageData)
@@ -531,6 +545,8 @@ private struct TickerCLI {
                 executablePath: executablePath,
                 arguments: arguments,
                 originalArgv0: originalArgv0,
+                environment: effectiveEnvironment,
+                currentDirectory: currentDirectory,
                 stdoutPipe: stdoutPipe,
                 stderrPipe: stderrPipe
             )
@@ -852,7 +868,11 @@ private struct TickerCLI {
 
 
     private func currentExecutablePath() -> String {
-        if let resolved = resolveExecutable(CommandLine.arguments[0]) {
+        if let resolved = resolveExecutable(
+            CommandLine.arguments[0],
+            environment: ProcessInfo.processInfo.environment,
+            currentDirectory: FileManager.default.currentDirectoryPath
+        ) {
             return resolved
         }
         return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
@@ -899,6 +919,8 @@ private func spawnChild(
     executablePath: String,
     arguments: [String],
     originalArgv0: String?,
+    environment: [String: String],
+    currentDirectory: String?,
     stdoutPipe: Pipe,
     stderrPipe: Pipe
 ) throws -> pid_t {
@@ -926,6 +948,14 @@ private func spawnChild(
     let stdoutWrite = stdoutPipe.fileHandleForWriting.fileDescriptor
     let stderrRead = stderrPipe.fileHandleForReading.fileDescriptor
     let stderrWrite = stderrPipe.fileHandleForWriting.fileDescriptor
+    if let currentDirectory {
+        try currentDirectory.withCString { path in
+            try requireSuccess(
+                posix_spawn_file_actions_addchdir_np(&fileActions, path),
+                "posix_spawn_file_actions_addchdir_np"
+            )
+        }
+    }
     try requireSuccess(
         posix_spawn_file_actions_adddup2(&fileActions, stdoutWrite, STDOUT_FILENO),
         "posix_spawn_file_actions_adddup2(stdout)"
@@ -981,13 +1011,13 @@ private func spawnChild(
         }
     }
 
-    let environmentStrings = ProcessInfo.processInfo.environment
+    let environmentStrings = environment
         .map { "\($0.key)=\($0.value)" }
         .sorted()
-    var environment: [UnsafeMutablePointer<CChar>?] = environmentStrings.map { strdup($0) }
-    environment.append(nil)
+    var environmentPointers: [UnsafeMutablePointer<CChar>?] = environmentStrings.map { strdup($0) }
+    environmentPointers.append(nil)
     defer {
-        for pointer in environment where pointer != nil {
+        for pointer in environmentPointers where pointer != nil {
             free(pointer)
         }
     }
@@ -995,7 +1025,7 @@ private func spawnChild(
     var processIdentifier: pid_t = 0
     code = executablePath.withCString { executable in
         argv.withUnsafeMutableBufferPointer { argvBuffer in
-            environment.withUnsafeMutableBufferPointer { environmentBuffer in
+            environmentPointers.withUnsafeMutableBufferPointer { environmentBuffer in
                 posix_spawn(
                     &processIdentifier,
                     executable,
@@ -1084,22 +1114,26 @@ private func finishRun(
     }
 }
 
-private func resolveExecutable(_ command: String) -> String? {
+private func resolveExecutable(
+    _ command: String,
+    environment: [String: String],
+    currentDirectory: String
+) -> String? {
     if command.contains("/") {
         let candidate: String
         if command.hasPrefix("/") {
             candidate = URL(fileURLWithPath: command).standardizedFileURL.path
         } else {
-            candidate = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            candidate = URL(fileURLWithPath: currentDirectory)
                 .appendingPathComponent(command)
                 .standardizedFileURL.path
         }
         return Darwin.access(candidate, X_OK) == 0 ? candidate : nil
     }
 
-    let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+    let path = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
     for directory in path.split(separator: ":", omittingEmptySubsequences: false) {
-        let base = directory.isEmpty ? FileManager.default.currentDirectoryPath : String(directory)
+        let base = directory.isEmpty ? currentDirectory : String(directory)
         let candidate = URL(fileURLWithPath: base)
             .appendingPathComponent(command)
             .standardizedFileURL.path

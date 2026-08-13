@@ -55,8 +55,11 @@ public final class CrontabAdapter: JobSourceAdapter {
     private let commandRunner: AdapterCommandRunner
 
     public convenience init() {
+        let configuredPath = ProcessInfo.processInfo.environment["TICKER_CRONTAB_PATH"]
+            .flatMap { $0.isEmpty ? nil : $0 }
+            ?? "/usr/bin/crontab"
         self.init(
-            crontabURL: URL(fileURLWithPath: "/usr/bin/crontab"),
+            crontabURL: URL(fileURLWithPath: configuredPath),
             commandRunner: runAdapterCommand
         )
     }

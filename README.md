@@ -86,8 +86,8 @@ When you run `ticker wrap <launchd-job-id>`, Ticker makes these on-disk changes:
 
    If a plist has both `Program` and `ProgramArguments`, Ticker keeps `Program` as the executable. It also passes `--argv0` so the child receives the original first argument. Ticker does not try to execute `ProgramArguments[0]` in this case.
 
-   Non-command plist keys keep the same values. Property-list serialization can change formatting and key order. The backup preserves the original bytes exactly, and `ticker unwrap` restores those bytes.
-4. It makes repeat wrapping safe. If the Ticker executable moves, wrapping again updates only the executable path and keeps the authenticated original backup. Ticker does not adopt a third-party executable merely because its filename is `ticker`.
+   Non-command plist keys keep the same values. Property-list serialization can change formatting and key order. The authenticated backup preserves the original bytes for disaster recovery. On unwrap, Ticker restores only `Program` and `ProgramArguments` from that backup. It leaves current schedule, environment, and other non-command values unchanged.
+4. It makes repeat wrapping safe. If the Ticker executable moves, wrapping again updates only the executable path and keeps the authenticated original backup. Ticker does not adopt a third-party executable merely because its filename is `ticker`. Before each rewrite, Ticker also confirms that the source bytes still match the version it read.
 
 Ticker does **not** reload the launchd job for you. It prints ready-to-paste commands like these:
 
@@ -102,8 +102,10 @@ Run both commands to apply the changed plist.
 
 Use one of these two paths:
 
-- **Preferred:** Find the internal job id with `ticker list --json`. Run `ticker unwrap <launchd-job-id>`. Then run the two `launchctl` commands that it prints.
+- **Preferred:** Find the internal job id with `ticker list --json`. Run `ticker unwrap <launchd-job-id>`. Ticker restores the original command and preserves non-command edits made while wrapped. Then run the two `launchctl` commands that it prints.
 - **Manual:** Copy the matching backup over the original plist. Run `ticker doctor --clear-stale <launchd-job-id>` to clear the managed database row. Then unload and load the plist with `launchctl`. Ticker refuses a manual restore whose authenticated metadata names another plist or whose bytes fail authentication.
+
+If `Program` or `ProgramArguments` changed to neither the Ticker wrapper nor the backed-up command, Ticker refuses to guess. The error names both files. Compare those two keys with the authenticated backup, restore the intended command manually, and then run `ticker doctor`. You can copy the complete backup into place if you want disaster recovery instead of preserving current non-command edits.
 
 Ticker never deletes backups. Unwrap jobs before deleting `Ticker.app`. A wrapped job whose `ticker` binary is missing will fail with exit 127, so removing the app first can leave that job unable to run until you restore its backup.
 
@@ -134,7 +136,7 @@ ticker wrap <job-id>
 ticker unwrap <job-id>
 ```
 
-Wraps a launchd job or restores its original plist. Both commands print the `launchctl` commands needed to apply the change.
+Wraps a launchd job or restores only its original command keys. Unwrap preserves current non-command plist values. Both commands print the `launchctl` commands needed to apply the change.
 
 ```text
 ticker doctor
@@ -163,7 +165,7 @@ Ticker makes no network calls and sends no telemetry.
 
 ## Run Now fidelity
 
-Ticker enables Run Now only when it can reproduce the scheduler's execution context. Crontab jobs run from their effective non-empty `HOME`, as cron does. Launchd jobs are disabled when their `UserName`, `GroupName`, or system-daemon domain would use a different effective uid or gid. The job detail view states the reason.
+Ticker enables Run Now only when it can reproduce the scheduler's execution context. Crontab jobs run with their discovered scheduler environment and from their effective non-empty `HOME`, as cron does. Launchd jobs are disabled when their `UserName`, `GroupName`, or system-daemon domain would use a different effective uid or gid. Wrapping uses the same identity gate, so Ticker does not rewrite a system-domain daemon that it cannot run faithfully. The job detail view and command error state the reason.
 
 ## Claude routine history limitations
 

@@ -1319,7 +1319,7 @@ private func test3A_ManualRestoreStaleRow(_ tests: TestHarness) throws {
 
         try writePropertyList([
             "Label": "com.example.stale-row",
-            "ProgramArguments": ["/bin/echo", "manually-restored"],
+            "ProgramArguments": ["/bin/echo", "old"],
             "ManualRevision": 2,
         ], to: plistURL)
         let manualData = try Data(contentsOf: plistURL)
@@ -3734,6 +3734,417 @@ private func test6_LaunchdRuntimeStatusExplanations(_ tests: TestHarness) throws
     }
 }
 
+private func test7_wrapperFixture(
+    directory: URL,
+    label: String,
+    propertyList: [String: Any]
+) throws -> (JobWrapper, SQLiteRunStore, Job, URL) {
+    let plistURL = directory.appendingPathComponent("\(label).plist")
+    try writePropertyList(propertyList, to: plistURL)
+    let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+    let wrapper = JobWrapper(
+        store: store,
+        backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
+    )
+    let commandDictionary = try test2A_readPropertyList(plistURL)
+    let command: [String]
+    let argv0: String?
+    if let program = commandDictionary["Program"] as? String {
+        let arguments = commandDictionary["ProgramArguments"] as? [String] ?? []
+        command = [program] + Array(arguments.dropFirst())
+        argv0 = arguments.first
+    } else {
+        command = try require(
+            commandDictionary["ProgramArguments"] as? [String],
+            "test7 fixture command"
+        )
+        argv0 = nil
+    }
+    let job = Job(
+        id: "launchd:\(label)",
+        source: .launchd,
+        label: label,
+        schedule: .onDemand,
+        command: command,
+        argv0: argv0,
+        cwd: nil,
+        enabled: true,
+        configPath: plistURL.path,
+        lastKnownExit: nil,
+        lastRunAt: nil,
+        lastScheduledFor: nil,
+        managed: false
+    )
+    return (wrapper, store, job, plistURL)
+}
+
+private func test7_UnwrapPreservesStartInterval(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round7-start-interval") { directory in
+        let (wrapper, _, job, plistURL) = try test7_wrapperFixture(
+            directory: directory,
+            label: "com.example.test7.interval",
+            propertyList: [
+                "Label": "com.example.test7.interval",
+                "Program": "/bin/echo",
+                "ProgramArguments": ["custom-echo", "original"],
+                "StartInterval": 3_600,
+            ]
+        )
+        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        var edited = try test2A_readPropertyList(plistURL)
+        edited["StartInterval"] = 300
+        try writePropertyList(edited, to: plistURL)
+
+        tests.expectEqual(
+            try wrapper.recoveryState(job: job),
+            .wrappedConsistent,
+            "test7_nonCommandScheduleEdit_remainsConsistent"
+        )
+        _ = try wrapper.unwrap(job: job)
+        let restored = try test2A_readPropertyList(plistURL)
+        tests.expectEqual(
+            restored["StartInterval"] as? Int,
+            300,
+            "test7_unwrap_preservesEditedStartInterval"
+        )
+        tests.expectEqual(
+            restored["Program"] as? String,
+            "/bin/echo",
+            "test7_unwrap_restoresOriginalProgram"
+        )
+        tests.expectEqual(
+            restored["ProgramArguments"] as? [String],
+            ["custom-echo", "original"],
+            "test7_unwrap_restoresProgramArgumentsAndArgv0"
+        )
+    }
+}
+
+private func test7_UnwrapPreservesEnvironmentVariables(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round7-environment") { directory in
+        let (wrapper, _, job, plistURL) = try test7_wrapperFixture(
+            directory: directory,
+            label: "com.example.test7.environment",
+            propertyList: [
+                "EnvironmentVariables": ["ORIGINAL": "one"],
+                "Label": "com.example.test7.environment",
+                "ProgramArguments": ["/bin/echo", "original"],
+            ]
+        )
+        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        var edited = try test2A_readPropertyList(plistURL)
+        edited["EnvironmentVariables"] = ["ADDED": "two", "ORIGINAL": "changed"]
+        try writePropertyList(edited, to: plistURL)
+
+        _ = try wrapper.unwrap(job: job)
+        let restored = try test2A_readPropertyList(plistURL)
+        tests.expectEqual(
+            restored["EnvironmentVariables"] as? [String: String],
+            ["ADDED": "two", "ORIGINAL": "changed"],
+            "test7_unwrap_preservesEditedEnvironmentVariables"
+        )
+        tests.expectEqual(
+            restored["ProgramArguments"] as? [String],
+            ["/bin/echo", "original"],
+            "test7_environmentEdit_unwrapRestoresOriginalCommand"
+        )
+    }
+}
+
+private func test7_UnwrapRejectsOwnedKeyConflict(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round7-command-conflict") { directory in
+        let (wrapper, store, job, plistURL) = try test7_wrapperFixture(
+            directory: directory,
+            label: "com.example.test7.conflict",
+            propertyList: [
+                "Label": "com.example.test7.conflict",
+                "ProgramArguments": ["/bin/echo", "original"],
+                "StartInterval": 60,
+            ]
+        )
+        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        let backupPath = try require(
+            try store.managedBackupPath(jobID: job.id),
+            "test7 conflict backup path"
+        )
+        var conflicted = try test2A_readPropertyList(plistURL)
+        conflicted["ProgramArguments"] = ["/bin/false", "third-party"]
+        try writePropertyList(conflicted, to: plistURL)
+        let conflictedData = try Data(contentsOf: plistURL)
+
+        do {
+            _ = try wrapper.unwrap(job: job)
+            tests.expect(false, "test7_ownedKeyConflict_failsClosed")
+        } catch {
+            let message = error.localizedDescription
+            tests.expect(
+                message.contains(plistURL.path) && message.contains(backupPath),
+                "test7_ownedKeyConflict_namesPlistAndBackup"
+            )
+        }
+        tests.expectEqual(
+            try Data(contentsOf: plistURL),
+            conflictedData,
+            "test7_ownedKeyConflict_mutatesNothing"
+        )
+        tests.expectEqual(
+            try store.managedBackupPath(jobID: job.id),
+            backupPath,
+            "test7_ownedKeyConflict_keepsManagedRecoveryState"
+        )
+    }
+}
+
+private func test7_WrapRejectsConcurrentSourceChange(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round7-wrap-toctou") { directory in
+        let plistURL = directory.appendingPathComponent("com.example.test7.toctou.plist")
+        try writePropertyList([
+            "Label": "com.example.test7.toctou",
+            "ProgramArguments": ["/bin/echo", "original"],
+            "StartInterval": 60,
+        ], to: plistURL)
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+        let changed: [String: Any] = [
+            "Label": "com.example.test7.toctou",
+            "ProgramArguments": ["/bin/echo", "changed-concurrently"],
+            "StartInterval": 300,
+        ]
+        let wrapper = JobWrapper(
+            store: store,
+            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true),
+            beforeSourceRewrite: {
+                try writePropertyList(changed, to: plistURL)
+            }
+        )
+        let job = test2A_makeLaunchdJob(
+            id: "launchd:com.example.test7.toctou",
+            label: "com.example.test7.toctou",
+            command: ["/bin/echo", "original"],
+            plistURL: plistURL
+        )
+
+        do {
+            _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+            tests.expect(false, "test7_concurrentSourceChange_abortsWrap")
+        } catch {
+            tests.expect(
+                error.localizedDescription.contains("changed while Ticker"),
+                "test7_concurrentSourceChange_hasActionableError"
+            )
+        }
+        tests.expectEqual(
+            try test2A_readPropertyList(plistURL)["ProgramArguments"] as? [String],
+            ["/bin/echo", "changed-concurrently"],
+            "test7_concurrentSourceChange_preservesExternalCommandEdit"
+        )
+        tests.expectEqual(
+            try store.managedBackupPath(jobID: job.id),
+            nil,
+            "test7_concurrentSourceChange_doesNotMarkJobManaged"
+        )
+    }
+}
+
+private struct test7_FileMetadata: Equatable {
+    let owner: uid_t
+    let group: gid_t
+    let mode: mode_t
+}
+
+private func test7_fileMetadata(at url: URL) throws -> test7_FileMetadata {
+    var value = stat()
+    guard Darwin.lstat(url.path, &value) == 0 else {
+        throw FixtureError.missing("test7 stat \(url.path): \(String(cString: strerror(errno)))")
+    }
+    return test7_FileMetadata(
+        owner: value.st_uid,
+        group: value.st_gid,
+        mode: value.st_mode & mode_t(S_IRWXU | S_IRWXG | S_IRWXO)
+    )
+}
+
+private func test7_aclText(at url: URL) throws -> String {
+    guard let acl = acl_get_file(url.path, ACL_TYPE_EXTENDED) else {
+        throw FixtureError.missing("test7 read ACL \(url.path): \(String(cString: strerror(errno)))")
+    }
+    defer { acl_free(UnsafeMutableRawPointer(acl)) }
+    var length: ssize_t = 0
+    guard let text = acl_to_text(acl, &length) else {
+        throw FixtureError.missing("test7 render ACL \(url.path): \(String(cString: strerror(errno)))")
+    }
+    defer { acl_free(UnsafeMutableRawPointer(text)) }
+    return String(cString: text)
+}
+
+private func test7_WrapAndUnwrapPreserveFileMetadata(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round7-metadata") { directory in
+        let (wrapper, _, job, plistURL) = try test7_wrapperFixture(
+            directory: directory,
+            label: "com.example.test7.metadata",
+            propertyList: [
+                "Label": "com.example.test7.metadata",
+                "ProgramArguments": ["/bin/echo", "metadata"],
+            ]
+        )
+        guard Darwin.chmod(plistURL.path, 0o600) == 0 else {
+            throw FixtureError.missing("test7 chmod fixture: \(String(cString: strerror(errno)))")
+        }
+        let aclSetup = try test3A_runProcess(
+            "/bin/chmod",
+            ["+a", "user:\(NSUserName()) allow read", plistURL.path]
+        )
+        guard aclSetup.status == 0 else {
+            throw FixtureError.missing("test7 create ACL: \(aclSetup.stderr)")
+        }
+        let aclBefore = try test7_aclText(at: plistURL)
+        let before = try test7_fileMetadata(at: plistURL)
+        print(
+            "TRANSCRIPT test7 stat before uid=\(before.owner) gid=\(before.group) "
+                + "mode=\(String(before.mode, radix: 8)) path=\(plistURL.path)"
+        )
+        print(
+            "TRANSCRIPT test7 acl before "
+                + aclBefore.replacingOccurrences(of: "\n", with: "|")
+        )
+
+        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        let afterWrap = try test7_fileMetadata(at: plistURL)
+        print(
+            "TRANSCRIPT test7 stat after-wrap uid=\(afterWrap.owner) gid=\(afterWrap.group) "
+                + "mode=\(String(afterWrap.mode, radix: 8)) path=\(plistURL.path)"
+        )
+        tests.expectEqual(afterWrap, before, "test7_wrap_preservesOwnerGroupAndMode")
+        tests.expectEqual(
+            try test7_aclText(at: plistURL),
+            aclBefore,
+            "test7_wrap_preservesACL"
+        )
+
+        _ = try wrapper.unwrap(job: job)
+        let afterUnwrap = try test7_fileMetadata(at: plistURL)
+        print(
+            "TRANSCRIPT test7 stat after-unwrap uid=\(afterUnwrap.owner) gid=\(afterUnwrap.group) "
+                + "mode=\(String(afterUnwrap.mode, radix: 8)) path=\(plistURL.path)"
+        )
+        tests.expectEqual(afterUnwrap, before, "test7_unwrap_preservesOwnerGroupAndMode")
+        tests.expectEqual(
+            try test7_aclText(at: plistURL),
+            aclBefore,
+            "test7_unwrap_preservesACL"
+        )
+    }
+}
+
+private func test7_SystemDaemonWrapIsRejected(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round7-system-daemon") { directory in
+        let plistURL = directory.appendingPathComponent("com.example.test7.system.plist")
+        try writePropertyList([
+            "Label": "com.example.test7.system",
+            "ProgramArguments": ["/usr/bin/true"],
+        ], to: plistURL)
+        let originalData = try Data(contentsOf: plistURL)
+        let reason = "launchd runs this job in the system domain as root:wheel, but Ticker runs as the signed-in user. Run Now is disabled because those execution identities differ."
+        let job = Job(
+            id: "launchd:system:com.example.test7.system",
+            source: .launchd,
+            label: "com.example.test7.system",
+            schedule: .onDemand,
+            command: ["/usr/bin/true"],
+            cwd: nil,
+            enabled: true,
+            launchdDomain: .systemDaemon,
+            launchdUserName: "root",
+            launchdGroupName: "wheel",
+            runNowUnavailableReason: reason,
+            configPath: plistURL.path,
+            lastKnownExit: nil,
+            lastRunAt: nil,
+            lastScheduledFor: nil,
+            managed: false
+        )
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+        let wrapper = JobWrapper(
+            store: store,
+            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
+        )
+
+        do {
+            _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+            tests.expect(false, "test7_systemDaemon_wrapIsRejected")
+        } catch {
+            tests.expect(
+                error.localizedDescription.contains(reason),
+                "test7_systemDaemon_wrapUsesRunNowIdentityReason"
+            )
+        }
+        tests.expectEqual(
+            try Data(contentsOf: plistURL),
+            originalData,
+            "test7_systemDaemon_wrapMutatesNothing"
+        )
+    }
+}
+
+private func test7_ManualCrontabRunUsesDiscoveredContext(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round7-manual-crontab") { directory in
+        let tickerPath = try test3A_builtCLIPath()
+        let fixtureHome = directory.appendingPathComponent("fixture-home", isDirectory: true)
+        let binDirectory = fixtureHome.appendingPathComponent("bin", isDirectory: true)
+        let unrelated = directory.appendingPathComponent("unrelated", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: unrelated, withIntermediateDirectories: true)
+        let relativeCommand = binDirectory.appendingPathComponent("relative-command")
+        try """
+        #!/bin/sh
+        printf '%s|%s|%s\\n' "$PWD" "$TEST7_CONTEXT" "$HOME"
+        """.write(to: relativeCommand, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: relativeCommand.path
+        )
+
+        let crontabFixture = directory.appendingPathComponent("crontab.txt")
+        try """
+        HOME=\(fixtureHome.path)
+        TEST7_CONTEXT=from-crontab
+        * * * * * ./bin/relative-command
+        """.write(to: crontabFixture, atomically: true, encoding: .utf8)
+        let fakeCrontab = directory.appendingPathComponent("crontab")
+        try """
+        #!/bin/sh
+        cat '\(crontabFixture.path)'
+        """.write(to: fakeCrontab, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeCrontab.path
+        )
+        let adapter = CrontabAdapter(
+            crontabURL: fakeCrontab,
+            commandRunner: runAdapterCommand
+        )
+        let job = try require(try adapter.discover().first, "test7 fixture crontab job")
+        let result = try test3A_runProcess(
+            tickerPath,
+            ["run", "--manual", "--label", job.id, "--"] + job.command,
+            environment: [
+                "HOME": unrelated.path,
+                "TEST7_CONTEXT": "from-parent",
+                "TICKER_CRONTAB_PATH": fakeCrontab.path,
+                "TICKER_STORE_PATH": directory.appendingPathComponent("ticker.db").path,
+            ],
+            currentDirectory: unrelated
+        )
+        let normalizedOutput = result.stdout.replacingOccurrences(of: "/private/var/", with: "/var/")
+        tests.expectEqual(result.status, 0, "test7_manualCrontab_relativeCommandSucceeds")
+        tests.expectEqual(
+            normalizedOutput,
+            "\(fixtureHome.path)|from-crontab|\(fixtureHome.path)\n",
+            "test7_manualCrontab_usesDiscoveredCwdAndEnvironment"
+        )
+    }
+}
+
+
 @main
 private enum TickerTests {
     static func main() {
@@ -3809,6 +4220,27 @@ private enum TickerTests {
         }
         tests.run("round 6 launchd runtime status explanations") {
             try test6_LaunchdRuntimeStatusExplanations(tests)
+        }
+        tests.run("round 7 unwrap preserves schedule edits") {
+            try test7_UnwrapPreservesStartInterval(tests)
+        }
+        tests.run("round 7 unwrap preserves environment edits") {
+            try test7_UnwrapPreservesEnvironmentVariables(tests)
+        }
+        tests.run("round 7 unwrap command conflict") {
+            try test7_UnwrapRejectsOwnedKeyConflict(tests)
+        }
+        tests.run("round 7 wrap TOCTOU") {
+            try test7_WrapRejectsConcurrentSourceChange(tests)
+        }
+        tests.run("round 7 file metadata") {
+            try test7_WrapAndUnwrapPreserveFileMetadata(tests)
+        }
+        tests.run("round 7 system-daemon wrap gate") {
+            try test7_SystemDaemonWrapIsRejected(tests)
+        }
+        tests.run("round 7 manual crontab context") {
+            try test7_ManualCrontabRunUsesDiscoveredContext(tests)
         }
         tests.finish()
     }

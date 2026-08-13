@@ -115,6 +115,13 @@ public final class JobWrapper {
     public func wrap(job: Job, tickerPath: String) throws -> ReloadCommands {
         let plistURL = try configurationURL(for: job)
         let commands = reloadCommands(for: plistURL)
+        guard job.canRunNow else {
+            throw JobWrapperError(
+                message: "Cannot wrap \(job.label): "
+                    + (job.runNowUnavailableReason
+                        ?? "Ticker cannot faithfully reproduce its scheduled execution context.")
+            )
+        }
         let originalData = try readData(at: plistURL)
         var format = PropertyListSerialization.PropertyListFormat.xml
         let propertyList: Any
@@ -143,7 +150,8 @@ public final class JobWrapper {
                 format: format,
                 plistURL: plistURL,
                 job: job,
-                tickerPath: tickerPath
+                tickerPath: tickerPath,
+                expectedSourceData: originalData
             )
             return commands
         case .wrappedBackupContentMismatch:
@@ -155,6 +163,9 @@ public final class JobWrapper {
                 message: "Ticker backup for \(job.id) has no valid content digest; explicit recovery is required"
             )
         case .ambiguousTickerInvocation:
+            if case .verified(let backupURL) = try backupResolution(for: job, plistURL: plistURL) {
+                throw ownedKeyConflictError(job: job, plistURL: plistURL, backupURL: backupURL)
+            }
             throw JobWrapperError(
                 message: "Launchd job \(job.id) invokes an unproven executable named ticker; refusing to rewrite it"
             )
@@ -196,7 +207,8 @@ public final class JobWrapper {
                 format: format,
                 plistURL: plistURL,
                 job: job,
-                tickerPath: tickerPath
+                tickerPath: tickerPath,
+                expectedSourceData: originalData
             )
             return commands
         case .staleManagedRow:
@@ -223,6 +235,7 @@ public final class JobWrapper {
             plistURL: plistURL
         )
         try beforeSourceRewrite?()
+        try ensureSourceUnchanged(originalData, at: plistURL)
         try store.markManaged(jobID: job.id, backupPath: backupURL.path)
 
         dictionary.removeValue(forKey: "Program")
@@ -246,6 +259,7 @@ public final class JobWrapper {
         }
 
         do {
+            try ensureSourceUnchanged(originalData, at: plistURL)
             try writeRewrittenData(rewrittenData, to: plistURL)
         } catch {
             try? store.unmarkManaged(jobID: job.id)
@@ -277,6 +291,9 @@ public final class JobWrapper {
                 message: "Ticker backup for \(job.id) has no valid content digest; explicit recovery is required"
             )
         case .ambiguousTickerInvocation:
+            if case .verified(let backupURL) = try backupResolution(for: job, plistURL: plistURL) {
+                throw ownedKeyConflictError(job: job, plistURL: plistURL, backupURL: backupURL)
+            }
             throw JobWrapperError(
                 message: "Launchd job \(job.id) invokes an unproven executable named ticker; refusing to restore it"
             )
@@ -300,13 +317,41 @@ public final class JobWrapper {
             job: job,
             plistURL: plistURL
         )
-        do {
-            try backupData.write(to: plistURL, options: .atomic)
-        } catch {
-            throw JobWrapperError(
-                message: "Could not restore \(plistURL.path) from \(backupURL.path): \(error.localizedDescription)"
-            )
+        let liveData = try readData(at: plistURL)
+        var liveFormat = PropertyListSerialization.PropertyListFormat.xml
+        var liveDictionary = try propertyListDictionary(
+            from: liveData,
+            format: &liveFormat,
+            plistURL: plistURL
+        )
+        let backupDictionary = try propertyListDictionary(
+            from: backupData,
+            format: nil,
+            plistURL: backupURL
+        )
+        guard wrapperMatchesBackup(
+            liveDictionary: liveDictionary,
+            backupDictionary: backupDictionary,
+            job: job
+        ) else {
+            throw ownedKeyConflictError(job: job, plistURL: plistURL, backupURL: backupURL)
         }
+
+        if backupDictionary.keys.contains("Program") {
+            liveDictionary["Program"] = backupDictionary["Program"]
+        } else {
+            liveDictionary.removeValue(forKey: "Program")
+        }
+        if backupDictionary.keys.contains("ProgramArguments") {
+            liveDictionary["ProgramArguments"] = backupDictionary["ProgramArguments"]
+        } else {
+            liveDictionary.removeValue(forKey: "ProgramArguments")
+        }
+        try ensureSourceUnchanged(liveData, at: plistURL)
+        try writeRewrittenData(
+            try serializedData(liveDictionary, format: liveFormat, plistURL: plistURL),
+            to: plistURL
+        )
 
         try store.unmarkManaged(jobID: job.id)
         return commands
@@ -329,12 +374,9 @@ public final class JobWrapper {
 
         let managedIDs = try store.managedJobIDs()
         let managedRowExists = !managedIDs.isDisjoint(with: acceptedBackupJobIDs(for: job))
-        guard let arguments = dictionary["ProgramArguments"] as? [String] else {
-            return managedRowExists ? .staleManagedRow : .unwrapped
-        }
-
+        let arguments = dictionary["ProgramArguments"] as? [String]
         let acceptedLabels = acceptedWrapperLabels(for: job)
-        if let decoded = LaunchdWrapper.decode(arguments) {
+        if let arguments, let decoded = LaunchdWrapper.decode(arguments) {
             guard acceptedLabels.contains(decoded.label) else {
                 return .wrappedForeignLabel(embeddedJobID: decoded.label)
             }
@@ -342,8 +384,17 @@ public final class JobWrapper {
                 return .wrappedMissingBackup
             }
             switch try backupResolution(for: job, plistURL: plistURL) {
-            case .verified:
-                return .wrappedConsistent
+            case .verified(let backupURL):
+                let backupDictionary = try authenticatedBackupDictionary(
+                    at: backupURL,
+                    job: job,
+                    plistURL: plistURL
+                )
+                return wrapperMatchesBackup(
+                    liveDictionary: dictionary,
+                    backupDictionary: backupDictionary,
+                    job: job
+                ) ? .wrappedConsistent : .ambiguousTickerInvocation
             case .missing:
                 return .wrappedMissingBackup
             case .contentMismatch:
@@ -353,15 +404,44 @@ public final class JobWrapper {
             }
         }
 
-        if let legacy = LaunchdWrapper.decodeLegacy(arguments) {
+        if let arguments, let legacy = LaunchdWrapper.decodeLegacy(arguments) {
             guard acceptedLabels.contains(legacy.label),
                   managedRowExists,
-                  case .verified = try backupResolution(for: job, plistURL: plistURL) else {
+                  case .verified(let backupURL) = try backupResolution(for: job, plistURL: plistURL) else {
                 return .ambiguousTickerInvocation
             }
-            return .wrappedConsistent
+            let backupDictionary = try authenticatedBackupDictionary(
+                at: backupURL,
+                job: job,
+                plistURL: plistURL
+            )
+            return wrapperMatchesBackup(
+                liveDictionary: dictionary,
+                backupDictionary: backupDictionary,
+                job: job
+            ) ? .wrappedConsistent : .ambiguousTickerInvocation
         }
-        return managedRowExists ? .staleManagedRow : .unwrapped
+
+        guard managedRowExists else {
+            return .unwrapped
+        }
+        switch try backupResolution(for: job, plistURL: plistURL) {
+        case .verified(let backupURL):
+            let backupDictionary = try authenticatedBackupDictionary(
+                at: backupURL,
+                job: job,
+                plistURL: plistURL
+            )
+            return ownedCommandKeysMatch(dictionary, backupDictionary)
+                ? .staleManagedRow
+                : .ambiguousTickerInvocation
+        case .contentMismatch:
+            return .wrappedBackupContentMismatch
+        case .unverified:
+            return .wrappedBackupUnverified
+        case .missing:
+            return .staleManagedRow
+        }
     }
 
     public func isWrapped(job: Job) -> Bool {
@@ -578,6 +658,108 @@ public final class JobWrapper {
         }
     }
 
+    private func authenticatedBackupDictionary(
+        at backupURL: URL,
+        job: Job,
+        plistURL: URL
+    ) throws -> [String: Any] {
+        try propertyListDictionary(
+            from: authenticatedBackupData(at: backupURL, job: job, plistURL: plistURL),
+            format: nil,
+            plistURL: backupURL
+        )
+    }
+
+    private func propertyListDictionary(
+        from data: Data,
+        format: UnsafeMutablePointer<PropertyListSerialization.PropertyListFormat>?,
+        plistURL: URL
+    ) throws -> [String: Any] {
+        let propertyList: Any
+        do {
+            propertyList = try PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: format
+            )
+        } catch {
+            throw JobWrapperError(
+                message: "Could not parse launchd plist at \(plistURL.path): \(error.localizedDescription)"
+            )
+        }
+        guard let dictionary = propertyList as? [String: Any] else {
+            throw JobWrapperError(message: "Launchd plist at \(plistURL.path) is not a dictionary")
+        }
+        return dictionary
+    }
+
+    private func wrapperMatchesBackup(
+        liveDictionary: [String: Any],
+        backupDictionary: [String: Any],
+        job: Job
+    ) -> Bool {
+        guard !liveDictionary.keys.contains("Program"),
+              let arguments = liveDictionary["ProgramArguments"] as? [String],
+              let decoded = LaunchdWrapper.decode(arguments) ?? LaunchdWrapper.decodeLegacy(arguments),
+              acceptedWrapperLabels(for: job).contains(decoded.label),
+              let originalExecution = try? execution(
+                  from: backupDictionary,
+                  fallback: job.command,
+                  jobID: job.id
+              ) else {
+            return false
+        }
+        return decoded.original == originalExecution.command
+            && decoded.argv0 == originalExecution.argv0
+    }
+
+    private func ownedCommandKeysMatch(
+        _ liveDictionary: [String: Any],
+        _ backupDictionary: [String: Any]
+    ) -> Bool {
+        let liveHasProgram = liveDictionary.keys.contains("Program")
+        let backupHasProgram = backupDictionary.keys.contains("Program")
+        guard liveHasProgram == backupHasProgram,
+              !liveHasProgram
+                || (liveDictionary["Program"] as? String) == (backupDictionary["Program"] as? String)
+        else {
+            return false
+        }
+
+        let liveHasArguments = liveDictionary.keys.contains("ProgramArguments")
+        let backupHasArguments = backupDictionary.keys.contains("ProgramArguments")
+        guard liveHasArguments == backupHasArguments,
+              !liveHasArguments
+                || (liveDictionary["ProgramArguments"] as? [String])
+                    == (backupDictionary["ProgramArguments"] as? [String])
+        else {
+            return false
+        }
+        return true
+    }
+
+    private func ownedKeyConflictError(
+        job: Job,
+        plistURL: URL,
+        backupURL: URL
+    ) -> JobWrapperError {
+        JobWrapperError(
+            message: "Cannot safely restore \(plistURL.path) because Program or ProgramArguments "
+                + "changed after Ticker wrapped the job. Ticker did not modify the plist. "
+                + "Compare those keys with the authenticated backup at \(backupURL.path), "
+                + "restore the intended command manually, and then run ticker doctor."
+        )
+    }
+
+    private func ensureSourceUnchanged(_ expectedData: Data, at plistURL: URL) throws {
+        guard try readData(at: plistURL) == expectedData else {
+            throw JobWrapperError(
+                message: "Launchd plist at \(plistURL.path) changed while Ticker was preparing "
+                    + "to rewrite it. Ticker did not modify the plist. Review the current file and retry."
+            )
+        }
+    }
+
     private func persistBackupWithMetadata(
         _ data: Data,
         to backupURL: URL,
@@ -651,7 +833,8 @@ public final class JobWrapper {
         format: PropertyListSerialization.PropertyListFormat,
         plistURL: URL,
         job: Job,
-        tickerPath: String
+        tickerPath: String,
+        expectedSourceData: Data
     ) throws {
         guard let arguments = dictionary["ProgramArguments"] as? [String],
               let decoded = LaunchdWrapper.decode(arguments) ?? LaunchdWrapper.decodeLegacy(arguments) else {
@@ -668,6 +851,7 @@ public final class JobWrapper {
         }
         dictionary["ProgramArguments"] = expected
         try beforeSourceRewrite?()
+        try ensureSourceUnchanged(expectedSourceData, at: plistURL)
         try writeRewrittenData(
             try serializedData(dictionary, format: format, plistURL: plistURL),
             to: plistURL
@@ -731,73 +915,16 @@ public final class JobWrapper {
     }
 
     private func persistBackup(_ data: Data, to backupURL: URL) throws {
-        let temporaryURL = backupDirectory.appendingPathComponent(
-            ".\(backupURL.lastPathComponent).\(UUID().uuidString).tmp",
-            isDirectory: false
-        )
-        let descriptor = temporaryURL.path.withCString {
-            Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)
-        }
-        guard descriptor >= 0 else {
-            throw posixError("create backup temporary file at \(temporaryURL.path)")
-        }
-
-        var fileDescriptor: Int32? = descriptor
-        var temporaryFileExists = true
-        defer {
-            if let fileDescriptor {
-                _ = Darwin.close(fileDescriptor)
-            }
-            if temporaryFileExists {
-                try? fileManager.removeItem(at: temporaryURL)
-            }
-        }
-
-        try data.withUnsafeBytes { buffer in
-            guard let baseAddress = buffer.baseAddress else {
-                return
-            }
-            var offset = 0
-            while offset < buffer.count {
-                let result = Darwin.write(
-                    descriptor,
-                    baseAddress.advanced(by: offset),
-                    buffer.count - offset
-                )
-                if result < 0 && errno == EINTR {
-                    continue
-                }
-                guard result > 0 else {
-                    throw posixError("write backup temporary file at \(temporaryURL.path)")
-                }
-                offset += result
-            }
-        }
-        try fullySync(descriptor, description: "backup temporary file at \(temporaryURL.path)")
-        guard Darwin.close(descriptor) == 0 else {
-            throw posixError("close backup temporary file at \(temporaryURL.path)")
-        }
-        fileDescriptor = nil
-
-        let renameResult = temporaryURL.path.withCString { source in
-            backupURL.path.withCString { destination in
-                Darwin.rename(source, destination)
-            }
-        }
-        guard renameResult == 0 else {
-            throw posixError("rename backup into place at \(backupURL.path)")
-        }
-        temporaryFileExists = false
-        try syncDirectory(backupDirectory)
+        try atomicWrite(data, to: backupURL, preservingMetadataFrom: nil)
     }
 
     private func syncDirectory(_ directory: URL) throws {
         let descriptor = directory.path.withCString { Darwin.open($0, O_RDONLY) }
         guard descriptor >= 0 else {
-            throw posixError("open backup directory at \(directory.path)")
+            throw posixError("open directory at \(directory.path)")
         }
         defer { _ = Darwin.close(descriptor) }
-        try fullySync(descriptor, description: "backup directory at \(directory.path)")
+        try fullySync(descriptor, description: "directory at \(directory.path)")
     }
 
     private func fullySync(_ descriptor: Int32, description: String) throws {
@@ -835,13 +962,84 @@ public final class JobWrapper {
     }
 
     private func writeRewrittenData(_ data: Data, to plistURL: URL) throws {
-        do {
-            try data.write(to: plistURL, options: .atomic)
-        } catch {
-            throw JobWrapperError(
-                message: "Could not rewrite launchd plist at \(plistURL.path): \(error.localizedDescription)"
-            )
+        try atomicWrite(data, to: plistURL, preservingMetadataFrom: plistURL)
+    }
+
+    private func atomicWrite(
+        _ data: Data,
+        to destinationURL: URL,
+        preservingMetadataFrom metadataSourceURL: URL?
+    ) throws {
+        let directory = destinationURL.deletingLastPathComponent()
+        let temporaryURL = directory.appendingPathComponent(
+            ".\(destinationURL.lastPathComponent).\(UUID().uuidString).tmp",
+            isDirectory: false
+        )
+        let descriptor = temporaryURL.path.withCString {
+            Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)
         }
+        guard descriptor >= 0 else {
+            throw posixError("create temporary file at \(temporaryURL.path)")
+        }
+
+        var fileDescriptor: Int32? = descriptor
+        var temporaryFileExists = true
+        defer {
+            if let fileDescriptor {
+                _ = Darwin.close(fileDescriptor)
+            }
+            if temporaryFileExists {
+                try? fileManager.removeItem(at: temporaryURL)
+            }
+        }
+
+        try data.withUnsafeBytes { buffer in
+            guard let baseAddress = buffer.baseAddress else {
+                return
+            }
+            var offset = 0
+            while offset < buffer.count {
+                let result = Darwin.write(
+                    descriptor,
+                    baseAddress.advanced(by: offset),
+                    buffer.count - offset
+                )
+                if result < 0 && errno == EINTR {
+                    continue
+                }
+                guard result > 0 else {
+                    throw posixError("write temporary file at \(temporaryURL.path)")
+                }
+                offset += result
+            }
+        }
+
+        if let metadataSourceURL {
+            let metadataResult = metadataSourceURL.path.withCString { source in
+                temporaryURL.path.withCString { destination in
+                    copyfile(source, destination, nil, copyfile_flags_t(COPYFILE_METADATA))
+                }
+            }
+            guard metadataResult == 0 else {
+                throw posixError("preserve metadata for \(metadataSourceURL.path)")
+            }
+        }
+        try fullySync(descriptor, description: "temporary file at \(temporaryURL.path)")
+        guard Darwin.close(descriptor) == 0 else {
+            throw posixError("close temporary file at \(temporaryURL.path)")
+        }
+        fileDescriptor = nil
+
+        let renameResult = temporaryURL.path.withCString { source in
+            destinationURL.path.withCString { destination in
+                Darwin.rename(source, destination)
+            }
+        }
+        guard renameResult == 0 else {
+            throw posixError("rename temporary file into place at \(destinationURL.path)")
+        }
+        temporaryFileExists = false
+        try syncDirectory(directory)
     }
 
     private func readData(at url: URL) throws -> Data {
