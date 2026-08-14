@@ -80,8 +80,9 @@ private struct ListRecord: Encodable {
         attention = job.attention
         isBroken = job.isBroken
         needsAttention = job.isBroken
-            || lastOutcome == .failure
-            || job.runtimeStatusAttribution == .ambiguous
+            || (job.enabled
+                && (lastOutcome == .failure
+                    || job.runtimeStatusAttribution == .ambiguous))
         label = job.label
         schedule = job.schedule.humanDescription
         command = job.command
@@ -756,8 +757,9 @@ private struct TickerCLI {
         )
         print("\n* managed by Ticker")
         for record in records {
-            if case .missingPayload(let path) = record.attention {
-                print("\(record.id) [broken]: missing payload at \(path)")
+            if let attention = record.attention {
+                let level = attention.requiresAttention ? "broken" : "info"
+                print("\(record.id) [\(level)]: \(attention.diagnosticDescription)")
             }
         }
         for record in records where record.source == .launchd {
@@ -887,9 +889,19 @@ private struct TickerCLI {
         }
         let wrapper = JobWrapper(store: store)
         for job in discoveredJobs.filter({ $0.source == .launchd }).sorted(by: { $0.id < $1.id }) {
+            if let attention = job.attention,
+               attention.isConfigurationDiagnostic {
+                let status = attention.requiresAttention
+                    ? "configuration-error\tbroken"
+                    : "configuration-info"
+                print("\(job.id)\t\(status): \(attention.diagnosticDescription)")
+                continue
+            }
             do {
                 let recovery = try wrapper.recoveryState(job: job).description
-                let attention = job.attention.map { "\tbroken: missing payload at \($0.path)" } ?? ""
+                let attention = job.attention.map {
+                    "\tbroken: \($0.diagnosticDescription)"
+                } ?? ""
                 if job.runtimeStatusAttribution == .ambiguous {
                     print("\(job.id)\t\(recovery)\tambiguous-runtime\(attention)")
                     if let explanation = job.runtimeStatusExplanation {

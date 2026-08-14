@@ -69,7 +69,17 @@ final class AppBootstrap: ObservableObject {
                 return
             }
             do {
-                let store = try SQLiteRunStore(path: SQLiteRunStore.defaultPath())
+                let defaultStorePath = SQLiteRunStore.defaultPath()
+                #if TICKER_TESTING
+                let storePath = RunStorePathPolicy.configuredPath(
+                    environment: ProcessInfo.processInfo.environment,
+                    scheduledWrapperInvocation: false,
+                    defaultPath: defaultStorePath
+                )
+                #else
+                let storePath = defaultStorePath
+                #endif
+                let store = try SQLiteRunStore(path: storePath)
                 let registry = JobRegistry.standard()
                 DispatchQueue.main.async {
                     let model = AppModel(registry: registry, store: store)
@@ -118,7 +128,23 @@ final class AppModel: ObservableObject {
     ) {
         self.registry = registry
         self.store = store
-        self.wrapper = wrapper ?? JobWrapper(store: store)
+        if let wrapper {
+            self.wrapper = wrapper
+        } else {
+            #if TICKER_TESTING
+            if let path = ProcessInfo.processInfo.environment["TICKER_TEST_BACKUP_DIRECTORY"],
+               !path.isEmpty {
+                self.wrapper = JobWrapper(
+                    store: store,
+                    backupDirectory: URL(fileURLWithPath: path, isDirectory: true)
+                )
+            } else {
+                self.wrapper = JobWrapper(store: store)
+            }
+            #else
+            self.wrapper = JobWrapper(store: store)
+            #endif
+        }
         self.tickerPathOverride = tickerPathOverride
     }
 
@@ -176,7 +202,10 @@ final class AppModel: ObservableObject {
                 refreshErrors.append("Could not read recorder diagnostics: \(error.localizedDescription)")
             }
 
-            for job in discovery.jobs where job.source == .launchd && job.configPath != nil {
+            for job in discovery.jobs
+            where job.source == .launchd
+                && job.configPath != nil
+                && job.attention?.isConfigurationDiagnostic != true {
                 do {
                     latestRecoveryStates[job.id] = try self.wrapper.recoveryState(job: job)
                 } catch {
@@ -216,12 +245,12 @@ final class AppModel: ObservableObject {
         )
     }
 
-    var hasUrgentIssuesInMyJobs: Bool {
-        jobs.contains { $0.provenance == .yours && needsAttention($0) }
+    var hasUrgentAttentionOwnedJobs: Bool {
+        jobs.contains { $0.provenance.isAttentionOwned && needsAttention($0) }
     }
 
     func needsAttention(_ job: Job) -> Bool {
-        if job.attention != nil {
+        if job.isBroken {
             return true
         }
         guard job.enabled else {

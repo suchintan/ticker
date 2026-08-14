@@ -164,14 +164,14 @@ public struct Job: Identifiable, Codable, Hashable {
     }
 
     public var effectiveRunNowUnavailableReason: String? {
-        if case .missingPayload(let path) = attention {
-            return "The job's payload does not exist at \(path)."
+        if let attention {
+            return attention.detail
         }
         return runNowUnavailableReason
     }
 
     public var isBroken: Bool {
-        attention != nil
+        attention?.requiresAttention ?? false
     }
 
     public var runtimeStatusExplanation: String? {

@@ -159,6 +159,23 @@ public final class LaunchdAdapter: JobSourceAdapter {
         let configPath: String
     }
 
+    private struct ConfigurationDiagnostic {
+        let label: String
+        let path: String
+        let attention: JobAttention
+        let domain: LaunchdDomain
+    }
+
+    private enum ConfigurationLoadResult {
+        case runnable(ParsedConfiguration)
+        case inert(label: String?, message: String)
+    }
+
+    private enum ConfigurationLoadError: Error {
+        case malformed(String)
+        case unreadable(String)
+    }
+
     private struct RuntimeKey: Hashable {
         let domain: LaunchdDomain
         let label: String
@@ -235,7 +252,8 @@ public final class LaunchdAdapter: JobSourceAdapter {
     }
 
     public func discover() throws -> [Job] {
-        let configurations = loadConfigurations()
+        let loaded = loadConfigurations()
+        let configurations = loaded.configurations
         let groupedConfigurations = Dictionary(
             grouping: configurations,
             by: { RuntimeKey(domain: $0.domain, label: $0.label) }
@@ -268,7 +286,9 @@ public final class LaunchdAdapter: JobSourceAdapter {
             let classification = provenanceClassifier.classify(
                 source: .launchd,
                 command: configuration.command,
-                configPath: configuration.configPath
+                configPath: configuration.configPath,
+                workingDirectory: configuration.cwd,
+                environment: configuration.environment
             )
             return Job(
                 id: jobID(label: configuration.label, configPath: configuration.configPath),
@@ -298,13 +318,20 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 lastScheduledFor: nil,
                 managed: configuration.managed
             )
-        }
+        } + loaded.diagnostics.map(diagnosticJob)
     }
 
-    private func loadConfigurations() -> [ParsedConfiguration] {
+    private func loadConfigurations() -> (
+        configurations: [ParsedConfiguration],
+        diagnostics: [ConfigurationDiagnostic]
+    ) {
         var configurations: [ParsedConfiguration] = []
+        var diagnostics: [ConfigurationDiagnostic] = []
 
         for directory in searchDirectories {
+            guard FileManager.default.fileExists(atPath: directory.path) else {
+                continue
+            }
             let files: [URL]
             do {
                 files = try FileManager.default.contentsOfDirectory(
@@ -313,6 +340,16 @@ public final class LaunchdAdapter: JobSourceAdapter {
                     options: [.skipsHiddenFiles]
                 )
             } catch {
+                let message = error.localizedDescription
+                diagnostics.append(ConfigurationDiagnostic(
+                    label: "\(directory.lastPathComponent) discovery error",
+                    path: directory.path,
+                    attention: .unreadableConfiguration(
+                        path: directory.path,
+                        message: message
+                    ),
+                    domain: launchdDomain(for: directory)
+                ))
                 continue
             }
 
@@ -320,19 +357,58 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 guard let classification = classify(file: file) else {
                     continue
                 }
-                guard let configuration = parse(
-                    file: file,
-                    domain: launchdDomain(for: directory),
-                    manuallyDisabled: classification.manuallyDisabled,
-                    filenameLabel: classification.label
-                ) else {
-                    continue
+                do {
+                    let result = try parse(
+                        file: file,
+                        domain: launchdDomain(for: directory),
+                        manuallyDisabled: classification.manuallyDisabled,
+                        filenameLabel: classification.label
+                    )
+                    switch result {
+                    case .runnable(let configuration):
+                        configurations.append(configuration)
+                    case .inert(let label, let message):
+                        let path = file.standardizedFileURL.path
+                        diagnostics.append(ConfigurationDiagnostic(
+                            label: label ?? file.deletingPathExtension().lastPathComponent,
+                            path: path,
+                            attention: .inertConfiguration(path: path, message: message),
+                            domain: launchdDomain(for: directory)
+                        ))
+                    }
+                } catch let error as ConfigurationLoadError {
+                    let path = file.standardizedFileURL.path
+                    let attention: JobAttention
+                    switch error {
+                    case .malformed(let message):
+                        attention = .malformedConfiguration(path: path, message: message)
+                    case .unreadable(let message):
+                        attention = .unreadableConfiguration(path: path, message: message)
+                    }
+                    diagnostics.append(ConfigurationDiagnostic(
+                        label: classification.label
+                            ?? file.deletingPathExtension().lastPathComponent,
+                        path: path,
+                        attention: attention,
+                        domain: launchdDomain(for: directory)
+                    ))
+                } catch {
+                    let path = file.standardizedFileURL.path
+                    diagnostics.append(ConfigurationDiagnostic(
+                        label: classification.label
+                            ?? file.deletingPathExtension().lastPathComponent,
+                        path: path,
+                        attention: .unreadableConfiguration(
+                            path: path,
+                            message: error.localizedDescription
+                        ),
+                        domain: launchdDomain(for: directory)
+                    ))
                 }
-                configurations.append(configuration)
             }
         }
 
-        return configurations
+        return (configurations, diagnostics)
     }
 
     private func classify(file: URL) -> (manuallyDisabled: Bool, label: String?)? {
@@ -355,69 +431,117 @@ public final class LaunchdAdapter: JobSourceAdapter {
         domain: LaunchdDomain,
         manuallyDisabled: Bool,
         filenameLabel: String?
-    ) -> ParsedConfiguration? {
+    ) throws -> ConfigurationLoadResult {
+        let data: Data
         do {
-            let data = try Data(contentsOf: file)
-            let propertyList = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
-            guard let dictionary = propertyList as? [String: Any] else {
-                return nil
-            }
+            data = try Data(contentsOf: file)
+        } catch {
+            throw ConfigurationLoadError.unreadable(error.localizedDescription)
+        }
 
-            let plistLabel = dictionary["Label"] as? String
-            guard let label = filenameLabel ?? plistLabel, !label.isEmpty else {
-                return nil
-            }
-
-            let program = dictionary["Program"] as? String
-            let programArguments = dictionary["ProgramArguments"] as? [String]
-            let literalCommand: [String]
-            let literalArgv0: String?
-            if let program, !program.isEmpty {
-                if let programArguments, !programArguments.isEmpty {
-                    literalCommand = [program] + programArguments.dropFirst()
-                    literalArgv0 = programArguments[0] == program ? nil : programArguments[0]
-                } else {
-                    literalCommand = [program]
-                    literalArgv0 = nil
-                }
-            } else if let programArguments, !programArguments.isEmpty {
-                literalCommand = programArguments
-                literalArgv0 = nil
-            } else {
-                literalCommand = []
-                literalArgv0 = nil
-            }
-            let observedWrapper = LaunchdWrapper.decode(programArguments ?? [])
-
-            let userName = nonEmptyString(dictionary["UserName"] as? String)
-            let groupName = nonEmptyString(dictionary["GroupName"] as? String)
-            return ParsedConfiguration(
-                label: label,
-                schedule: parseSchedule(dictionary),
-                command: observedWrapper?.original ?? literalCommand,
-                argv0: observedWrapper?.argv0 ?? literalArgv0,
-                environment: parseEnvironment(dictionary["EnvironmentVariables"]),
-                domain: domain,
-                userName: userName,
-                groupName: groupName,
-                runNowUnavailableReason: manualRunUnavailableReason(
-                    domain: domain,
-                    userName: userName,
-                    groupName: groupName
-                ),
-                managed: observedWrapper != nil,
-                cwd: dictionary["WorkingDirectory"] as? String,
-                standardOutPath: dictionary["StandardOutPath"] as? String,
-                standardErrorPath: dictionary["StandardErrorPath"] as? String,
-                runAtLoad: (dictionary["RunAtLoad"] as? Bool) ?? false,
-                keepAlive: parseKeepAlive(dictionary["KeepAlive"]),
-                disabled: (dictionary["Disabled"] as? Bool) ?? false,
-                manuallyDisabled: manuallyDisabled,
-                configPath: file.standardizedFileURL.resolvingSymlinksInPath().path
+        let propertyList: Any
+        do {
+            propertyList = try PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: nil
             )
         } catch {
-            return nil
+            throw ConfigurationLoadError.malformed(error.localizedDescription)
         }
+        guard let dictionary = propertyList as? [String: Any] else {
+            return .inert(
+                label: filenameLabel,
+                message: "the property-list root is not a launchd dictionary"
+            )
+        }
+
+        let plistLabel = nonEmptyString(dictionary["Label"] as? String)
+        let label = filenameLabel ?? plistLabel
+        let program = nonEmptyString(dictionary["Program"] as? String)
+        let programArguments = dictionary["ProgramArguments"] as? [String]
+        let hasProgramArguments = programArguments?.first.map { !$0.isEmpty } == true
+        guard let label, program != nil || hasProgramArguments else {
+            var missing: [String] = []
+            if label == nil {
+                missing.append("Label")
+            }
+            if program == nil, !hasProgramArguments {
+                missing.append("Program or ProgramArguments")
+            }
+            return .inert(
+                label: plistLabel,
+                message: "the plist does not define \(missing.joined(separator: " or "))"
+            )
+        }
+
+        let literalCommand: [String]
+        let literalArgv0: String?
+        if let program {
+            if let programArguments, !programArguments.isEmpty {
+                literalCommand = [program] + programArguments.dropFirst()
+                literalArgv0 = programArguments[0] == program ? nil : programArguments[0]
+            } else {
+                literalCommand = [program]
+                literalArgv0 = nil
+            }
+        } else if let programArguments, !programArguments.isEmpty {
+            literalCommand = programArguments
+            literalArgv0 = nil
+        } else {
+            literalCommand = []
+            literalArgv0 = nil
+        }
+        let observedWrapper = LaunchdWrapper.decode(programArguments ?? [])
+
+        let userName = nonEmptyString(dictionary["UserName"] as? String)
+        let groupName = nonEmptyString(dictionary["GroupName"] as? String)
+        return .runnable(ParsedConfiguration(
+            label: label,
+            schedule: parseSchedule(dictionary),
+            command: observedWrapper?.original ?? literalCommand,
+            argv0: observedWrapper?.argv0 ?? literalArgv0,
+            environment: parseEnvironment(dictionary["EnvironmentVariables"]),
+            domain: domain,
+            userName: userName,
+            groupName: groupName,
+            runNowUnavailableReason: manualRunUnavailableReason(
+                domain: domain,
+                userName: userName,
+                groupName: groupName
+            ),
+            managed: observedWrapper != nil,
+            cwd: dictionary["WorkingDirectory"] as? String,
+            standardOutPath: dictionary["StandardOutPath"] as? String,
+            standardErrorPath: dictionary["StandardErrorPath"] as? String,
+            runAtLoad: (dictionary["RunAtLoad"] as? Bool) ?? false,
+            keepAlive: parseKeepAlive(dictionary["KeepAlive"]),
+            disabled: (dictionary["Disabled"] as? Bool) ?? false,
+            manuallyDisabled: manuallyDisabled,
+            configPath: file.standardizedFileURL.resolvingSymlinksInPath().path
+        ))
+    }
+
+    private func diagnosticJob(_ diagnostic: ConfigurationDiagnostic) -> Job {
+        let provenance = provenanceClassifier.classifyConfiguration(at: diagnostic.path)
+        return Job(
+            id: jobID(label: diagnostic.label, configPath: diagnostic.path),
+            source: .launchd,
+            provenance: provenance,
+            attention: diagnostic.attention,
+            label: diagnostic.label,
+            schedule: .onDemand,
+            command: [],
+            cwd: nil,
+            enabled: false,
+            launchdDomain: diagnostic.domain,
+            runtimeStatusAttribution: .unavailable,
+            configPath: diagnostic.path,
+            lastKnownExit: nil,
+            lastRunAt: nil,
+            lastScheduledFor: nil,
+            managed: false
+        )
     }
 
     private func parseSchedule(_ dictionary: [String: Any]) -> Schedule {

@@ -344,7 +344,16 @@ private func testLaunchdAdapter(_ tests: TestHarness) throws {
 
         let adapter = LaunchdAdapter(searchDirectories: [directoryB, directoryA], commandRunner: launchdRunner)
         let jobs = try adapter.discover()
-        tests.expectEqual(jobs.count, 5, "malformed launchd plist is skipped without hiding valid siblings")
+        tests.expectEqual(
+            jobs.count,
+            6,
+            "test14_malformedLaunchdPlist_isVisibleBesideValidSiblings"
+        )
+        tests.expectEqual(
+            jobs.first { $0.label == "malformed" }?.attention?.kind,
+            "malformedConfiguration",
+            "test14_malformedLaunchdPlist_hasTypedDiagnostic"
+        )
         tests.expectEqual(Set(jobs.map(\.id)).count, jobs.count, "all discovered launchd ids are unique")
 
         let dictionaryJob = try require(
@@ -2870,6 +2879,49 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                     "test13_displayName_disambiguatesIdenticalLabelsWithinGroup"
                 )
 
+                let duplicateUserA = Job(
+                    id: "launchd:duplicate-user#a11111",
+                    source: .launchd,
+                    provenance: .yours,
+                    label: "com.example.same-label",
+                    schedule: .onDemand,
+                    command: ["/usr/bin/true"],
+                    cwd: nil,
+                    enabled: true,
+                    configPath: FileManager.default.homeDirectoryForCurrentUser
+                        .appendingPathComponent("Library/LaunchAgents/first.plist").path,
+                    lastKnownExit: nil,
+                    lastRunAt: nil,
+                    lastScheduledFor: nil,
+                    managed: false
+                )
+                let duplicateUserB = Job(
+                    id: "launchd:duplicate-user#b22222",
+                    source: .launchd,
+                    provenance: .yours,
+                    label: "com.example.same-label",
+                    schedule: .onDemand,
+                    command: ["/usr/bin/true"],
+                    cwd: nil,
+                    enabled: true,
+                    configPath: FileManager.default.homeDirectoryForCurrentUser
+                        .appendingPathComponent("Library/LaunchAgents/second.plist").path,
+                    lastKnownExit: nil,
+                    lastRunAt: nil,
+                    lastScheduledFor: nil,
+                    managed: false
+                )
+                try check(
+                    JobDisplayName.disambiguated(
+                        for: duplicateUserA,
+                        among: [duplicateUserA, duplicateUserB]
+                    ) != JobDisplayName.disambiguated(
+                        for: duplicateUserB,
+                        among: [duplicateUserA, duplicateUserB]
+                    ),
+                    "test14_displayName_sameLocationCollision_remainsUnique"
+                )
+
                 let vendorFailure = makeJob(
                     id: "launchd:vendor-failure",
                     source: .launchd,
@@ -2880,7 +2932,7 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                 )
                 model.jobs = [vendorFailure]
                 try check(
-                    !model.hasUrgentIssuesInMyJobs,
+                    !model.hasUrgentAttentionOwnedJobs,
                     "test13_vendorFailure_doesNotSetUrgentMenuBarState"
                 )
                 let missingPayload = "/tmp/test13-gone.sh"
@@ -2895,8 +2947,22 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                 )
                 model.jobs = [ownerFailure]
                 try check(
-                    model.hasUrgentIssuesInMyJobs,
+                    model.hasUrgentAttentionOwnedJobs,
                     "test13_ownerMissingPayload_setsUrgentMenuBarState"
+                )
+                let unknownFailure = makeJob(
+                    id: "launchd:unknown-missing",
+                    source: .launchd,
+                    provenance: .unknown("no third-party proof"),
+                    attention: .missingPayload("/usr/local/bin/missing-user-tool"),
+                    environment: [:],
+                    command: ["/usr/local/bin/missing-user-tool"],
+                    enabled: false
+                )
+                model.jobs = [unknownFailure]
+                try check(
+                    model.hasUrgentAttentionOwnedJobs,
+                    "test14_unattributedBrokenJob_setsUrgentMenuBarState"
                 )
 
                 print("APP HARNESS PASS")
@@ -5954,15 +6020,15 @@ private func test13_ProvenanceClassificationAndCaching(_ tests: TestHarness) thr
             .system,
             "test13_systemPrefix_isSystem"
         )
-        if case .unknown = classifier.classify(
-            source: .launchd,
-            command: ["/usr/bin/plain-tool"],
-            configPath: root.appendingPathComponent("unknown.plist").path
-        ).provenance {
-            tests.expect(true, "test13_unattributedBinary_hasTypedUnknownReason")
-        } else {
-            tests.expect(false, "test13_unattributedBinary_hasTypedUnknownReason")
-        }
+        tests.expectEqual(
+            classifier.classify(
+                source: .launchd,
+                command: ["/usr/bin/plain-tool"],
+                configPath: root.appendingPathComponent("system-program.plist").path
+            ).provenance,
+            .system,
+            "test14_usrBinPath_isPositiveSystemProof"
+        )
         tests.expectEqual(
             classifier.classify(source: .crontab, command: [], configPath: nil).provenance,
             .yours,
@@ -6139,9 +6205,8 @@ private func test13_UIArchitectureContract(_ tests: TestHarness) throws {
         "test13_detail_usesReviewedPathAndActionPresentation"
     )
     tests.expect(
-        appSource.contains("job.provenance == .yours")
-            || appSource.contains("model.hasUrgentIssuesInMyJobs"),
-        "test13_menuBarFailure_isScopedToMyJobs"
+        appSource.contains("model.hasUrgentAttentionOwnedJobs"),
+        "test14_menuBarFailure_includesUnattributedJobs"
     )
     tests.expect(
         listSource.contains("job.command.joined")
@@ -6173,6 +6238,641 @@ private func test13_UIArchitectureContract(_ tests: TestHarness) throws {
     )
 }
 
+private func test14_ProvenanceFailsTowardVisibility(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round14-provenance") { root in
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let bin = home.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let userScript = bin.appendingPathComponent("backup.py")
+        try Data("print('backup')\n".utf8).write(to: userScript)
+        let plist = root.appendingPathComponent("job.plist")
+        try Data("plist".utf8).write(to: plist)
+
+        let signedInterpreter = root.appendingPathComponent("python3")
+        try Data("python".utf8).write(to: signedInterpreter)
+        var signatureCalls = 0
+        let classifier = JobProvenanceClassifier(homeDirectory: home) { _, arguments in
+            signatureCalls += 1
+            if arguments.contains("--verify") {
+                return AdapterCommandResult(status: 0, stdout: "", stderr: "valid")
+            }
+            if arguments.last == signedInterpreter.path {
+                return AdapterCommandResult(
+                    status: 0,
+                    stdout: "",
+                    stderr: "Authority=Developer ID Application: Vendor Tools LLC (TEAM123)\n"
+                )
+            }
+            return AdapterCommandResult(status: 1, stdout: "", stderr: "unsigned")
+        }
+
+        tests.expectEqual(
+            classifier.classify(
+                source: .launchd,
+                command: ["/opt/homebrew/bin/python3", userScript.path],
+                configPath: plist.path
+            ).provenance,
+            .yours,
+            "test14_homebrewInterpreter_userPayloadWins"
+        )
+        tests.expectEqual(
+            classifier.classify(
+                source: .launchd,
+                command: [signedInterpreter.path, userScript.path],
+                configPath: root.appendingPathComponent("signed-interpreter.plist").path
+            ).provenance,
+            .yours,
+            "test14_signedInterpreter_userPayloadWins"
+        )
+        tests.expectEqual(
+            classifier.classify(
+                source: .launchd,
+                command: [
+                    "/Applications/VendorPython.app/Contents/MacOS/python3",
+                    userScript.path,
+                ],
+                configPath: root.appendingPathComponent("vendor-interpreter.plist").path
+            ).provenance,
+            .yours,
+            "test14_vendorPathInterpreter_userPayloadWins"
+        )
+
+        let direct = bin.appendingPathComponent("nightly")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: direct)
+        let directPlist = root.appendingPathComponent("direct.plist")
+        try Data("direct".utf8).write(to: directPlist)
+        let healthy = classifier.classify(
+            source: .launchd,
+            command: [direct.path],
+            configPath: directPlist.path
+        )
+        tests.expectEqual(
+            healthy.provenance,
+            .yours,
+            "test14_bareHomeExecutable_isYours"
+        )
+        tests.expectEqual(
+            healthy.attention,
+            nil,
+            "test14_bareHomeExecutable_exists"
+        )
+        try FileManager.default.removeItem(at: direct)
+        let deleted = classifier.classify(
+            source: .launchd,
+            command: [direct.path],
+            configPath: directPlist.path
+        )
+        tests.expectEqual(
+            deleted.attention,
+            .missingPayload(direct.path),
+            "test14_deletedPayload_recheckedWithoutRestart"
+        )
+
+        let restored = Data("#!/bin/sh\nexit 0\n".utf8)
+        try restored.write(to: direct)
+        tests.expectEqual(
+            classifier.classify(
+                source: .launchd,
+                command: [direct.path],
+                configPath: directPlist.path
+            ).attention,
+            nil,
+            "test14_restoredPayload_recheckedWithoutRestart"
+        )
+
+        let output = home.appendingPathComponent("output.json")
+        tests.expectEqual(
+            classifier.classify(
+                source: .launchd,
+                command: ["/usr/bin/curl", "-o", output.path, "https://example.com/data"],
+                configPath: root.appendingPathComponent("curl.plist").path
+            ).attention,
+            nil,
+            "test14_arbitraryAbsoluteArgument_isNotPayload"
+        )
+
+        if case .unknown = classifier.classify(
+            source: .launchd,
+            command: ["/opt/custom/nightly"],
+            configPath: root.appendingPathComponent("opt-custom.plist").path
+        ).provenance {
+            tests.expect(true, "test14_unprovedOptPath_isUnattributed")
+        } else {
+            tests.expect(false, "test14_unprovedOptPath_isUnattributed")
+        }
+        tests.expectEqual(
+            classifier.classify(
+                source: .launchd,
+                command: ["/opt/local/bin/port-job"],
+                configPath: root.appendingPathComponent("macports.plist").path
+            ).provenance,
+            .packageManager("MacPorts"),
+            "test14_macPorts_hasCorrectPackageManagerName"
+        )
+
+        let displayOnlyProgram = root.appendingPathComponent("Damaged Signature")
+        try Data("damaged".utf8).write(to: displayOnlyProgram)
+        let strictClassifier = JobProvenanceClassifier(homeDirectory: home) { _, arguments in
+            if arguments.contains("--verify") {
+                return AdapterCommandResult(status: 1, stdout: "", stderr: "invalid signature")
+            }
+            return AdapterCommandResult(
+                status: 0,
+                stdout: "",
+                stderr: "Authority=Developer ID Application: Stale Vendor LLC (STALE123)\n"
+            )
+        }
+        if case .app = strictClassifier.classify(
+            source: .launchd,
+            command: [displayOnlyProgram.path],
+            configPath: root.appendingPathComponent("damaged.plist").path
+        ).provenance {
+            tests.expect(false, "test14_damagedSignature_isNotTrusted")
+        } else {
+            tests.expect(true, "test14_damagedSignature_isNotTrusted")
+        }
+
+        let symlinkTarget = root.appendingPathComponent("symlink-target")
+        let symlinkProgram = root.appendingPathComponent("symlink-program")
+        try Data("one".utf8).write(to: symlinkTarget)
+        try FileManager.default.createSymbolicLink(at: symlinkProgram, withDestinationURL: symlinkTarget)
+        var symlinkProbes = 0
+        let symlinkClassifier = JobProvenanceClassifier(homeDirectory: home) { _, arguments in
+            if arguments.contains("--verify") {
+                return AdapterCommandResult(status: 0, stdout: "", stderr: "valid")
+            }
+            symlinkProbes += 1
+            let data = (try? Data(contentsOf: symlinkProgram)) ?? Data()
+            let vendor = data.count > 3 ? "Vendor Two" : "Vendor One"
+            return AdapterCommandResult(
+                status: 0,
+                stdout: "",
+                stderr: "Authority=Developer ID Application: \(vendor) (TEAM123)\n"
+            )
+        }
+        let symlinkPlist = root.appendingPathComponent("symlink.plist")
+        try Data("symlink".utf8).write(to: symlinkPlist)
+        tests.expectEqual(
+            symlinkClassifier.classify(
+                source: .launchd,
+                command: [symlinkProgram.path],
+                configPath: symlinkPlist.path
+            ).provenance,
+            .app("Vendor One"),
+            "test14_symlinkTarget_firstClassification"
+        )
+        try Data("replacement-target".utf8).write(to: symlinkTarget)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: 2)],
+            ofItemAtPath: symlinkTarget.path
+        )
+        tests.expectEqual(
+            symlinkClassifier.classify(
+                source: .launchd,
+                command: [symlinkProgram.path],
+                configPath: symlinkPlist.path
+            ).provenance,
+            .app("Vendor Two"),
+            "test14_symlinkTargetChange_invalidatesProvenanceCache"
+        )
+        tests.expectEqual(symlinkProbes, 2, "test14_symlinkTargetChange_reprobesSignature")
+        tests.expect(signatureCalls > 0, "test14_signatureFixtures_exerciseSignaturePath")
+
+        let actualHome = root.appendingPathComponent("actual-home", isDirectory: true)
+        let linkedHome = root.appendingPathComponent("linked-home", isDirectory: true)
+        let linkedHomeBin = actualHome.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: linkedHomeBin, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: linkedHome, withDestinationURL: actualHome)
+        let linkedHomeScript = linkedHomeBin.appendingPathComponent("nightly")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: linkedHomeScript)
+        let linkedHomeClassifier = JobProvenanceClassifier(homeDirectory: linkedHome) { _, _ in
+            AdapterCommandResult(status: 1, stdout: "", stderr: "unsigned")
+        }
+        tests.expectEqual(
+            linkedHomeClassifier.classify(
+                source: .launchd,
+                command: [linkedHomeScript.path],
+                configPath: root.appendingPathComponent("linked-home.plist").path
+            ).provenance,
+            .yours,
+            "test14_symlinkedHome_resolvedPayloadRemainsYours"
+        )
+
+        for attention in [
+            JobAttention.malformedConfiguration(path: plist.path, message: "malformed XML"),
+            JobAttention.inertConfiguration(path: plist.path, message: "no runnable keys"),
+            JobAttention.unreadableConfiguration(path: plist.path, message: "permission denied"),
+        ] {
+            tests.expectEqual(
+                try JSONDecoder().decode(
+                    JobAttention.self,
+                    from: JSONEncoder().encode(attention)
+                ),
+                attention,
+                "test14_newAttentionState_roundTripsThroughCodable"
+            )
+        }
+    }
+}
+
+private func test14_LaunchdFormsAndDiagnostics(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round14-launchd") { root in
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let agents = home.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+        let bin = home.appendingPathComponent("bin", isDirectory: true)
+        let work = home.appendingPathComponent("jobs", isDirectory: true)
+        try FileManager.default.createDirectory(at: agents, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        let shellPayload = bin.appendingPathComponent("nightly")
+        let relativePayload = work.appendingPathComponent("relative.sh")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: shellPayload)
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: relativePayload)
+
+        try writePropertyList(
+            [
+                "Label": "com.example.test14.shell-c",
+                "ProgramArguments": ["/bin/sh", "-c", "$HOME/bin/nightly --quiet"],
+                "EnvironmentVariables": ["HOME": home.path],
+            ],
+            to: agents.appendingPathComponent("shell-c.plist")
+        )
+        try writePropertyList(
+            [
+                "Label": "com.example.test14.relative",
+                "ProgramArguments": ["/bin/sh", "relative.sh"],
+                "WorkingDirectory": work.path,
+            ],
+            to: agents.appendingPathComponent("relative.plist")
+        )
+        try writePropertyList(
+            ["Label": "com.example.test14.empty"],
+            to: agents.appendingPathComponent("empty.plist")
+        )
+        try writePropertyList(
+            [
+                "Label": "com.example.test14.shell-builtin",
+                "ProgramArguments": [
+                    "/bin/sh", "-c", "echo ready > /Users/example/status.txt",
+                ],
+            ],
+            to: agents.appendingPathComponent("shell-builtin.plist")
+        )
+
+        let adapter = LaunchdAdapter(
+            searchDirectories: [agents],
+            homeDirectory: home
+        ) { _, _ in
+            AdapterCommandResult(status: 1, stdout: "", stderr: "not loaded")
+        }
+        let jobs = try adapter.discover()
+        let shellJob = try require(
+            jobs.first { $0.label == "com.example.test14.shell-c" },
+            "test14 shell -c job"
+        )
+        tests.expectEqual(shellJob.provenance, .yours, "test14_shellC_homePayload_isYours")
+        tests.expectEqual(shellJob.attention, nil, "test14_shellC_statsExecutableNotCommandString")
+
+        let relativeJob = try require(
+            jobs.first { $0.label == "com.example.test14.relative" },
+            "test14 relative job"
+        )
+        tests.expectEqual(
+            relativeJob.provenance,
+            .yours,
+            "test14_relativePayload_resolvesAgainstWorkingDirectory"
+        )
+        tests.expectEqual(relativeJob.attention, nil, "test14_relativePayload_exists")
+
+        let emptyJob = try require(
+            jobs.first { $0.label == "com.example.test14.empty" },
+            "test14 empty-command job"
+        )
+        tests.expectEqual(emptyJob.provenance, .yours, "test14_emptyUserAgent_staysOwned")
+        tests.expectEqual(
+            emptyJob.attention?.kind,
+            "inertConfiguration",
+            "test14_emptyCommand_isExplicitInertState"
+        )
+        let shellBuiltin = try require(
+            jobs.first { $0.label == "com.example.test14.shell-builtin" },
+            "test14 shell builtin job"
+        )
+        tests.expectEqual(
+            shellBuiltin.attention,
+            nil,
+            "test14_shellC_doesNotStatAbsoluteRedirectionTarget"
+        )
+
+        let directPayload = bin.appendingPathComponent("direct-nightly")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: directPayload)
+        try writePropertyList(
+            [
+                "Label": "com.example.test14.live-delete",
+                "ProgramArguments": [directPayload.path],
+            ],
+            to: agents.appendingPathComponent("live-delete.plist")
+        )
+        let healthyAttention = try adapter.discover()
+            .first { $0.label == "com.example.test14.live-delete" }?.attention
+        tests.expectEqual(
+            healthyAttention,
+            nil,
+            "test14_liveAdapter_payloadInitiallyHealthy"
+        )
+        try FileManager.default.removeItem(at: directPayload)
+        let deletedAttention = try adapter.discover()
+            .first { $0.label == "com.example.test14.live-delete" }?.attention
+        tests.expectEqual(
+            deletedAttention,
+            .missingPayload(directPayload.path),
+            "test14_liveAdapter_deleteBecomesBrokenWithoutRestart"
+        )
+        print(
+            "TRANSCRIPT test14 live-delete first=\(healthyAttention?.kind ?? "none") "
+                + "second=\(deletedAttention?.kind ?? "none") adapter=same-instance"
+        )
+    }
+
+    try withTemporaryDirectory("round14-malformed") { root in
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let agents = home.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+        try FileManager.default.createDirectory(at: agents, withIntermediateDirectories: true)
+        let malformed = agents.appendingPathComponent("malformed-local-job.plist")
+        try Data("<?xml version=\"1.0\"?><plist><dict>".utf8).write(to: malformed)
+        let adapter = LaunchdAdapter(
+            searchDirectories: [agents],
+            homeDirectory: home
+        ) { _, _ in
+            AdapterCommandResult(status: 1, stdout: "", stderr: "not loaded")
+        }
+        let jobs = try adapter.discover()
+        let diagnostic = try require(jobs.first, "test14 malformed diagnostic job")
+        tests.expectEqual(jobs.count, 1, "test14_malformedPlist_producesVisibleEntry")
+        tests.expectEqual(
+            diagnostic.provenance,
+            .yours,
+            "test14_malformedUserLaunchAgent_isConservativelyYours"
+        )
+        tests.expectEqual(
+            diagnostic.attention?.kind,
+            "malformedConfiguration",
+            "test14_malformedPlist_isUrgentMalformedConfiguration"
+        )
+        tests.expectEqual(
+            diagnostic.configPath,
+            malformed.path,
+            "test14_malformedPlist_preservesDiagnosticPath"
+        )
+        print(
+            "TRANSCRIPT test14 malformed count=\(jobs.count) "
+                + "provenance=\(diagnostic.provenance) "
+                + "attention=\(diagnostic.attention?.kind ?? "none") "
+                + "path=\(diagnostic.configPath ?? "none")"
+        )
+    }
+
+    try withTemporaryDirectory("round14-unreadable-directory") { root in
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let agents = home.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+        try FileManager.default.createDirectory(at: agents, withIntermediateDirectories: true)
+        guard Darwin.chmod(agents.path, 0) == 0 else {
+            throw FixtureError.missing("test14 chmod unreadable directory")
+        }
+        defer { _ = Darwin.chmod(agents.path, S_IRWXU) }
+        let adapter = LaunchdAdapter(
+            searchDirectories: [agents],
+            homeDirectory: home
+        ) { _, _ in
+            AdapterCommandResult(status: 1, stdout: "", stderr: "not loaded")
+        }
+        let jobs = try adapter.discover()
+        tests.expectEqual(jobs.count, 1, "test14_unreadableDirectory_producesVisibleEntry")
+        tests.expectEqual(
+            jobs.first?.attention?.kind,
+            "unreadableConfiguration",
+            "test14_unreadableDirectory_hasInformationalConfigurationState"
+        )
+        tests.expectEqual(
+            jobs.first?.provenance,
+            .yours,
+            "test14_unreadableUserLaunchAgentsDirectory_isConservativelyYours"
+        )
+    }
+}
+
+private func test15_ConfigurationStatesAndFilenameProvenance(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round15-configuration-states") { root in
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let agents = home.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+        let daemons = root.appendingPathComponent("Library/LaunchDaemons", isDirectory: true)
+        try FileManager.default.createDirectory(at: agents, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: daemons, withIntermediateDirectories: true)
+
+        let malformed = agents.appendingPathComponent("broken-local-job.plist")
+        try Data("<?xml version=\"1.0\"?><plist><dict>".utf8).write(to: malformed)
+        tests.expect(
+            FileManager.default.isReadableFile(atPath: malformed.path),
+            "test15_malformedFixture_isReadable"
+        )
+
+        let inertFixtures: [(String, JobProvenance)] = [
+            ("com.google.keystone.agent.plist", .app("Google")),
+            ("com.google.keystone.xpcservice.plist", .app("Google")),
+            ("io.island.keystone.agent.plist", .app("Island")),
+            ("io.island.keystone.xpcservice.plist", .app("Island")),
+            ("org.acme.helper.plist", .app("Acme")),
+            ("com.home.local-stub.plist", .yours),
+        ]
+        for (filename, _) in inertFixtures {
+            try writePropertyList([:], to: agents.appendingPathComponent(filename))
+        }
+
+        let unreadable = daemons.appendingPathComponent(
+            "com.microsoft.teams.TeamsUpdaterDaemon.plist"
+        )
+        try writePropertyList(
+            [
+                "Label": "com.microsoft.teams.TeamsUpdaterDaemon",
+                "ProgramArguments": ["/Library/Application Support/Microsoft/TeamsUpdater"],
+            ],
+            to: unreadable
+        )
+        guard Darwin.chmod(unreadable.path, 0) == 0 else {
+            throw FixtureError.missing("test15 chmod unreadable daemon")
+        }
+        defer { _ = Darwin.chmod(unreadable.path, S_IRUSR | S_IWUSR) }
+        tests.expect(
+            !FileManager.default.isReadableFile(atPath: unreadable.path),
+            "test15_unreadableFixture_deniesNormalRead"
+        )
+
+        let adapter = LaunchdAdapter(
+            searchDirectories: [agents, daemons],
+            homeDirectory: home
+        ) { _, _ in
+            AdapterCommandResult(status: 1, stdout: "", stderr: "not loaded")
+        }
+        let jobs = try adapter.discover()
+        tests.expectEqual(
+            jobs.count,
+            inertFixtures.count + 2,
+            "test15_allMalformedInertAndUnreadableEntries_stayDiscoverable"
+        )
+
+        let malformedJob = try require(
+            jobs.first { $0.configPath == malformed.path },
+            "test15 malformed job"
+        )
+        tests.expectEqual(
+            malformedJob.attention?.kind,
+            "malformedConfiguration",
+            "test15_malformedReadablePlist_hasMalformedState"
+        )
+        tests.expectEqual(
+            malformedJob.provenance,
+            .yours,
+            "test15_handBrokenPlistWithoutVendorIdentity_fallsBackToOwnerLocation"
+        )
+        tests.expect(
+            malformedJob.isBroken,
+            "test15_malformedReadablePlist_isBrokenAndAlerts"
+        )
+
+        for (filename, expectedProvenance) in inertFixtures {
+            let path = agents.appendingPathComponent(filename).path
+            let job = try require(
+                jobs.first { $0.configPath == path },
+                "test15 inert job \(filename)"
+            )
+            tests.expectEqual(
+                job.attention?.kind,
+                "inertConfiguration",
+                "test15_inert_\(filename)_hasInertState"
+            )
+            tests.expectEqual(
+                job.provenance,
+                expectedProvenance,
+                "test15_inert_\(filename)_usesFilenameIdentityBeforeLocation"
+            )
+            tests.expect(
+                !job.isBroken,
+                "test15_inert_\(filename)_isQuiet"
+            )
+        }
+
+        let unreadableJob = try require(
+            jobs.first { $0.configPath == unreadable.path },
+            "test15 unreadable job"
+        )
+        tests.expectEqual(
+            unreadableJob.attention?.kind,
+            "unreadableConfiguration",
+            "test15_permissionDeniedPlist_hasUnreadableState"
+        )
+        tests.expectEqual(
+            unreadableJob.provenance,
+            .app("Microsoft"),
+            "test15_permissionDeniedVendorPlist_usesFilenameVendor"
+        )
+        tests.expect(
+            !unreadableJob.isBroken,
+            "test15_permissionDeniedPlist_isQuiet"
+        )
+        tests.expect(
+            unreadableJob.attention?.detail.localizedCaseInsensitiveContains("elevated access")
+                == true,
+            "test15_permissionDeniedPlist_plainlyExplainsElevatedAccess"
+        )
+        tests.expectEqual(
+            jobs.filter(\.isBroken).count,
+            1,
+            "test15_onlyMalformedConfigurationAlertsAcrossThreeStates"
+        )
+    }
+}
+
+private func test15_InformationalStatePresentationContract(_ tests: TestHarness) throws {
+    let repository = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let modelSource = try String(
+        contentsOf: repository.appendingPathComponent("Sources/TickerCore/Models.swift"),
+        encoding: .utf8
+    )
+    let appModelSource = try String(
+        contentsOf: repository.appendingPathComponent("Sources/TickerApp/AppModel.swift"),
+        encoding: .utf8
+    )
+    let listSource = try String(
+        contentsOf: repository.appendingPathComponent("Sources/TickerApp/JobListView.swift"),
+        encoding: .utf8
+    )
+    let detailSource = try String(
+        contentsOf: repository.appendingPathComponent("Sources/TickerApp/JobDetailView.swift"),
+        encoding: .utf8
+    )
+    tests.expect(
+        modelSource.contains("attention?.requiresAttention ?? false"),
+        "test15_isBroken_usesTypedAttentionSeverity"
+    )
+    tests.expect(
+        appModelSource.contains("if job.isBroken"),
+        "test15_appAttention_usesBrokenStateInsteadOfDiagnosticPresence"
+    )
+    tests.expect(
+        listSource.contains("attention.requiresAttention"),
+        "test15_jobList_rendersInformationalDiagnosticsQuietly"
+    )
+    tests.expect(
+        detailSource.contains("attention.requiresAttention"),
+        "test15_jobDetail_rendersInformationalDiagnosticsQuietly"
+    )
+}
+
+private func test14_UISafetyContract(_ tests: TestHarness) throws {
+    let repository = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let listSource = try String(
+        contentsOf: repository.appendingPathComponent("Sources/TickerApp/JobListView.swift"),
+        encoding: .utf8
+    )
+    let modelSource = try String(
+        contentsOf: repository.appendingPathComponent("Sources/TickerApp/AppModel.swift"),
+        encoding: .utf8
+    )
+    tests.expect(
+        listSource.contains("Section(\"Needs Review\")")
+            && !listSource.contains("subgroupHeader(\"Unknown Owners\"")
+            && listSource.contains("unattributedJobs"),
+        "test14_unattributedJobs_haveVisibleTopLevelGroup"
+    )
+    tests.expect(
+        listSource.contains("matchingJobs.first { $0.id == selectedJobID }")
+            && listSource.contains("onChange(of: searchText)"),
+        "test14_search_reconcilesHiddenSelection"
+    )
+    tests.expect(
+        listSource.contains("allYourJobs.isEmpty && !allOtherJobs.isEmpty"),
+        "test14_onlyOtherJobs_autoExpandsVisibleRows"
+    )
+    tests.expect(
+        listSource.contains("lastPathComponent")
+            && listSource.contains("shortID")
+            && listSource.contains("let now = Date()")
+            && listSource.contains("nextFire(after: now"),
+        "test14_displayCollisionsAndSortBoundary_areDeterministic"
+    )
+    tests.expect(
+        modelSource.contains("provenance.isAttentionOwned")
+            && modelSource.contains("needsAttention($0)"),
+        "test14_unattributedBrokenJob_canReddenMenuBar"
+    )
+    tests.expect(
+        modelSource.contains("RunStorePathPolicy.configuredPath")
+            && modelSource.contains("TICKER_TEST_BACKUP_DIRECTORY")
+            && modelSource.contains("#if TICKER_TESTING"),
+        "test14_testBuild_canFullyIsolateAppSmokeState"
+    )
+}
+
 
 @main
 private enum TickerTests {
@@ -6200,12 +6900,44 @@ private enum TickerTests {
             }
             tests.finish()
         }
+        if ProcessInfo.processInfo.environment["TICKER_TEST14_ONLY"] == "1" {
+            let tests = TestHarness()
+            tests.run("round 14 provenance failure direction") {
+                try test14_ProvenanceFailsTowardVisibility(tests)
+            }
+            tests.run("round 14 launchd forms and diagnostics") {
+                try test14_LaunchdFormsAndDiagnostics(tests)
+            }
+            tests.run("round 14 UI safety contract") {
+                try test14_UISafetyContract(tests)
+            }
+            tests.finish()
+        }
+        if ProcessInfo.processInfo.environment["TICKER_TEST15_ONLY"] == "1" {
+            let tests = TestHarness()
+            tests.run("round 15 configuration states and filename provenance") {
+                try test15_ConfigurationStatesAndFilenameProvenance(tests)
+            }
+            tests.run("round 15 informational state presentation") {
+                try test15_InformationalStatePresentationContract(tests)
+            }
+            tests.finish()
+        }
         let tests = TestHarness()
         tests.run("round 13 provenance classification and cache") {
             try test13_ProvenanceClassificationAndCaching(tests)
         }
         tests.run("round 13 CLI missing payload") {
             try test13_CLISurfacesMissingPayload(tests)
+        }
+        tests.run("round 14 provenance failure direction") {
+            try test14_ProvenanceFailsTowardVisibility(tests)
+        }
+        tests.run("round 14 launchd forms and diagnostics") {
+            try test14_LaunchdFormsAndDiagnostics(tests)
+        }
+        tests.run("round 15 configuration states and filename provenance") {
+            try test15_ConfigurationStatesAndFilenameProvenance(tests)
         }
         tests.run("ExitStatus tests") { testExitStatus(tests) }
         tests.run("cron and schedule tests") { try testCronAndSchedules(tests) }
@@ -6331,6 +7063,12 @@ private enum TickerTests {
         }
         tests.run("round 13 provenance-first UI architecture") {
             try test13_UIArchitectureContract(tests)
+        }
+        tests.run("round 14 UI safety contract") {
+            try test14_UISafetyContract(tests)
+        }
+        tests.run("round 15 informational state presentation") {
+            try test15_InformationalStatePresentationContract(tests)
         }
         tests.finish()
     }

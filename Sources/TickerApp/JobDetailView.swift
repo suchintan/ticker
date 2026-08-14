@@ -120,12 +120,19 @@ struct JobDetailView: View {
 
     private var healthSummary: some View {
         Group {
-            if case .missingPayload(let path) = job.attention {
+            if let attention = job.attention, attention.requiresAttention {
                 HealthSummaryView(
                     color: .red,
                     icon: "xmark.circle.fill",
                     title: "This job cannot run",
-                    detail: "Its payload is missing at \(path)."
+                    detail: attention.detail
+                )
+            } else if let attention = job.attention {
+                HealthSummaryView(
+                    color: .secondary,
+                    icon: "info.circle",
+                    title: attention.summary,
+                    detail: attention.detail
                 )
             } else if !job.enabled {
                 HealthSummaryView(
@@ -171,12 +178,14 @@ struct JobDetailView: View {
 
     @ViewBuilder
     private var actionableAlerts: some View {
-        if case .missingPayload(let path) = job.attention {
+        if let attention = job.attention {
             DetailCallout(
-                color: .red,
-                icon: "exclamationmark.triangle.fill",
-                title: "Missing payload",
-                detail: "Ticker found the job, but \(path) does not exist. Restore the file or update the plist command."
+                color: attention.requiresAttention ? .red : .secondary,
+                icon: attention.requiresAttention
+                    ? "exclamationmark.triangle.fill"
+                    : "info.circle",
+                title: attentionCalloutTitle(attention),
+                detail: attentionCalloutDetail(attention)
             )
         }
 
@@ -218,6 +227,32 @@ struct JobDetailView: View {
             )
         } else {
             wrapperAlert
+        }
+    }
+
+    private func attentionCalloutTitle(_ attention: JobAttention) -> String {
+        switch attention {
+        case .missingPayload:
+            return "Missing payload"
+        case .malformedConfiguration:
+            return "Malformed configuration"
+        case .inertConfiguration:
+            return "Inert configuration"
+        case .unreadableConfiguration:
+            return "Unreadable configuration"
+        }
+    }
+
+    private func attentionCalloutDetail(_ attention: JobAttention) -> String {
+        switch attention {
+        case .missingPayload(let path):
+            return "Ticker found the job, but \(path) does not exist. Restore the file or update the plist command."
+        case .malformedConfiguration(let path, let message):
+            return "Ticker found \(path), but it is not a valid property list: \(message)"
+        case .inertConfiguration:
+            return attention.detail
+        case .unreadableConfiguration:
+            return attention.detail
         }
     }
 

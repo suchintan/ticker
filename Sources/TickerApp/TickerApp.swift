@@ -40,11 +40,11 @@ private struct MenuBarStatusIcon: View {
         if model.jobs.isEmpty {
             Image(systemName: "clock.badge.questionmark")
                 .accessibilityLabel("Ticker found no scheduled jobs")
-        } else if model.hasUrgentIssuesInMyJobs {
+        } else if model.hasUrgentAttentionOwnedJobs {
             Image(systemName: "exclamationmark.triangle.fill")
                 .symbolRenderingMode(.monochrome)
                 .foregroundColor(.red)
-                .accessibilityLabel("Ticker found one of your jobs needs attention")
+                .accessibilityLabel("Ticker found a job that needs attention")
         } else {
             Image(systemName: "clock")
                 .accessibilityLabel("Your Ticker jobs have no known issues")

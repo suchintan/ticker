@@ -41,6 +41,19 @@ public enum JobProvenance: Hashable {
     public var isYours: Bool {
         self == .yours
     }
+
+    public var isAttentionOwned: Bool {
+        switch self {
+        case .yours, .unknown:
+            return true
+        case .app, .packageManager, .system:
+            return false
+        }
+    }
+
+    public var isConfirmedThirdParty: Bool {
+        !isAttentionOwned
+    }
 }
 
 extension JobProvenance: Codable {
@@ -88,17 +101,30 @@ extension JobProvenance: Codable {
 
 public enum JobAttention: Hashable {
     case missingPayload(String)
+    case malformedConfiguration(path: String, message: String)
+    case inertConfiguration(path: String, message: String)
+    case unreadableConfiguration(path: String, message: String)
 
     public var kind: String {
         switch self {
         case .missingPayload:
             return "missingPayload"
+        case .malformedConfiguration:
+            return "malformedConfiguration"
+        case .inertConfiguration:
+            return "inertConfiguration"
+        case .unreadableConfiguration:
+            return "unreadableConfiguration"
         }
     }
 
     public var path: String {
         switch self {
         case .missingPayload(let path):
+            return path
+        case .malformedConfiguration(let path, _),
+             .inertConfiguration(let path, _),
+             .unreadableConfiguration(let path, _):
             return path
         }
     }
@@ -107,6 +133,56 @@ public enum JobAttention: Hashable {
         switch self {
         case .missingPayload:
             return "Missing payload"
+        case .malformedConfiguration:
+            return "Malformed configuration"
+        case .inertConfiguration:
+            return "Inert configuration"
+        case .unreadableConfiguration:
+            return "Unreadable configuration"
+        }
+    }
+
+    public var requiresAttention: Bool {
+        switch self {
+        case .missingPayload, .malformedConfiguration:
+            return true
+        case .inertConfiguration, .unreadableConfiguration:
+            return false
+        }
+    }
+
+    public var isConfigurationDiagnostic: Bool {
+        switch self {
+        case .missingPayload:
+            return false
+        case .malformedConfiguration, .inertConfiguration, .unreadableConfiguration:
+            return true
+        }
+    }
+
+    public var detail: String {
+        switch self {
+        case .missingPayload(let path):
+            return "The job's payload does not exist at \(path)."
+        case .malformedConfiguration(let path, let message):
+            return "Ticker found \(path), but it is not a valid property list: \(message)"
+        case .inertConfiguration(let path, let message):
+            return "\(path) is a valid property list, but it does not declare a runnable launchd job: \(message). It is inert and will not run."
+        case .unreadableConfiguration(let path, let message):
+            return "Ticker cannot inspect \(path) without elevated access: \(message)"
+        }
+    }
+
+    public var diagnosticDescription: String {
+        switch self {
+        case .missingPayload(let path):
+            return "missing payload at \(path)"
+        case .malformedConfiguration(let path, let message):
+            return "malformed configuration at \(path): \(message)"
+        case .inertConfiguration(let path, let message):
+            return "inert configuration at \(path): \(message)"
+        case .unreadableConfiguration(let path, let message):
+            return "unreadable configuration at \(path): elevated access is required (\(message))"
         }
     }
 }
@@ -115,6 +191,7 @@ extension JobAttention: Codable {
     private enum CodingKeys: String, CodingKey {
         case kind
         case path
+        case message
     }
 
     public init(from decoder: Decoder) throws {
@@ -122,6 +199,31 @@ extension JobAttention: Codable {
         switch try container.decode(String.self, forKey: .kind) {
         case "missingPayload":
             self = .missingPayload(try container.decode(String.self, forKey: .path))
+        case "malformedConfiguration":
+            self = .malformedConfiguration(
+                path: try container.decode(String.self, forKey: .path),
+                message: try container.decode(String.self, forKey: .message)
+            )
+        case "inertConfiguration":
+            self = .inertConfiguration(
+                path: try container.decode(String.self, forKey: .path),
+                message: try container.decode(String.self, forKey: .message)
+            )
+        case "unreadableConfiguration":
+            self = .unreadableConfiguration(
+                path: try container.decode(String.self, forKey: .path),
+                message: try container.decode(String.self, forKey: .message)
+            )
+        case "missingCommand":
+            self = .inertConfiguration(
+                path: try container.decode(String.self, forKey: .path),
+                message: "the plist does not define Program or ProgramArguments"
+            )
+        case "brokenConfiguration":
+            self = .malformedConfiguration(
+                path: try container.decode(String.self, forKey: .path),
+                message: try container.decode(String.self, forKey: .message)
+            )
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .kind,
@@ -135,6 +237,14 @@ extension JobAttention: Codable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(kind, forKey: .kind)
         try container.encode(path, forKey: .path)
+        switch self {
+        case .malformedConfiguration(_, let message),
+             .inertConfiguration(_, let message),
+             .unreadableConfiguration(_, let message):
+            try container.encode(message, forKey: .message)
+        case .missingPayload:
+            break
+        }
     }
 }
 
@@ -157,11 +267,28 @@ internal final class JobProvenanceClassifier {
         let plist: FileIdentity
         let program: FileIdentity
         let command: [String]
+        let workingDirectory: String?
+        let environment: [String]
     }
 
     private struct CacheEntry {
         let key: CacheKey
-        let classification: JobClassification
+        let resolution: LaunchdResolution
+    }
+
+    private struct LaunchdResolution {
+        let provenance: JobProvenance
+        let payload: String?
+    }
+
+    private enum InterpreterKind {
+        case shell
+        case python
+        case ruby
+        case perl
+        case node
+        case osascript
+        case open
     }
 
     private static let packageManagerPrefixes = [
@@ -175,16 +302,31 @@ internal final class JobProvenanceClassifier {
         "/Applications/",
         "/Library/Application Support/",
         "/Library/PrivilegedHelperTools/",
-        "/Library/Scripts/",
+        "/Library/Scripts/Videostream/",
         "/var/lib/",
-        "/opt/",
     ]
 
     private static let systemPrefixes = [
         "/System/",
         "/usr/libexec/",
+        "/usr/bin/",
         "/usr/sbin/",
+        "/bin/",
         "/sbin/",
+    ]
+
+    private static let shellNames: Set<String> = [
+        "bash", "dash", "fish", "ksh", "sh", "tcsh", "zsh",
+    ]
+
+    private static let reverseDNSRoots: Set<String> = [
+        "ai", "app", "co", "com", "dev", "io", "me", "net", "org",
+    ]
+
+    private static let filenameVendorDisplayNames = [
+        "google": "Google",
+        "island": "Island",
+        "microsoft": "Microsoft",
     ]
 
     // macOS can redact Authority while still returning the signature's TeamIdentifier.
@@ -205,6 +347,7 @@ internal final class JobProvenanceClassifier {
     ]
 
     private let homeDirectory: String
+    private let resolvedHomeDirectory: String
     private let codesignURL: URL
     private let signatureRunner: AdapterCommandRunner
     private let fileManager: FileManager
@@ -218,6 +361,8 @@ internal final class JobProvenanceClassifier {
         signatureRunner: @escaping AdapterCommandRunner
     ) {
         self.homeDirectory = homeDirectory.standardizedFileURL.path
+        self.resolvedHomeDirectory = homeDirectory.standardizedFileURL
+            .resolvingSymlinksInPath().path
         self.codesignURL = codesignURL
         self.fileManager = fileManager
         self.signatureRunner = signatureRunner
@@ -226,93 +371,140 @@ internal final class JobProvenanceClassifier {
     internal func classify(
         source: JobSource,
         command: [String],
-        configPath: String?
+        configPath: String?,
+        workingDirectory: String? = nil,
+        environment: [String: String] = [:]
     ) -> JobClassification {
         guard source == .launchd else {
             return JobClassification(provenance: .yours, attention: nil)
         }
 
         let program = command.first ?? ""
+        let resolvedProgram = resolvedPath(
+            program,
+            workingDirectory: workingDirectory,
+            environment: environment,
+            searchPath: true
+        ) ?? standardizedPath(program)
         let cacheSlot = configPath ?? "unidentified:\(command.joined(separator: "\u{1f}"))"
         let key = CacheKey(
             plist: fileIdentity(configPath ?? cacheSlot),
-            program: fileIdentity(program),
-            command: command
+            program: fileIdentity(resolvedProgram),
+            command: command,
+            workingDirectory: workingDirectory,
+            environment: environment.keys.sorted().map { "\($0)=\(environment[$0] ?? "")" }
         )
 
+        let resolution: LaunchdResolution
         lock.lock()
         if let entry = cache[cacheSlot], entry.key == key {
+            resolution = entry.resolution
             lock.unlock()
-            return entry.classification
+        } else {
+            lock.unlock()
+            resolution = classifyLaunchd(
+                command: command,
+                configPath: configPath,
+                workingDirectory: workingDirectory,
+                environment: environment
+            )
+            lock.lock()
+            cache[cacheSlot] = CacheEntry(key: key, resolution: resolution)
+            lock.unlock()
         }
-        lock.unlock()
 
-        let payload = command.dropFirst().first { $0.hasPrefix("/") }
-        let launchdClassification = classifyLaunchd(program: program, payload: payload)
-        let attention = launchdClassification.payload.flatMap { path -> JobAttention? in
+        let attention: JobAttention?
+        if command.isEmpty {
+            attention = .inertConfiguration(
+                path: configPath ?? "launchd configuration",
+                message: "the plist does not define Program or ProgramArguments"
+            )
+        } else {
+            attention = resolution.payload.flatMap { path -> JobAttention? in
             let standardized = standardizedPath(path)
             return fileManager.fileExists(atPath: standardized)
                 ? nil
                 : .missingPayload(standardized)
+            }
         }
-        let result = JobClassification(
-            provenance: launchdClassification.provenance,
+        return JobClassification(
+            provenance: resolution.provenance,
             attention: attention
         )
+    }
 
-        lock.lock()
-        cache[cacheSlot] = CacheEntry(key: key, classification: result)
-        lock.unlock()
-        return result
+    internal func classifyConfiguration(at path: String) -> JobProvenance {
+        if let vendor = filenameVendorName(for: path) {
+            return .app(vendor)
+        }
+        return isInsideHome(path)
+            ? .yours
+            : .unknown("could not attribute launchd configuration \(standardizedPath(path))")
     }
 
     private func classifyLaunchd(
-        program: String,
-        payload: String?
-    ) -> (provenance: JobProvenance, payload: String?) {
-        let programPath = standardizedPath(program)
-        if hasPrefix(programPath, in: Self.packageManagerPrefixes) {
-            return (.packageManager("Homebrew"), nil)
+        command: [String],
+        configPath: String?,
+        workingDirectory: String?,
+        environment: [String: String]
+    ) -> LaunchdResolution {
+        guard let program = command.first, !program.isEmpty else {
+            let provenance = configPath.map(classifyConfiguration(at:))
+                ?? .unknown("launchd job has no program")
+            return LaunchdResolution(provenance: provenance, payload: nil)
         }
 
-        if programPath.hasPrefix("/"),
-           let authority = developerIDAuthority(for: programPath) {
-            return (.app(normalizedAppName(authority)), nil)
+        let programPath = resolvedPath(
+            program,
+            workingDirectory: workingDirectory,
+            environment: environment,
+            searchPath: true
+        ) ?? standardizedPath(program)
+        if let interpreter = interpreterKind(for: programPath),
+           let payload = interpreterPayload(
+               kind: interpreter,
+               arguments: Array(command.dropFirst()),
+               workingDirectory: workingDirectory,
+               environment: environment
+           ) {
+            return LaunchdResolution(
+                provenance: provenanceForPayload(payload),
+                payload: payload
+            )
+        }
+        if interpreterKind(for: programPath) != nil {
+            return LaunchdResolution(
+                provenance: .unknown("interpreter command has no attributable file payload"),
+                payload: nil
+            )
         }
 
-        if let name = vendorName(for: programPath) {
-            return (.app(name), nil)
-        }
-
-        if let payload {
-            let payloadPath = standardizedPath(payload)
-            if isInsideHome(payloadPath) {
-                return (.yours, payload)
-            }
-            if hasPrefix(payloadPath, in: Self.packageManagerPrefixes) {
-                return (.packageManager("Homebrew"), payload)
-            }
-            if let name = vendorName(for: payloadPath) {
-                return (.app(name), payload)
-            }
-        }
-
-        if hasPrefix(programPath, in: Self.systemPrefixes) {
-            return (.system, payload)
-        }
-        if program.isEmpty {
-            return (.unknown("launchd job has no program"), payload)
-        }
-        return (.unknown("could not attribute \(program)"), payload)
+        return LaunchdResolution(
+            provenance: provenanceForExecutable(programPath),
+            payload: programPath.hasPrefix("/") ? programPath : nil
+        )
     }
 
     private func developerIDAuthority(for program: String) -> String? {
-        guard let result = try? signatureRunner(
+        guard let verification = try? signatureRunner(
             codesignURL,
-            ["-dv", "--verbose=4", program]
-        ), result.status == 0 else {
+            ["--verify", "--strict", "--verbose=4", program]
+        ), verification.status == 0 else {
             return nil
         }
+        if let authority = signatureAuthority(from: verification) {
+            return authority
+        }
+        guard let display = try? signatureRunner(
+            codesignURL,
+            ["-dv", "--verbose=4", program]
+        ), display.status == 0 else {
+            return nil
+        }
+        return signatureAuthority(from: display)
+    }
+
+    private func signatureAuthority(from result: AdapterCommandResult) -> String? {
         let prefix = "Authority=Developer ID Application:"
         let output = result.stdout + "\n" + result.stderr
         var teamIdentifier: String?
@@ -341,9 +533,318 @@ internal final class JobProvenanceClassifier {
         return teamIdentifier.flatMap { Self.developerIDNamesByTeamIdentifier[$0] }
     }
 
+    private func provenanceForPayload(_ path: String) -> JobProvenance {
+        let standardized = standardizedPath(path)
+        if isInsideHome(standardized) {
+            return .yours
+        }
+        if let packageManager = packageManagerName(for: standardized) {
+            return .packageManager(packageManager)
+        }
+        if let name = vendorName(for: standardized) {
+            return .app(name)
+        }
+        if hasPrefix(standardized, in: Self.systemPrefixes) {
+            return .system
+        }
+        return .unknown("could not attribute payload \(standardized)")
+    }
+
+    private func provenanceForExecutable(_ path: String) -> JobProvenance {
+        let standardized = standardizedPath(path)
+        if let packageManager = packageManagerName(for: standardized) {
+            return .packageManager(packageManager)
+        }
+        if standardized.hasPrefix("/"),
+           let authority = developerIDAuthority(for: standardized) {
+            return .app(normalizedAppName(authority))
+        }
+        if let name = vendorName(for: standardized) {
+            return .app(name)
+        }
+        if hasPrefix(standardized, in: Self.systemPrefixes) {
+            return .system
+        }
+        if isInsideHome(standardized) {
+            return .yours
+        }
+        return .unknown("could not attribute \(path)")
+    }
+
+    private func packageManagerName(for path: String) -> String? {
+        if path.hasPrefix("/opt/local/") {
+            return "MacPorts"
+        }
+        return hasPrefix(path, in: Self.packageManagerPrefixes) ? "Homebrew" : nil
+    }
+
+    private func interpreterKind(for path: String) -> InterpreterKind? {
+        let name = URL(fileURLWithPath: path).lastPathComponent.lowercased()
+        if Self.shellNames.contains(name) {
+            return .shell
+        }
+        if name.hasPrefix("python") {
+            return .python
+        }
+        if name == "ruby" || name.hasPrefix("ruby") {
+            return .ruby
+        }
+        if name == "perl" || name.hasPrefix("perl") {
+            return .perl
+        }
+        if name == "node" || name.hasPrefix("node") {
+            return .node
+        }
+        if name == "osascript" {
+            return .osascript
+        }
+        if name == "open" {
+            return .open
+        }
+        return nil
+    }
+
+    private func interpreterPayload(
+        kind: InterpreterKind,
+        arguments: [String],
+        workingDirectory: String?,
+        environment: [String: String]
+    ) -> String? {
+        let rawPayload: String?
+        switch kind {
+        case .shell:
+            if let commandIndex = arguments.firstIndex(where: {
+                $0 == "--command" || ($0.hasPrefix("-") && $0.dropFirst().contains("c"))
+            }) {
+                guard commandIndex + 1 < arguments.count else {
+                    return nil
+                }
+                guard let executable = shellCommandExecutable(arguments[commandIndex + 1]),
+                      executable.hasPrefix("/")
+                        || executable.hasPrefix("~")
+                        || executable.hasPrefix("$")
+                        || executable.contains("/") else {
+                    return nil
+                }
+                rawPayload = executable
+            } else {
+                rawPayload = firstFileArgument(
+                    in: arguments,
+                    inlineOptions: [],
+                    optionsWithValues: ["-o", "+o", "--rcfile"]
+                )
+            }
+        case .python:
+            rawPayload = firstFileArgument(
+                in: arguments,
+                inlineOptions: ["-c", "-m", "--command", "--module"],
+                optionsWithValues: ["-W", "-X", "--check-hash-based-pycs"]
+            )
+        case .ruby, .perl:
+            rawPayload = firstFileArgument(
+                in: arguments,
+                inlineOptions: ["-e"],
+                optionsWithValues: ["-C", "-I", "-M", "-m", "-r", "--encoding"]
+            )
+        case .node:
+            rawPayload = firstFileArgument(
+                in: arguments,
+                inlineOptions: ["-e", "--eval", "-p", "--print"],
+                optionsWithValues: [
+                    "-r", "--conditions", "--import", "--loader", "--require",
+                ]
+            )
+        case .osascript:
+            rawPayload = firstFileArgument(
+                in: arguments,
+                inlineOptions: ["-e"],
+                optionsWithValues: ["-l", "--language"]
+            )
+        case .open:
+            rawPayload = firstFileArgument(
+                in: arguments,
+                inlineOptions: [],
+                optionsWithValues: ["-a", "-b", "--application", "--bundle-identifier"]
+            )
+        }
+        guard let rawPayload, !rawPayload.contains("://") else {
+            return nil
+        }
+        return resolvedPath(
+            rawPayload,
+            workingDirectory: workingDirectory,
+            environment: environment,
+            searchPath: false
+        )
+    }
+
+    private func firstFileArgument(
+        in arguments: [String],
+        inlineOptions: Set<String>,
+        optionsWithValues: Set<String>
+    ) -> String? {
+        var skipNext = false
+        for argument in arguments {
+            if skipNext {
+                skipNext = false
+                continue
+            }
+            if inlineOptions.contains(argument) {
+                return nil
+            }
+            if optionsWithValues.contains(argument) {
+                skipNext = true
+                continue
+            }
+            if optionsWithValues.contains(where: { argument.hasPrefix($0 + "=") }) {
+                continue
+            }
+            if argument == "--" {
+                continue
+            }
+            if !argument.hasPrefix("-") {
+                return argument
+            }
+        }
+        return nil
+    }
+
+    private func shellCommandExecutable(_ command: String) -> String? {
+        let words = shellWords(command)
+        var index = 0
+        while index < words.count {
+            let word = words[index]
+            if word == "exec" || word == "command" || word == "source" || word == "." {
+                index += 1
+                continue
+            }
+            if word == "env" || word.contains("=") {
+                index += 1
+                continue
+            }
+            if word.hasPrefix("-") {
+                index += 1
+                continue
+            }
+            return word
+        }
+        return nil
+    }
+
+    private func shellWords(_ command: String) -> [String] {
+        var words: [String] = []
+        var word = ""
+        var quote: Character?
+        var escaped = false
+        for character in command {
+            if escaped {
+                word.append(character)
+                escaped = false
+                continue
+            }
+            if character == "\\" && quote != "'" {
+                escaped = true
+                continue
+            }
+            if let activeQuote = quote {
+                if character == activeQuote {
+                    quote = nil
+                } else {
+                    word.append(character)
+                }
+                continue
+            }
+            if character == "'" || character == "\"" {
+                quote = character
+            } else if character.isWhitespace {
+                if !word.isEmpty {
+                    words.append(word)
+                    word = ""
+                }
+            } else if character == ";" || character == "|" || character == "&" {
+                if !word.isEmpty {
+                    words.append(word)
+                    word = ""
+                }
+                break
+            } else {
+                word.append(character)
+            }
+        }
+        if !word.isEmpty {
+            words.append(word)
+        }
+        return words
+    }
+
+    private func resolvedPath(
+        _ rawPath: String,
+        workingDirectory: String?,
+        environment: [String: String],
+        searchPath: Bool
+    ) -> String? {
+        guard !rawPath.isEmpty else {
+            return nil
+        }
+        let expanded = expandPathVariables(rawPath, environment: environment)
+        if expanded.hasPrefix("/") {
+            return standardizedPath(expanded)
+        }
+        if expanded.contains("/") || !searchPath {
+            let base = workingDirectory.map {
+                expandPathVariables($0, environment: environment)
+            } ?? "/"
+            return URL(fileURLWithPath: base, isDirectory: true)
+                .appendingPathComponent(expanded)
+                .standardizedFileURL.path
+        }
+        let searchDirectories = (environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+            .split(separator: ":", omittingEmptySubsequences: false)
+            .map(String.init)
+        for directory in searchDirectories {
+            let base = directory.isEmpty ? (workingDirectory ?? "/") : directory
+            let candidate = URL(fileURLWithPath: base, isDirectory: true)
+                .appendingPathComponent(expanded)
+                .standardizedFileURL.path
+            if fileManager.fileExists(atPath: candidate) {
+                return candidate
+            }
+        }
+        return expanded
+    }
+
+    private func expandPathVariables(
+        _ rawPath: String,
+        environment: [String: String]
+    ) -> String {
+        var values = environment
+        values["HOME"] = environment["HOME"] ?? homeDirectory
+        var path = rawPath
+        if path == "~" {
+            path = values["HOME"] ?? homeDirectory
+        } else if path.hasPrefix("~/") {
+            path = (values["HOME"] ?? homeDirectory) + String(path.dropFirst())
+        }
+        for key in values.keys.sorted(by: { $0.count > $1.count }) {
+            guard let value = values[key] else {
+                continue
+            }
+            path = path.replacingOccurrences(of: "${\(key)}", with: value)
+            path = path.replacingOccurrences(of: "$\(key)", with: value)
+        }
+        return path
+    }
+
     private func vendorName(for path: String) -> String? {
         guard !hasPrefix(path, in: Self.packageManagerPrefixes) else {
             return nil
+        }
+        let userApplicationSupport = homeDirectory + "/Library/Application Support/"
+        if path.hasPrefix(userApplicationSupport) {
+            let remainder = path.dropFirst(userApplicationSupport.count)
+            return remainder.split(separator: "/").first.map {
+                normalizedAppName(String($0))
+            }
         }
         for prefix in Self.vendorPrefixes where path.hasPrefix(prefix) {
             let remainder = path.dropFirst(prefix.count)
@@ -366,8 +867,52 @@ internal final class JobProvenanceClassifier {
         return name
     }
 
+    private func filenameVendorName(for path: String) -> String? {
+        let filename = URL(fileURLWithPath: path).lastPathComponent
+        let lowercaseFilename = filename.lowercased()
+        guard let plistRange = lowercaseFilename.range(of: ".plist") else {
+            return nil
+        }
+        let stem = String(lowercaseFilename[..<plistRange.lowerBound])
+        let segments = stem.split(separator: ".", omittingEmptySubsequences: false)
+        guard segments.count >= 3,
+              Self.reverseDNSRoots.contains(String(segments[0])) else {
+            return nil
+        }
+
+        let vendor = String(segments[1])
+        let validVendorCharacters = CharacterSet.alphanumerics
+            .union(CharacterSet(charactersIn: "-_"))
+        guard !vendor.isEmpty,
+              vendor.unicodeScalars.allSatisfy(validVendorCharacters.contains),
+              !ownerFilenameSegments.contains(vendor) else {
+            return nil
+        }
+        if let displayName = Self.filenameVendorDisplayNames[vendor] {
+            return displayName
+        }
+        return vendor
+            .split(whereSeparator: { $0 == "-" || $0 == "_" })
+            .map { String($0).capitalized }
+            .joined(separator: " ")
+    }
+
+    private var ownerFilenameSegments: Set<String> {
+        Set([
+            URL(fileURLWithPath: homeDirectory).lastPathComponent,
+            NSUserName(),
+            ProcessInfo.processInfo.environment["USER"] ?? "",
+        ].map { $0.lowercased() }.filter { !$0.isEmpty })
+    }
+
     private func isInsideHome(_ path: String) -> Bool {
-        path == homeDirectory || path.hasPrefix(homeDirectory + "/")
+        let standardized = standardizedPath(path)
+        if standardized == homeDirectory || standardized.hasPrefix(homeDirectory + "/") {
+            return true
+        }
+        let resolved = URL(fileURLWithPath: standardized).resolvingSymlinksInPath().path
+        return resolved == resolvedHomeDirectory
+            || resolved.hasPrefix(resolvedHomeDirectory + "/")
     }
 
     private func hasPrefix(_ path: String, in prefixes: [String]) -> Bool {
@@ -378,14 +923,23 @@ internal final class JobProvenanceClassifier {
         guard !path.isEmpty else {
             return path
         }
-        let expanded = NSString(string: path).expandingTildeInPath
+        let expanded: String
+        if path == "~" {
+            expanded = homeDirectory
+        } else if path.hasPrefix("~/") {
+            expanded = homeDirectory + String(path.dropFirst())
+        } else {
+            expanded = path
+        }
         return URL(fileURLWithPath: expanded).standardizedFileURL.path
     }
 
     private func fileIdentity(_ path: String) -> FileIdentity {
         let standardized = standardizedPath(path)
+        let identityPath = URL(fileURLWithPath: standardized)
+            .resolvingSymlinksInPath().path
         var info = stat()
-        guard !standardized.isEmpty, Darwin.lstat(standardized, &info) == 0 else {
+        guard !standardized.isEmpty, Darwin.lstat(identityPath, &info) == 0 else {
             return FileIdentity(
                 path: standardized,
                 device: nil,

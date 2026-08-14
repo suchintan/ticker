@@ -45,7 +45,30 @@ enum JobDisplayName {
         if Set(collisions.map(\.label)).count == collisions.count {
             return job.label
         }
-        return "\(job.label) — \(locationName(for: job))"
+        let locationDisplay = "\(job.label) — \(locationName(for: job))"
+        let locationCollisions = collisions.filter {
+            "\($0.label) — \(locationName(for: $0))" == locationDisplay
+        }
+        guard locationCollisions.count > 1 else {
+            return locationDisplay
+        }
+        let plistName = job.configPath.map {
+            URL(fileURLWithPath: $0).lastPathComponent
+        } ?? job.source.rawValue
+        let pathDisplay = "\(locationDisplay) · \(plistName)"
+        let pathCollisions = locationCollisions.filter {
+            let otherName = $0.configPath.map {
+                URL(fileURLWithPath: $0).lastPathComponent
+            } ?? $0.source.rawValue
+            return "\($0.label) — \(locationName(for: $0)) · \(otherName)" == pathDisplay
+        }
+        guard pathCollisions.count > 1 else {
+            return pathDisplay
+        }
+        let shortID = job.id.split(separator: "#").last.map {
+            String($0.prefix(6))
+        } ?? String(job.id.suffix(6))
+        return "\(pathDisplay) · \(shortID)"
     }
 
     private static func locationName(for job: Job) -> String {
@@ -74,13 +97,12 @@ struct JobListView: View {
     @AppStorage("ticker.appsExpanded") private var appsExpanded = true
     @AppStorage("ticker.packageManagersExpanded") private var packageManagersExpanded = true
     @AppStorage("ticker.systemJobsExpanded") private var systemJobsExpanded = true
-    @AppStorage("ticker.unknownOwnersExpanded") private var unknownOwnersExpanded = true
 
     private var selectedJob: Job? {
         guard let selectedJobID else {
             return nil
         }
-        return model.jobs.first { $0.id == selectedJobID }
+        return matchingJobs.first { $0.id == selectedJobID }
     }
 
     private var matchingJobs: [Job] {
@@ -99,11 +121,25 @@ struct JobListView: View {
     }
 
     private var otherJobs: [Job] {
-        matchingJobs.filter { !$0.provenance.isYours }
+        matchingJobs.filter { $0.provenance.isConfirmedThirdParty }
     }
 
     private var allOtherJobs: [Job] {
-        model.jobs.filter { !$0.provenance.isYours }
+        model.jobs.filter { $0.provenance.isConfirmedThirdParty }
+    }
+
+    private var unattributedJobs: [Job] {
+        sorted(matchingJobs.filter {
+            if case .unknown = $0.provenance { return true }
+            return false
+        })
+    }
+
+    private var allUnattributedJobs: [Job] {
+        model.jobs.filter {
+            if case .unknown = $0.provenance { return true }
+            return false
+        }
     }
 
     private var appJobs: [Job] {
@@ -124,13 +160,6 @@ struct JobListView: View {
         sorted(otherJobs.filter { $0.provenance == .system })
     }
 
-    private var unknownJobs: [Job] {
-        sorted(otherJobs.filter {
-            if case .unknown = $0.provenance { return true }
-            return false
-        })
-    }
-
     private var isSearching: Bool {
         !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -149,12 +178,10 @@ struct JobListView: View {
         }
         .frame(width: 820, height: 600)
         .onReceive(model.$jobs) { jobs in
-            if let selectedJobID,
-               jobs.contains(where: { $0.id == selectedJobID }) {
-                return
-            }
-            selectedJobID = jobs.first(where: { $0.provenance.isYours })?.id
-                ?? jobs.first?.id
+            reconcileSelection(in: visibleJobs(in: jobs))
+        }
+        .onChange(of: searchText) { _ in
+            reconcileSelection(in: matchingJobs)
         }
     }
 
@@ -174,10 +201,18 @@ struct JobListView: View {
                         jobRows(yourJobs)
                     }
 
-                    DisclosureGroup(isExpanded: otherExpansion) {
-                        provenanceSubgroups
-                    } label: {
-                        otherJobsHeader
+                    if !unattributedJobs.isEmpty {
+                        Section("Needs Review") {
+                            jobRows(unattributedJobs)
+                        }
+                    }
+
+                    if !allOtherJobs.isEmpty {
+                        DisclosureGroup(isExpanded: otherExpansion) {
+                            provenanceSubgroups
+                        } label: {
+                            otherJobsHeader
+                        }
                     }
                 }
 
@@ -263,15 +298,6 @@ struct JobListView: View {
             }
         }
 
-        if !unknownJobs.isEmpty {
-            DisclosureGroup(
-                isExpanded: subgroupExpansion($unknownOwnersExpanded, hasMatches: !unknownJobs.isEmpty)
-            ) {
-                jobRows(unknownJobs)
-            } label: {
-                subgroupHeader("Unknown Owners", count: unknownJobs.count)
-            }
-        }
     }
 
     private func jobRows(_ jobs: [Job]) -> some View {
@@ -344,7 +370,12 @@ struct JobListView: View {
 
     private var otherExpansion: Binding<Bool> {
         Binding(
-            get: { otherJobsExpanded || (isSearching && !otherJobs.isEmpty) },
+            get: {
+                otherJobsExpanded
+                    || (allYourJobs.isEmpty && !allOtherJobs.isEmpty
+                        && allUnattributedJobs.isEmpty)
+                    || (isSearching && !otherJobs.isEmpty)
+            },
             set: { if !isSearching { otherJobsExpanded = $0 } }
         )
     }
@@ -386,13 +417,16 @@ struct JobListView: View {
     }
 
     private func sorted(_ jobs: [Job]) -> [Job] {
-        jobs.sorted { left, right in
+        let now = Date()
+        return jobs.sorted { left, right in
             let leftRank = rank(left)
             let rightRank = rank(right)
             if leftRank != rightRank {
                 return leftRank < rightRank
             }
-            switch (left.nextFireAt, right.nextFireAt) {
+            let leftNextFire = left.schedule.nextFire(after: now, calendar: .current)
+            let rightNextFire = right.schedule.nextFire(after: now, calendar: .current)
+            switch (leftNextFire, rightNextFire) {
             case let (leftDate?, rightDate?) where leftDate != rightDate:
                 return leftDate < rightDate
             case (.some, .none):
@@ -408,6 +442,24 @@ struct JobListView: View {
                 return leftName.localizedCaseInsensitiveCompare(rightName) == .orderedAscending
             }
         }
+    }
+
+    private func visibleJobs(in jobs: [Job]) -> [Job] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else {
+            return jobs
+        }
+        return jobs.filter(matchesSearch)
+    }
+
+    private func reconcileSelection(in visibleJobs: [Job]) {
+        if let selectedJobID,
+           visibleJobs.contains(where: { $0.id == selectedJobID }) {
+            return
+        }
+        selectedJobID = visibleJobs.first(where: { $0.provenance.isYours })?.id
+            ?? visibleJobs.first(where: { !$0.provenance.isConfirmedThirdParty })?.id
+            ?? visibleJobs.first?.id
     }
 
     private func rank(_ job: Job) -> Int {
@@ -466,8 +518,14 @@ private struct JobRow: View {
 
     @ViewBuilder
     private var status: some View {
-        if job.attention != nil {
-            AttentionBadge(title: "Missing payload", icon: "exclamationmark.triangle.fill", color: .red)
+        if let attention = job.attention {
+            AttentionBadge(
+                title: attention.summary,
+                icon: attention.requiresAttention
+                    ? "exclamationmark.triangle.fill"
+                    : "info.circle",
+                color: attention.requiresAttention ? .red : .secondary
+            )
         } else if outcome == .failure {
             AttentionBadge(title: "Failed", icon: "xmark.circle.fill", color: .red)
         } else if let skew = job.skew, skew > 3_600 {
