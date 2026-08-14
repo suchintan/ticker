@@ -1,4 +1,5 @@
 import Darwin
+import CryptoKit
 import Foundation
 import SQLite3
 
@@ -2537,6 +2538,15 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                 try check(adapter.discoveryCount == 2, "overlapping refreshes did not coalesce to one pass")
                 try check(waitUntil { model.errors.contains { $0.contains("ownership probe unavailable") } },
                           "test10_app_refresh_didNotSurfaceRecorderDiagnostic")
+                try store.clearRecorderDiagnostic(claimedJobID: "launchd:test10-app")
+                model.refresh()
+                try check(
+                    waitUntil {
+                        !model.errors.contains { $0.contains("ownership probe unavailable") }
+                    },
+                    "test11_app_refresh_didNotClearResolvedRecorderDiagnostic"
+                )
+                print("APP HARNESS test11_recorderDiagnosticClearing PASS")
 
                 let noPathJob = makeJob(
                     id: "cron:no-path",
@@ -2893,6 +2903,10 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
         tests.expect(
             output.contains("APP HARNESS test9_identityRecoveryRoute PASS"),
             "test9_appRoute_reconcilesIdentityBeforeUnwrapAndAcceptsLateOldRuns"
+        )
+        tests.expect(
+            output.contains("APP HARNESS test11_recorderDiagnosticClearing PASS"),
+            "test11_appRefresh_removesResolvedRecorderDiagnostic"
         )
     }
 }
@@ -4313,6 +4327,74 @@ private func test7_aclText(at url: URL) throws -> String {
     return String(cString: text)
 }
 
+private let test11_metadataAttributeName = "com.ticker.tests.file-metadata"
+
+private func test11_setExtendedAttribute(_ data: Data, at url: URL) throws {
+    let result = data.withUnsafeBytes { bytes in
+        url.path.withCString { path in
+            test11_metadataAttributeName.withCString { name in
+                Darwin.setxattr(
+                    path,
+                    name,
+                    bytes.baseAddress,
+                    bytes.count,
+                    0,
+                    XATTR_NOFOLLOW
+                )
+            }
+        }
+    }
+    guard result == 0 else {
+        throw FixtureError.missing(
+            "test11 set xattr \(url.path): \(String(cString: strerror(errno)))"
+        )
+    }
+}
+
+private func test11_extendedAttribute(at url: URL) throws -> Data {
+    let size = url.path.withCString { path in
+        test11_metadataAttributeName.withCString { name in
+            Darwin.getxattr(path, name, nil, 0, 0, XATTR_NOFOLLOW)
+        }
+    }
+    guard size >= 0 else {
+        throw FixtureError.missing(
+            "test11 size xattr \(url.path): \(String(cString: strerror(errno)))"
+        )
+    }
+    var data = Data(count: size)
+    let read = data.withUnsafeMutableBytes { bytes in
+        url.path.withCString { path in
+            test11_metadataAttributeName.withCString { name in
+                Darwin.getxattr(
+                    path,
+                    name,
+                    bytes.baseAddress,
+                    bytes.count,
+                    0,
+                    XATTR_NOFOLLOW
+                )
+            }
+        }
+    }
+    guard read == size else {
+        throw FixtureError.missing(
+            "test11 read xattr \(url.path): \(String(cString: strerror(errno)))"
+        )
+    }
+    return data
+}
+
+private func test11_fileFlags(at url: URL) throws -> UInt32 {
+    var value = stat()
+    guard Darwin.lstat(url.path, &value) == 0 else {
+        throw FixtureError.missing(
+            "test11 stat flags \(url.path): \(String(cString: strerror(errno)))"
+        )
+    }
+    return value.st_flags
+}
+
 private func test7_WrapAndUnwrapPreserveFileMetadata(_ tests: TestHarness) throws {
     try withTemporaryDirectory("round7-metadata") { directory in
         let (wrapper, _, job, plistURL) = try test7_wrapperFixture(
@@ -4325,6 +4407,13 @@ private func test7_WrapAndUnwrapPreserveFileMetadata(_ tests: TestHarness) throw
         )
         guard Darwin.chmod(plistURL.path, 0o600) == 0 else {
             throw FixtureError.missing("test7 chmod fixture: \(String(cString: strerror(errno)))")
+        }
+        let attributeBefore = Data("ticker-metadata-value".utf8)
+        try test11_setExtendedAttribute(attributeBefore, at: plistURL)
+        guard Darwin.chflags(plistURL.path, UInt32(UF_NODUMP)) == 0 else {
+            throw FixtureError.missing(
+                "test11 set file flag: \(String(cString: strerror(errno)))"
+            )
         }
         let aclSetup = try test3A_runProcess(
             "/bin/chmod",
@@ -4356,6 +4445,16 @@ private func test7_WrapAndUnwrapPreserveFileMetadata(_ tests: TestHarness) throw
             aclBefore,
             "test7_wrap_preservesACL"
         )
+        tests.expectEqual(
+            try test11_extendedAttribute(at: plistURL),
+            attributeBefore,
+            "test11_wrap_preservesExtendedAttributes"
+        )
+        let flagsAfterWrap = try test11_fileFlags(at: plistURL)
+        tests.expect(
+            flagsAfterWrap & UInt32(UF_NODUMP) != 0,
+            "test11_wrap_preservesFileFlags"
+        )
 
         _ = try wrapper.unwrap(job: job)
         let afterUnwrap = try test7_fileMetadata(at: plistURL)
@@ -4368,6 +4467,16 @@ private func test7_WrapAndUnwrapPreserveFileMetadata(_ tests: TestHarness) throw
             try test7_aclText(at: plistURL),
             aclBefore,
             "test7_unwrap_preservesACL"
+        )
+        tests.expectEqual(
+            try test11_extendedAttribute(at: plistURL),
+            attributeBefore,
+            "test11_unwrap_preservesExtendedAttributes"
+        )
+        let flagsAfterUnwrap = try test11_fileFlags(at: plistURL)
+        tests.expect(
+            flagsAfterUnwrap & UInt32(UF_NODUMP) != 0,
+            "test11_unwrap_preservesFileFlags"
         )
     }
 }
@@ -5107,6 +5216,185 @@ private func test10_RuntimeOwnershipAndDiagnostics(_ tests: TestHarness) throws 
         let forgedDiagnostic = try store.recorderDiagnostics().first?.message
         tests.expect(forgedDiagnostic?.contains("command does not match") == true,
                      "test10_handRunScheduledInjection_recordsDiagnostic")
+
+        let differentPIDLaunchctl = directory.appendingPathComponent("different-pid-launchctl")
+        try """
+        #!/bin/sh
+        printf 'gui/test = {\n    pid = 1\n    runs = 1\n    last exit code = 0\n}\n'
+        """.write(to: differentPIDLaunchctl, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: differentPIDLaunchctl.path
+        )
+        var differentPIDEnvironment = environment
+        differentPIDEnvironment["TICKER_TEST_LAUNCHCTL_PATH"] = differentPIDLaunchctl.path
+        for _ in 0..<3 {
+            let differentPIDResult = try test3A_runProcess(
+                fixture.arguments[0],
+                Array(fixture.arguments.dropFirst()),
+                environment: differentPIDEnvironment
+            )
+            tests.expectEqual(
+                differentPIDResult.status,
+                0,
+                "test11_exactCommandDifferentPID_stillExecutesChild"
+            )
+        }
+        tests.expectEqual(
+            try store.runs(jobID: fixture.job.id, limit: 10).count,
+            0,
+            "test11_exactCommandDifferentPID_cannotAttributeHistory"
+        )
+        let differentPIDDiagnostic = try store.recorderDiagnostics().first?.message
+        tests.expect(
+            differentPIDDiagnostic?.contains("reports pid 1") == true,
+            "test11_exactCommandDifferentPID_recordsOwnershipFailure"
+        )
+        tests.expectEqual(
+            try test11_recorderDiagnosticRowCount(at: URL(fileURLWithPath: compiledStorePath)),
+            1,
+            "test11_repeatedPIDFailures_keepOneActiveRow"
+        )
+
+        let ownedLaunchctl = try test10_fakeLaunchctl(in: directory)
+        var ownedEnvironment = environment
+        ownedEnvironment["TICKER_TEST_LAUNCHCTL_PATH"] = ownedLaunchctl.path
+        let ownedResult = try test3A_runProcess(
+            fixture.arguments[0],
+            Array(fixture.arguments.dropFirst()),
+            environment: ownedEnvironment
+        )
+        tests.expectEqual(
+            ownedResult.status,
+            0,
+            "test11_nextSuccessfulAuthorization_executesChild"
+        )
+        tests.expectEqual(
+            try store.runs(jobID: fixture.job.id, limit: 10).count,
+            1,
+            "test11_nextSuccessfulAuthorization_recordsHistory"
+        )
+        tests.expectEqual(
+            try store.recorderDiagnostics(),
+            [],
+            "test11_nextSuccessfulAuthorization_clearsDiagnostic"
+        )
+    }
+}
+
+private func test11_recorderDiagnosticRowCount(at databaseURL: URL) throws -> Int {
+    var database: OpaquePointer?
+    let openResult = sqlite3_open_v2(
+        databaseURL.path,
+        &database,
+        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+        nil
+    )
+    guard openResult == SQLITE_OK, let database else {
+        throw FixtureError.missing("test11 open recorder diagnostic database")
+    }
+    defer { sqlite3_close(database) }
+
+    var statement: OpaquePointer?
+    let prepareResult = sqlite3_prepare_v2(
+        database,
+        "SELECT COUNT(*) FROM recorder_diagnostics;",
+        -1,
+        &statement,
+        nil
+    )
+    guard prepareResult == SQLITE_OK, let statement else {
+        throw FixtureError.missing("test11 prepare recorder diagnostic count")
+    }
+    defer { sqlite3_finalize(statement) }
+    guard sqlite3_step(statement) == SQLITE_ROW else {
+        throw FixtureError.missing("test11 read recorder diagnostic count")
+    }
+    return Int(sqlite3_column_int64(statement, 0))
+}
+
+private func test11_RecorderDiagnosticsAreCurrentAndBounded(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round11-recorder-diagnostics") { directory in
+        let databaseURL = directory.appendingPathComponent("ticker.db")
+        let store = try SQLiteRunStore(path: databaseURL.path)
+        let jobID = "launchd:com.example.test11.diagnostic#111111111111"
+        let firstRecordedAt = Date()
+        for attempt in 1...25 {
+            try store.recordRecorderDiagnostic(
+                claimedJobID: jobID,
+                message: "authorization failure \(attempt)"
+            )
+        }
+        let diagnostics = try store.recorderDiagnostics(limit: 100)
+        tests.expectEqual(
+            diagnostics.count,
+            1,
+            "test11_repeatedAuthorizationFailures_haveOneActiveDiagnostic"
+        )
+        tests.expectEqual(
+            diagnostics.first?.message,
+            "authorization failure 25",
+            "test11_repeatedAuthorizationFailures_replaceTheActiveDiagnostic"
+        )
+        tests.expect(
+            diagnostics.first.map { $0.occurredAt >= firstRecordedAt } == true,
+            "test11_activeDiagnostic_returnsItsOccurrenceTime"
+        )
+        tests.expectEqual(
+            try test11_recorderDiagnosticRowCount(at: databaseURL),
+            1,
+            "test11_repeatedAuthorizationFailures_doNotGrowTheTable"
+        )
+
+        try store.clearRecorderDiagnostic(claimedJobID: jobID)
+        tests.expectEqual(
+            try store.recorderDiagnostics(limit: 100),
+            [],
+            "test11_resolvedAuthorization_removesTheActiveDiagnostic"
+        )
+    }
+}
+
+private func test11_AmbiguousWrapperExplanationMatchesCause(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round11-ambiguous-wrapper-explanation") { directory in
+        let (wrapper, _, job, plistURL) = try test7_wrapperFixture(
+            directory: directory,
+            label: "com.example.test11.command-disagreement",
+            propertyList: [
+                "Label": "com.example.test11.command-disagreement",
+                "ProgramArguments": ["/bin/echo", "authenticated-command"],
+            ]
+        )
+        _ = try wrapper.wrap(
+            job: job,
+            tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"
+        )
+        var edited = try test2A_readPropertyList(plistURL)
+        var arguments = try require(
+            edited["ProgramArguments"] as? [String],
+            "test11 versioned wrapper arguments"
+        )
+        let separator = try require(
+            arguments.firstIndex(of: "--"),
+            "test11 versioned wrapper separator"
+        )
+        arguments[arguments.index(separator, offsetBy: 2)] = "edited-command"
+        edited["ProgramArguments"] = arguments
+        try writePropertyList(edited, to: plistURL)
+
+        tests.expectEqual(
+            try wrapper.recoveryState(job: job),
+            .ambiguousTickerInvocation,
+            "test11_versionedWrapperCommandEdit_isAmbiguous"
+        )
+        tests.expectEqual(
+            JobRecoveryState.ambiguousTickerInvocationExplanation,
+            "Ticker cannot verify that this plist's command matches the authenticated backup "
+                + "associated with its wrapper. Program or ProgramArguments changed, or the wrapper "
+                + "and backup identify different commands. Compare those fields with the authenticated "
+                + "backup, restore the intended command, then run ticker doctor.",
+            "test11_ambiguousWrapperExplanation_describesBackupCommandDisagreement"
+        )
     }
 }
 
@@ -5146,6 +5434,49 @@ private func test9_CopiedWrapperRuntimeOwnership(_ tests: TestHarness) throws {
                      "test9_copiedWrapper_reportsOwnershipFailureClearly")
         tests.expectEqual(try store.runs(jobID: owner.job.id, limit: 10).count, 1,
                           "test9_copiedWrapper_leavesVictimHistoryUnchanged")
+
+        let pathBoundCopyURL = directory.appendingPathComponent("path-bound-copy.plist")
+        let pathBoundLabel = "com.example.test11.path-bound-copy"
+        let originalCanonicalPath = originalURL.standardizedFileURL.resolvingSymlinksInPath().path
+        let originalPathDigest = SHA256.hash(data: Data(originalCanonicalPath.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let forgedPathClaim = "launchd:\(pathBoundLabel)#\(originalPathDigest.prefix(12))"
+        var pathBoundCopy = copied
+        pathBoundCopy["Label"] = pathBoundLabel
+        var pathBoundArguments = try require(
+            pathBoundCopy["ProgramArguments"] as? [String],
+            "test11 path-bound copied wrapper arguments"
+        )
+        let labelOption = try require(
+            pathBoundArguments.firstIndex(of: "--label"),
+            "test11 path-bound copied wrapper label"
+        )
+        pathBoundArguments[pathBoundArguments.index(after: labelOption)] = forgedPathClaim
+        pathBoundCopy["ProgramArguments"] = pathBoundArguments
+        try FileManager.default.removeItem(at: originalURL)
+        try FileManager.default.removeItem(at: copiedURL)
+        try writePropertyList(pathBoundCopy, to: pathBoundCopyURL)
+
+        let pathBoundResult = try test3A_runProcess(
+            pathBoundArguments[0],
+            Array(pathBoundArguments.dropFirst()),
+            environment: environment
+        )
+        tests.expectEqual(
+            pathBoundResult.status,
+            0,
+            "test11_differentLabelCopiedWrapper_stillExecutesChild"
+        )
+        tests.expect(
+            pathBoundResult.stderr.contains("scheduled wrapper ownership not proven"),
+            "test11_differentLabelCopiedWrapper_reportsPathIdentityFailure"
+        )
+        tests.expectEqual(
+            try store.runs(jobID: forgedPathClaim, limit: 10).count,
+            0,
+            "test11_differentLabelCopiedWrapper_canonicalPathPreventsAttribution"
+        )
     }
 }
 
@@ -5423,6 +5754,12 @@ private enum TickerTests {
         tests.run("round 10 concurrent evidence migration") { try test10_ConcurrentEvidenceMigration(tests) }
         tests.run("round 10 explicit singular identity reconciliation") { try test10_ExplicitSingularIdentityReconciliation(tests) }
         tests.run("round 10 runtime ownership and diagnostics") { try test10_RuntimeOwnershipAndDiagnostics(tests) }
+        tests.run("round 11 active recorder diagnostics") {
+            try test11_RecorderDiagnosticsAreCurrentAndBounded(tests)
+        }
+        tests.run("round 11 ambiguous wrapper explanation") {
+            try test11_AmbiguousWrapperExplanationMatchesCause(tests)
+        }
         tests.finish()
     }
 }

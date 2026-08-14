@@ -30,6 +30,12 @@ public enum JobRecoveryState: Equatable {
     case ambiguousTickerInvocation
     case staleManagedRow
 
+    public static let ambiguousTickerInvocationExplanation =
+        "Ticker cannot verify that this plist's command matches the authenticated backup "
+        + "associated with its wrapper. Program or ProgramArguments changed, or the wrapper "
+        + "and backup identify different commands. Compare those fields with the authenticated "
+        + "backup, restore the intended command, then run ticker doctor."
+
     public var description: String {
         switch self {
         case .unwrapped:

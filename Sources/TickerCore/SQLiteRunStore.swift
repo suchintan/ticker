@@ -24,7 +24,9 @@ public struct SQLiteRunStoreError: Error, LocalizedError {
 }
 
 public struct RecorderDiagnostic: Equatable {
-    public let claimedJobID: String; public let message: String
+    public let claimedJobID: String
+    public let occurredAt: Date
+    public let message: String
 }
 
 public struct BackupSourceClaim: Equatable {
@@ -119,6 +121,17 @@ public final class SQLiteRunStore: RunStore {
                   backup_path TEXT PRIMARY KEY, job_id TEXT NOT NULL,
                   source_plist_path TEXT NOT NULL, rebound_at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);
+                """
+            )
+            try Self.execute(
+                database: validDatabase,
+                sql: """
+                DELETE FROM recorder_diagnostics
+                WHERE id NOT IN (
+                  SELECT MAX(id) FROM recorder_diagnostics GROUP BY claimed_job_id
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_recorder_diagnostics_job
+                ON recorder_diagnostics(claimed_job_id);
                 """
             )
             try Self.ensureRunsTriggerColumn(
@@ -322,21 +335,35 @@ public final class SQLiteRunStore: RunStore {
 
     public func recordRecorderDiagnostic(claimedJobID: String, message: String) throws {
         try queue.sync {
-            let statement = try prepare(
-                "INSERT INTO recorder_diagnostics(claimed_job_id, occurred_at, message) VALUES(?, ?, ?);"
-            )
-            defer { sqlite3_finalize(statement) }
-            try bind(claimedJobID, to: 1, in: statement)
-            try bind(Date().timeIntervalSince1970, to: 2, in: statement)
-            try bind(message, to: 3, in: statement)
-            try stepDone(statement, operation: "record recorder diagnostic")
+            try withImmediateTransaction {
+                let canonicalID = try canonicalJobIDLocked(claimedJobID)
+                try clearRecorderDiagnosticLocked(canonicalJobID: canonicalID)
+                let statement = try prepare(
+                    "INSERT INTO recorder_diagnostics(claimed_job_id, occurred_at, message) VALUES(?, ?, ?);"
+                )
+                defer { sqlite3_finalize(statement) }
+                try bind(canonicalID, to: 1, in: statement)
+                try bind(Date().timeIntervalSince1970, to: 2, in: statement)
+                try bind(message, to: 3, in: statement)
+                try stepDone(statement, operation: "record recorder diagnostic")
+            }
+        }
+    }
+
+    public func clearRecorderDiagnostic(claimedJobID: String) throws {
+        try queue.sync {
+            try withImmediateTransaction {
+                try clearRecorderDiagnosticLocked(
+                    canonicalJobID: canonicalJobIDLocked(claimedJobID)
+                )
+            }
         }
     }
 
     public func recorderDiagnostics(limit: Int = 20) throws -> [RecorderDiagnostic] {
         try queue.sync {
             let statement = try prepare(
-                "SELECT claimed_job_id, message FROM recorder_diagnostics ORDER BY id DESC LIMIT ?;"
+                "SELECT claimed_job_id, occurred_at, message FROM recorder_diagnostics ORDER BY id DESC LIMIT ?;"
             )
             defer { sqlite3_finalize(statement) }
             try bind(max(0, limit), to: 1, in: statement)
@@ -348,11 +375,12 @@ public final class SQLiteRunStore: RunStore {
                 }
                 guard stepResult == SQLITE_ROW,
                       let claimedJobID = textColumn(0, in: statement),
-                      let message = textColumn(1, in: statement) else {
+                      let message = textColumn(2, in: statement) else {
                     throw databaseError(operation: "read recorder diagnostics", code: stepResult)
                 }
                 result.append(RecorderDiagnostic(
-                    claimedJobID: claimedJobID,
+                    claimedJobID: try canonicalJobIDLocked(claimedJobID),
+                    occurredAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
                     message: message
                 ))
             }
@@ -535,6 +563,38 @@ public final class SQLiteRunStore: RunStore {
             code: SQLITE_CONSTRAINT,
             message: "Identity alias cycle includes \(jobID)"
         )
+    }
+
+    private func clearRecorderDiagnosticLocked(canonicalJobID: String) throws {
+        let readStatement = try prepare("SELECT id, claimed_job_id FROM recorder_diagnostics;")
+        var matchingIDs: [Int64] = []
+        while true {
+            let result = sqlite3_step(readStatement)
+            if result == SQLITE_DONE {
+                break
+            }
+            guard result == SQLITE_ROW,
+                  let storedJobID = textColumn(1, in: readStatement) else {
+                sqlite3_finalize(readStatement)
+                throw databaseError(operation: "read recorder diagnostics for clearing", code: result)
+            }
+            if try canonicalJobIDLocked(storedJobID) == canonicalJobID {
+                matchingIDs.append(sqlite3_column_int64(readStatement, 0))
+            }
+        }
+        sqlite3_finalize(readStatement)
+
+        for diagnosticID in matchingIDs {
+            let deleteStatement = try prepare("DELETE FROM recorder_diagnostics WHERE id = ?;")
+            try bind(diagnosticID, to: 1, in: deleteStatement)
+            do {
+                try stepDone(deleteStatement, operation: "clear recorder diagnostic")
+                sqlite3_finalize(deleteStatement)
+            } catch {
+                sqlite3_finalize(deleteStatement)
+                throw error
+            }
+        }
     }
 
     private func migrateJobIdentityLocked(from oldJobID: String, to newJobID: String) throws {

@@ -151,7 +151,7 @@ ticker doctor
 ticker doctor --clear-stale <job-id>
 ```
 
-Reports the wrapper, managed-row, and authenticated-backup state for each launchd job. It reports content mismatches, digest-less legacy backups, ambiguous basename-only `ticker` commands, and legacy history that cannot be mapped uniquely to a current job. The clear option removes a managed row only when the plist has already been restored outside Ticker.
+Reports each launchd job's current wrapper, managed-row, and authenticated-backup state, followed by any active recorder-authorization diagnostics. It reports missing or unauthenticated backups, authenticated-content mismatches, wrapper and backup command disagreements, foreign wrapper labels, identity changes, and stale managed rows. The clear option removes a managed row only when the plist has already been restored outside Ticker.
 
 ```text
 ticker --help

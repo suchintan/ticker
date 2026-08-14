@@ -493,6 +493,14 @@ private struct TickerCLI {
                 switch status {
                 case .owned(let snapshot):
                     wrapperRuntimeSnapshot = snapshot
+                    do {
+                        try store.clearRecorderDiagnostic(claimedJobID: jobID)
+                    } catch {
+                        writeStandardError(
+                            "ticker: could not clear resolved recorder diagnostic: "
+                                + "\(error.localizedDescription)\n"
+                        )
+                    }
                 case .serviceNotPublished:
                     throw LaunchdRuntimeProbeError(
                         message: "launchd service exists but has not published this wrapper pid yet"

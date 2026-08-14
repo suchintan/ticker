@@ -166,8 +166,8 @@ struct JobDetailView: View {
                     DetailCallout(
                         color: .red,
                         icon: "exclamationmark.triangle.fill",
-                        title: "Unverified ticker command",
-                        detail: "This plist invokes an executable named ticker without Ticker's version marker. Ticker will not modify it."
+                        title: "Unverified wrapper command",
+                        detail: JobRecoveryState.ambiguousTickerInvocationExplanation
                     )
                 case .wrappedForeignLabel:
                     DetailCallout(
