@@ -175,15 +175,23 @@ public final class LaunchdAdapter: JobSourceAdapter {
     private let searchDirectories: [URL]
     private let launchctlURL: URL
     private let commandRunner: AdapterCommandRunner
+    private let provenanceClassifier: JobProvenanceClassifier
 
     public convenience init() {
+        #if TICKER_TESTING
+        let home = ProcessInfo.processInfo.environment["TICKER_TEST_HOME_DIRECTORY"]
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        #else
         let home = FileManager.default.homeDirectoryForCurrentUser
+        #endif
         #if TICKER_TESTING
         if let paths = ProcessInfo.processInfo.environment["TICKER_TEST_LAUNCHD_DIRECTORIES"],
            !paths.isEmpty {
             self.init(searchDirectories: paths.split(separator: ":").map {
                     URL(fileURLWithPath: String($0), isDirectory: true) },
                 launchctlURL: URL(fileURLWithPath: "/bin/launchctl"),
+                homeDirectory: home,
                 commandRunner: { try runAdapterCommand(executable: $0, arguments: $1) })
             return
         }
@@ -195,6 +203,9 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 URL(fileURLWithPath: "/Library/LaunchDaemons", isDirectory: true),
             ],
             launchctlURL: URL(fileURLWithPath: "/bin/launchctl"),
+            codesignRunner: {
+                try runAdapterCommand(executable: $0, arguments: $1, timeout: 1)
+            },
             commandRunner: { try runAdapterCommand(executable: $0, arguments: $1) }
         )
     }
@@ -202,6 +213,11 @@ public final class LaunchdAdapter: JobSourceAdapter {
     internal init(
         searchDirectories: [URL],
         launchctlURL: URL = URL(fileURLWithPath: "/bin/launchctl"),
+        codesignURL: URL = URL(fileURLWithPath: "/usr/bin/codesign"),
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        codesignRunner: @escaping AdapterCommandRunner = { _, _ in
+            AdapterCommandResult(status: 1, stdout: "", stderr: "signature unavailable")
+        },
         commandRunner: @escaping AdapterCommandRunner
     ) {
         var seenPaths = Set<String>()
@@ -211,6 +227,11 @@ public final class LaunchdAdapter: JobSourceAdapter {
             .sorted { $0.path < $1.path }
         self.launchctlURL = launchctlURL
         self.commandRunner = commandRunner
+        self.provenanceClassifier = JobProvenanceClassifier(
+            homeDirectory: homeDirectory,
+            codesignURL: codesignURL,
+            signatureRunner: codesignRunner
+        )
     }
 
     public func discover() throws -> [Job] {
@@ -244,9 +265,16 @@ public final class LaunchdAdapter: JobSourceAdapter {
             let hasAmbiguousRuntimeStatus = duplicateKeys.contains(key)
             let runtimeStatus = hasAmbiguousRuntimeStatus ? nil : runtimeStatuses[key]
             let isLoaded = runtimeStatus != nil
+            let classification = provenanceClassifier.classify(
+                source: .launchd,
+                command: configuration.command,
+                configPath: configuration.configPath
+            )
             return Job(
                 id: jobID(label: configuration.label, configPath: configuration.configPath),
                 source: .launchd,
+                provenance: classification.provenance,
+                attention: classification.attention,
                 label: configuration.label,
                 schedule: configuration.schedule,
                 command: configuration.command,

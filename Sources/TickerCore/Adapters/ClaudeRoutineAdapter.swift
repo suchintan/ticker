@@ -35,6 +35,15 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
     private let searchRoots: [URL]
 
     public convenience init() {
+        #if TICKER_TESTING
+        if let paths = ProcessInfo.processInfo.environment["TICKER_TEST_CLAUDE_ROOTS"],
+           !paths.isEmpty {
+            self.init(searchRoots: paths.split(separator: ":").map {
+                URL(fileURLWithPath: String($0), isDirectory: true)
+            })
+            return
+        }
+        #endif
         let claude = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Claude", isDirectory: true)
         self.init(
@@ -230,6 +239,7 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
             job: Job(
                 id: "claude:\(taskID)",
                 source: .claudeRoutine,
+                provenance: .yours,
                 label: taskID,
                 schedule: .cron(cronExpression),
                 command: [],
@@ -260,6 +270,8 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
         Job(
             id: id,
             source: job.source,
+            provenance: job.provenance,
+            attention: job.attention,
             label: job.label,
             schedule: job.schedule,
             command: job.command,

@@ -77,6 +77,8 @@ public enum JobHealthPolicy {
 public struct Job: Identifiable, Codable, Hashable {
     public let id: String
     public let source: JobSource
+    public let provenance: JobProvenance
+    public let attention: JobAttention?
     public let label: String
     public let schedule: Schedule
     public let command: [String]
@@ -101,6 +103,8 @@ public struct Job: Identifiable, Codable, Hashable {
     public init(
         id: String,
         source: JobSource,
+        provenance: JobProvenance? = nil,
+        attention: JobAttention? = nil,
         label: String,
         schedule: Schedule,
         command: [String],
@@ -124,6 +128,11 @@ public struct Job: Identifiable, Codable, Hashable {
     ) {
         self.id = id
         self.source = source
+        self.provenance = provenance
+            ?? (source == .launchd
+                ? .unknown("launchd job was not classified")
+                : .yours)
+        self.attention = attention
         self.label = label
         self.schedule = schedule
         self.command = command
@@ -151,7 +160,18 @@ public struct Job: Identifiable, Codable, Hashable {
     }
 
     public var canRunNow: Bool {
-        !command.isEmpty && runNowUnavailableReason == nil
+        !command.isEmpty && effectiveRunNowUnavailableReason == nil
+    }
+
+    public var effectiveRunNowUnavailableReason: String? {
+        if case .missingPayload(let path) = attention {
+            return "The job's payload does not exist at \(path)."
+        }
+        return runNowUnavailableReason
+    }
+
+    public var isBroken: Bool {
+        attention != nil
     }
 
     public var runtimeStatusExplanation: String? {
@@ -193,6 +213,8 @@ public struct Job: Identifiable, Codable, Hashable {
     private enum CodingKeys: String, CodingKey {
         case id
         case source
+        case provenance
+        case attention
         case label
         case schedule
         case command

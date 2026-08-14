@@ -46,6 +46,10 @@ private struct ExitStatusRecord: Encodable {
 private struct ListRecord: Encodable {
     let id: String
     let source: JobSource
+    let provenance: JobProvenance
+    let attention: JobAttention?
+    let isBroken: Bool
+    let needsAttention: Bool
     let label: String
     let schedule: String
     let command: [String]
@@ -72,6 +76,12 @@ private struct ListRecord: Encodable {
     init(job: Job, lastOutcome: Outcome) {
         id = job.id
         source = job.source
+        provenance = job.provenance
+        attention = job.attention
+        isBroken = job.isBroken
+        needsAttention = job.isBroken
+            || lastOutcome == .failure
+            || job.runtimeStatusAttribution == .ambiguous
         label = job.label
         schedule = job.schedule.humanDescription
         command = job.command
@@ -100,6 +110,10 @@ private struct ListRecord: Encodable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(id, forKey: .id)
         try container.encode(source, forKey: .source)
+        try container.encode(provenance, forKey: .provenance)
+        try encode(attention, into: &container, forKey: .attention)
+        try container.encode(isBroken, forKey: .isBroken)
+        try container.encode(needsAttention, forKey: .needsAttention)
         try container.encode(label, forKey: .label)
         try container.encode(schedule, forKey: .schedule)
         try container.encode(command, forKey: .command)
@@ -139,6 +153,10 @@ private struct ListRecord: Encodable {
     private enum CodingKeys: String, CodingKey {
         case id
         case source
+        case provenance
+        case attention
+        case isBroken
+        case needsAttention
         case label
         case schedule
         case command
@@ -458,7 +476,7 @@ private struct TickerCLI {
             guard job.canRunNow else {
                 throw CLIError.operation(
                     "Cannot run \(job.label) manually: "
-                        + (job.runNowUnavailableReason
+                        + (job.effectiveRunNowUnavailableReason
                             ?? "Ticker cannot faithfully reproduce its scheduled execution context.")
                 )
             }
@@ -713,23 +731,35 @@ private struct TickerCLI {
         }
         let rows = records.map { record in
             [
+                record.provenance.displayName,
                 record.source.rawValue,
-                record.runtimeStatusAttribution == .ambiguous
-                    ? "ambiguous"
-                    : (record.enabled ? "on" : "off"),
+                record.isBroken
+                    ? "broken"
+                    : (record.runtimeStatusAttribution == .ambiguous
+                        ? "needs-attention"
+                        : (record.enabled ? "on" : "off")),
                 record.id,
                 record.label + (record.managed ? "*" : ""),
                 record.schedule,
                 record.nextFireAt.map(formatDate) ?? "—",
                 record.lastOutcome.rawValue,
                 record.runtimeStatusAttribution?.rawValue ?? "—",
+                record.attention?.summary ?? "—",
             ]
         }
         printTable(
-            headers: ["SOURCE", "STATE", "ID", "JOB", "SCHEDULE", "NEXT FIRE", "OUTCOME", "RUNTIME"],
+            headers: [
+                "OWNER", "SOURCE", "STATE", "ID", "JOB", "SCHEDULE", "NEXT FIRE",
+                "OUTCOME", "RUNTIME", "ATTENTION",
+            ],
             rows: rows
         )
         print("\n* managed by Ticker")
+        for record in records {
+            if case .missingPayload(let path) = record.attention {
+                print("\(record.id) [broken]: missing payload at \(path)")
+            }
+        }
         for record in records where record.source == .launchd {
             if let attribution = record.runtimeStatusAttribution,
                let explanation = record.runtimeStatusExplanation {
@@ -859,13 +889,14 @@ private struct TickerCLI {
         for job in discoveredJobs.filter({ $0.source == .launchd }).sorted(by: { $0.id < $1.id }) {
             do {
                 let recovery = try wrapper.recoveryState(job: job).description
+                let attention = job.attention.map { "\tbroken: missing payload at \($0.path)" } ?? ""
                 if job.runtimeStatusAttribution == .ambiguous {
-                    print("\(job.id)\t\(recovery)\tambiguous-runtime")
+                    print("\(job.id)\t\(recovery)\tambiguous-runtime\(attention)")
                     if let explanation = job.runtimeStatusExplanation {
                         print("\t\(explanation)")
                     }
                 } else {
-                    print("\(job.id)\t\(recovery)")
+                    print("\(job.id)\t\(recovery)\(attention)")
                 }
             } catch {
                 print("\(job.id)\terror: \(error.localizedDescription)")

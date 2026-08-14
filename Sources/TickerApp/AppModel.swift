@@ -216,6 +216,37 @@ final class AppModel: ObservableObject {
         )
     }
 
+    var hasUrgentIssuesInMyJobs: Bool {
+        jobs.contains { $0.provenance == .yours && needsAttention($0) }
+    }
+
+    func needsAttention(_ job: Job) -> Bool {
+        if job.attention != nil {
+            return true
+        }
+        guard job.enabled else {
+            return false
+        }
+        return outcome(for: job) == .failure
+            || job.runtimeStatusAttribution == .ambiguous
+            || (job.skew.map { $0 > 3_600 } ?? false)
+            || skipStorm(for: job) != nil
+            || wrapperNeedsAttention(job)
+    }
+
+    func wrapperNeedsAttention(_ job: Job) -> Bool {
+        if recoveryStateErrors[job.id] != nil {
+            return true
+        }
+        switch recoveryStates[job.id] {
+        case .identityChanged, .wrappedMissingBackup, .wrappedBackupContentMismatch,
+             .ambiguousTickerInvocation, .wrappedForeignLabel, .staleManagedRow:
+            return true
+        case .unwrapped, .wrappedConsistent, .none:
+            return false
+        }
+    }
+
     func isManaged(_ job: Job) -> Bool {
         switch recoveryStates[job.id] {
         case .wrappedConsistent, .identityChanged, .wrappedMissingBackup,
@@ -320,7 +351,7 @@ final class AppModel: ObservableObject {
 
     func runNow(_ job: Job) {
         guard job.canRunNow else {
-            let reason = job.runNowUnavailableReason
+            let reason = job.effectiveRunNowUnavailableReason
                 ?? "Ticker does not have a faithful command for this job."
             appendError("Cannot run \(job.label): \(reason)")
             return

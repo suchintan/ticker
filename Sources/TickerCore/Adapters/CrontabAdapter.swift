@@ -129,6 +129,7 @@ public final class CrontabAdapter: JobSourceAdapter {
                 Job(
                     id: identifier,
                     source: .crontab,
+                    provenance: .yours,
                     label: entry.command,
                     schedule: entry.schedule,
                     command: [shell, "-c", entry.command],

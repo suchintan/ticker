@@ -20,7 +20,7 @@ struct JobRunNowPresentation: Equatable {
             disabledTitle = "Claude routines cannot run from Ticker"
             disabledDetail = "Ticker observes Claude routines but cannot faithfully re-run them. Trigger this routine from Claude."
         } else {
-            let reason = job.runNowUnavailableReason
+            let reason = job.effectiveRunNowUnavailableReason
                 ?? "Ticker cannot faithfully reproduce this job's scheduled execution context."
             helpText = reason
             disabledTitle = "Run Now is unavailable"
@@ -34,87 +34,159 @@ struct JobDetailView: View {
     let job: Job
 
     @State private var selectedRunID: Int64?
+    @State private var showManualRunWhy = false
+    @State private var showRewriteConfirmation = false
 
     private var runs: [Run] {
         model.runsByJob[job.id] ?? []
     }
 
     private var selectedRun: Run? {
-        guard let selectedRunID = selectedRunID else {
+        guard let selectedRunID else {
             return nil
         }
         return runs.first { $0.id == selectedRunID }
     }
 
+    private var displayName: String {
+        JobDisplayName.candidate(for: job.label)
+    }
+
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 20) {
                 header
-                callouts
-                actionButtons
+                healthSummary
+                actionableAlerts
+                primaryActions
 
                 if let message = model.actionMessages[job.id] {
                     ActionMessageView(message: message)
                 }
 
-                Divider()
-                configuration
-                Divider()
                 history
                 output
+                configuration
+                advanced
             }
-            .padding(16)
+            .padding(20)
         }
+        .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             model.loadRuns(for: job)
         }
         .onReceive(model.$runsByJob) { _ in
-            if let selectedRunID = selectedRunID,
+            if let selectedRunID,
                runs.contains(where: { $0.id == selectedRunID }) {
                 return
             }
             selectedRunID = runs.first?.id
         }
+        .sheet(isPresented: $showRewriteConfirmation) {
+            RewriteConfirmationSheet(
+                plistName: job.configPath.map { URL(fileURLWithPath: $0).lastPathComponent }
+                    ?? job.label,
+                actionTitle: model.wrappingButtonTitle(for: job),
+                detail: rewriteConfirmationDetail,
+                confirm: {
+                    showRewriteConfirmation = false
+                    model.toggleWrapping(job)
+                },
+                cancel: { showRewriteConfirmation = false }
+            )
+        }
     }
 
     private var header: some View {
-        HStack(alignment: .top) {
-            VStack(alignment: .leading, spacing: 5) {
-                Text(job.label)
-                    .font(.title2.bold())
-                    .textSelection(.enabled)
-                Text(job.source == .claudeRoutine ? "Claude routine" : job.source.rawValue)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 4) {
-                DetailOutcomeBadge(outcome: model.outcome(for: job))
-                if let attribution = job.runtimeStatusAttribution,
-                   let explanation = job.runtimeStatusExplanation {
-                    Text("Runtime: \(attribution.rawValue)")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundColor(attribution == .ambiguous ? .orange : .secondary)
-                    Text(explanation)
-                        .font(.caption2)
-                        .foregroundColor(attribution == .ambiguous ? .orange : .secondary)
-                        .multilineTextAlignment(.trailing)
-                        .frame(maxWidth: 320, alignment: .trailing)
-                        .textSelection(.enabled)
+        VStack(alignment: .leading, spacing: 5) {
+            Text(displayName)
+                .font(.title3.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(displayName)
+            Text(job.label)
+                .font(.caption)
+                .monospaced()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(job.label)
+                .textSelection(.enabled)
+            Text("\(job.provenance.displayName) · \(sourceName)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var healthSummary: some View {
+        Group {
+            if case .missingPayload(let path) = job.attention {
+                HealthSummaryView(
+                    color: .red,
+                    icon: "xmark.circle.fill",
+                    title: "This job cannot run",
+                    detail: "Its payload is missing at \(path)."
+                )
+            } else if !job.enabled {
+                HealthSummaryView(
+                    color: .secondary,
+                    icon: "pause.circle",
+                    title: "This job is disabled",
+                    detail: "Ticker will keep showing its configuration and existing history."
+                )
+            } else {
+                switch model.outcome(for: job) {
+                case .failure:
+                    HealthSummaryView(
+                        color: .red,
+                        icon: "xmark.circle.fill",
+                        title: "The last observed run failed",
+                        detail: lastEvidenceText
+                    )
+                case .running:
+                    HealthSummaryView(
+                        color: .blue,
+                        icon: "arrow.triangle.2.circlepath",
+                        title: "Running now",
+                        detail: lastEvidenceText
+                    )
+                case .success:
+                    HealthSummaryView(
+                        color: .green,
+                        icon: "checkmark.circle",
+                        title: "The last observed run succeeded",
+                        detail: lastEvidenceText
+                    )
+                case .unknown:
+                    HealthSummaryView(
+                        color: .secondary,
+                        icon: "questionmark.circle",
+                        title: "No run evidence",
+                        detail: noEvidenceText
+                    )
                 }
             }
         }
     }
 
     @ViewBuilder
-    private var callouts: some View {
+    private var actionableAlerts: some View {
+        if case .missingPayload(let path) = job.attention {
+            DetailCallout(
+                color: .red,
+                icon: "exclamationmark.triangle.fill",
+                title: "Missing payload",
+                detail: "Ticker found the job, but \(path) does not exist. Restore the file or update the plist command."
+            )
+        }
+
         if let skew = job.skew, skew > 3_600,
            let scheduledFor = job.lastScheduledFor,
            let ranAt = job.lastRunAt {
             DetailCallout(
                 color: .orange,
                 icon: "clock.badge.exclamationmark",
-                title: "ran \(String(format: "%.1fh", skew / 3_600)) late",
+                title: "Ran \(String(format: "%.1fh", skew / 3_600)) late",
                 detail: "Scheduled \(Self.dateTime(scheduledFor)); started \(Self.dateTime(ranAt))."
             )
         }
@@ -128,206 +200,119 @@ struct JobDetailView: View {
             )
         }
 
-        let runNow = JobRunNowPresentation(job: job, busy: model.busyJobIDs.contains(job.id))
-        if let title = runNow.disabledTitle, let detail = runNow.disabledDetail {
+        if job.runtimeStatusAttribution == .ambiguous {
             DetailCallout(
-                color: .blue,
-                icon: "play.slash.fill",
-                title: title,
-                detail: detail
+                color: .orange,
+                icon: "questionmark.diamond.fill",
+                title: "Runtime status is ambiguous",
+                detail: "Another plist uses the same label, so Ticker cannot safely assign launchd's runtime record."
             )
         }
 
-        if job.source == .launchd {
-            if let recoveryError = model.recoveryStateError(for: job) {
-                DetailCallout(
-                    color: .red,
-                    icon: "exclamationmark.triangle.fill",
-                    title: "Wrapper recovery could not be verified",
-                    detail: recoveryError
-                )
-            } else {
-                switch model.recoveryState(for: job) {
-                case .wrappedMissingBackup:
-                    DetailCallout(
-                        color: .orange,
-                        icon: "wrench.and.screwdriver.fill",
-                        title: "History wrapper needs repair",
-                        detail: "Ticker found its wrapper but no verified backup. Repair the wrapper before you can safely restore this job."
-                    )
-                case .wrappedBackupContentMismatch:
-                    DetailCallout(
-                        color: .red,
-                        icon: "exclamationmark.shield.fill",
-                        title: "Backup integrity check failed",
-                        detail: "Ticker's backup does not match its authenticated metadata. Ticker will not rewrite or restore this plist."
-                    )
-                case .ambiguousTickerInvocation:
-                    DetailCallout(
-                        color: .red,
-                        icon: "exclamationmark.triangle.fill",
-                        title: "Unverified wrapper command",
-                        detail: JobRecoveryState.ambiguousTickerInvocationExplanation
-                    )
-                case .wrappedForeignLabel:
-                    DetailCallout(
-                        color: .red,
-                        icon: "exclamationmark.triangle.fill",
-                        title: "Unsafe wrapper label",
-                        detail: "This plist contains a Ticker wrapper for another job. Ticker will not modify it."
-                    )
-                case .identityChanged(let previousJobID):
-                    DetailCallout(
-                        color: .orange,
-                        icon: "arrow.triangle.2.circlepath",
-                        title: "History identity changed",
-                        detail: "This authenticated wrapper still records as \(previousJobID). Reconcile it before unwrapping so existing and late history follow this job."
-                    )
-                case .staleManagedRow:
-                    DetailCallout(
-                        color: .orange,
-                        icon: "externaldrive.badge.exclamationmark",
-                        title: "Stale history record",
-                        detail: "The plist was restored outside Ticker. Wrapping it again will replace the stale record and preserve the current plist."
-                    )
-                case .unwrapped, .wrappedConsistent, .none:
-                    EmptyView()
-                }
-            }
-        }
-
-        if !model.isManaged(job) {
-            switch job.source {
-            case .launchd:
-                DetailCallout(
-                    color: .blue,
-                    icon: "info.circle.fill",
-                    title: "History is not enabled",
-                    detail: "launchd keeps only the most recent exit status. Wrap this job to record run times, duration, output, and every outcome."
-                )
-            case .crontab:
-                DetailCallout(
-                    color: .blue,
-                    icon: "info.circle.fill",
-                    title: "History is not enabled",
-                    detail: "crontab keeps no run history. Ticker does not modify crontab entries yet."
-                )
-            case .claudeRoutine:
-                DetailCallout(
-                    color: .blue,
-                    icon: "info.circle.fill",
-                    title: "Claude records starts, not outcomes",
-                    detail: "Ticker can show late runs and skip storms. Direct history wrapping for Claude routines is not available yet."
-                )
-            }
+        if let recoveryError = model.recoveryStateError(for: job) {
+            DetailCallout(
+                color: .red,
+                icon: "exclamationmark.triangle.fill",
+                title: "Wrapper recovery could not be verified",
+                detail: recoveryError
+            )
+        } else {
+            wrapperAlert
         }
     }
 
-    private var actionButtons: some View {
+    @ViewBuilder
+    private var wrapperAlert: some View {
+        switch model.recoveryState(for: job) {
+        case .wrappedMissingBackup:
+            DetailCallout(
+                color: .orange,
+                icon: "wrench.and.screwdriver.fill",
+                title: "History wrapper needs repair",
+                detail: "Ticker found its wrapper but no verified backup. Repair it before restoring this job."
+            )
+        case .wrappedBackupContentMismatch:
+            DetailCallout(
+                color: .red,
+                icon: "exclamationmark.shield.fill",
+                title: "Backup integrity check failed",
+                detail: "Ticker's backup does not match its authenticated metadata, so Ticker will not rewrite this plist."
+            )
+        case .ambiguousTickerInvocation:
+            DetailCallout(
+                color: .red,
+                icon: "exclamationmark.triangle.fill",
+                title: "Unverified wrapper command",
+                detail: JobRecoveryState.ambiguousTickerInvocationExplanation
+            )
+        case .wrappedForeignLabel:
+            DetailCallout(
+                color: .red,
+                icon: "exclamationmark.triangle.fill",
+                title: "Unsafe wrapper label",
+                detail: "This plist contains a Ticker wrapper for another job. Ticker will not modify it."
+            )
+        case .identityChanged(let previousJobID):
+            DetailCallout(
+                color: .orange,
+                icon: "arrow.triangle.2.circlepath",
+                title: "History identity changed",
+                detail: "This wrapper still records as \(previousJobID). Reconcile it before unwrapping."
+            )
+        case .staleManagedRow:
+            DetailCallout(
+                color: .orange,
+                icon: "externaldrive.badge.exclamationmark",
+                title: "Stale history record",
+                detail: "The plist was restored outside Ticker. Wrapping it again will replace the stale record."
+            )
+        case .unwrapped, .wrappedConsistent, .none:
+            EmptyView()
+        }
+    }
+
+    private var primaryActions: some View {
         let busy = model.busyJobIDs.contains(job.id)
-        let presentation = JobRunNowPresentation(
-            job: job,
-            busy: busy
-        )
+        let runNow = JobRunNowPresentation(job: job, busy: busy)
         return HStack(spacing: 8) {
-            Button {
-                model.runNow(job)
-            } label: {
-                Label("Run Now", systemImage: "play.fill")
+            if job.canRunNow {
+                Button {
+                    model.runNow(job)
+                } label: {
+                    Label("Run Now", systemImage: "play.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!runNow.isEnabled)
+                .help(runNow.helpText)
+            } else {
+                Text("Manual run unavailable")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Why?") {
+                    showManualRunWhy = true
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .popover(isPresented: $showManualRunWhy, arrowEdge: .top) {
+                    Text(runNow.disabledDetail ?? runNow.helpText)
+                        .font(.body)
+                        .padding(14)
+                        .frame(width: 300, alignment: .leading)
+                }
             }
-            .disabled(!presentation.isEnabled)
-            .help(presentation.helpText)
-
-            Button {
-                revealConfig()
-            } label: {
-                Label("Reveal Config in Finder", systemImage: "folder")
-            }
-            .disabled(job.configPath == nil)
-
-            Button {
-                model.toggleWrapping(job)
-            } label: {
-                Label(
-                    model.wrappingButtonTitle(for: job),
-                    systemImage: model.wrappingButtonIcon(for: job)
-                )
-            }
-            .disabled(busy || !model.canToggleWrapping(job))
-            .help(wrappingHelp)
 
             if busy {
                 ProgressView()
                     .controlSize(.small)
             }
-        }
-        .controlSize(.small)
-    }
-
-    private var configuration: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Configuration")
-                .font(.headline)
-
-            DetailField(label: "Command") {
-                Text(Self.displayCommand(job.command))
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
-            }
-
-            DetailField(label: "Schedule") {
-                Text(job.schedule.humanDescription)
-            }
-
-            DetailField(label: "Next fire") {
-                if let nextFire = job.nextFireAt {
-                    Text(Self.dateTime(nextFire))
-                } else {
-                    Text(job.schedule.humanDescription)
-                }
-            }
-
-            DetailField(label: "Config") {
-                if let configPath = job.configPath {
-                    Text(configPath)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                } else {
-                    Text("Not available")
-                        .foregroundColor(.secondary)
-                }
-            }
-
-            if let cwd = job.cwd {
-                DetailField(label: "Working directory") {
-                    Text(cwd)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                }
-            }
-
-            if job.canRunNow {
-                let environment = model.runEnvironment(for: job)
-                DetailField(label: "Run Now environment") {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Scheduler defaults, then job variables:")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        ForEach(environment.keys.sorted(), id: \.self) { name in
-                            Text("\(name)=\(environment[name] ?? "")")
-                                .font(.system(.caption, design: .monospaced))
-                                .textSelection(.enabled)
-                        }
-                    }
-                }
-            }
+            Spacer()
         }
     }
 
     private var history: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Last 20 runs")
+                Text("Run history")
                     .font(.headline)
                 Spacer()
                 Button {
@@ -335,35 +320,62 @@ struct JobDetailView: View {
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.borderless)
                 .help("Reload run history")
             }
 
             if runs.isEmpty {
-                Text(model.isManaged(job) ? "No recorded runs yet." : "Wrap this job to start recording runs.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, 12)
+                historyEmptyState
             } else {
-                VStack(spacing: 3) {
-                    ForEach(runs) { run in
-                        RunHistoryRow(run: run, selected: selectedRunID == run.id) {
-                            selectedRunID = run.id
-                        }
+                Table(runs, selection: $selectedRunID) {
+                    TableColumn("Started") { run in
+                        Text(Self.dateTime(run.startedAt))
+                    }
+                    TableColumn("Result") { run in
+                        RunOutcomeView(outcome: run.outcome)
+                    }
+                    TableColumn("Trigger") { run in
+                        Text(run.trigger == .manual ? "Manual" : "Scheduled")
+                    }
+                    TableColumn("Duration") { run in
+                        Text(Self.durationText(run))
+                    }
+                    TableColumn("Exit") { run in
+                        Text(run.exitCode.map(String.init) ?? "—")
+                            .monospaced()
                     }
                 }
+                .frame(height: 200)
             }
         }
+    }
+
+    private var historyEmptyState: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(historyEmptyText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if job.provenance.isYours,
+               job.source == .launchd,
+               job.attention == nil,
+               !model.isManaged(job),
+               model.canToggleWrapping(job) {
+                Button("Enable Run History…") {
+                    showRewriteConfirmation = true
+                }
+                .controlSize(.small)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 10)
     }
 
     @ViewBuilder
     private var output: some View {
         if let run = selectedRun {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Captured output")
+                Text("Selected run output")
                     .font(.headline)
-
                 ScrollView([.horizontal, .vertical]) {
                     VStack(alignment: .leading, spacing: 12) {
                         OutputSection(title: "stdout", text: run.stdoutTail)
@@ -374,25 +386,182 @@ struct JobDetailView: View {
                 }
                 .frame(minHeight: 120, maxHeight: 220)
                 .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
-
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
-                        .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
+                        .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
                 )
             }
         }
     }
 
-    private var wrappingHelp: String {
-        switch job.source {
-        case .launchd:
-            return "Rewrite this job to run through the Ticker history recorder."
-        case .crontab:
-            return "crontab wrapping is not available yet."
-        case .claudeRoutine:
-            return "Claude routine wrapping is on the roadmap."
+    private var configuration: some View {
+        DisclosureGroup("Configuration") {
+            VStack(alignment: .leading, spacing: 12) {
+                DetailField(label: "Command") {
+                    ScrollView(.horizontal) {
+                        Text(Self.displayCommand(job.command))
+                            .font(.caption)
+                            .monospaced()
+                            .fixedSize(horizontal: true, vertical: false)
+                            .textSelection(.enabled)
+                    }
+                    .padding(8)
+                    .background(
+                        Color(nsColor: .controlBackgroundColor),
+                        in: RoundedRectangle(cornerRadius: 6)
+                    )
+                }
+
+                DetailField(label: "Schedule") {
+                    Text(job.schedule.humanDescription)
+                }
+
+                DetailField(label: "Next fire") {
+                    Text(job.nextFireAt.map(Self.dateTime) ?? "Not scheduled")
+                        .foregroundStyle(job.nextFireAt == nil ? .secondary : .primary)
+                }
+
+                DetailField(label: "Config") {
+                    HStack(spacing: 8) {
+                        if let configPath = job.configPath {
+                            PathText(path: configPath)
+                            Button {
+                                revealConfig()
+                            } label: {
+                                Label("Show in Finder", systemImage: "folder")
+                            }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                        } else {
+                            Text("Not available")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                if let cwd = job.cwd {
+                    DetailField(label: "Working directory") {
+                        PathText(path: cwd)
+                    }
+                }
+            }
+            .padding(.top, 10)
+        }
+        .font(.body)
+    }
+
+    private var advanced: some View {
+        DisclosureGroup("Advanced") {
+            VStack(alignment: .leading, spacing: 12) {
+                if let explanation = job.runtimeStatusExplanation {
+                    DisclosureGroup(runtimeDisclosureTitle) {
+                        Text(explanation)
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .padding(.top, 6)
+                    }
+                }
+
+                let environment = model.runEnvironment(for: job)
+                DisclosureGroup("Environment (\(environment.count))") {
+                    Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
+                        ForEach(environment.keys.sorted(), id: \.self) { name in
+                            GridRow {
+                                Text(name)
+                                    .font(.caption)
+                                    .monospaced()
+                                    .foregroundStyle(.secondary)
+                                Text(environment[name] ?? "")
+                                    .font(.caption)
+                                    .monospaced()
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .help(environment[name] ?? "")
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                    .padding(.top, 6)
+                }
+
+                if shouldShowAdvancedWrapping {
+                    Divider()
+                    Text("Run history integration")
+                        .font(.headline)
+                    Text("Ticker must rewrite this plist. You will need to reload it after the change.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button(model.wrappingButtonTitle(for: job)) {
+                        showRewriteConfirmation = true
+                    }
+                    .disabled(model.busyJobIDs.contains(job.id) || !model.canToggleWrapping(job))
+                }
+            }
+            .padding(.top, 10)
         }
     }
+
+    private var historyEmptyText: String {
+        if model.isManaged(job) {
+            return "No recorded runs yet."
+        }
+        switch job.source {
+        case .launchd:
+            return job.provenance.isYours
+                ? "Run history is not enabled for this job."
+                : "Ticker has no captured history for this app or system job."
+        case .crontab:
+            return "crontab does not provide run history."
+        case .claudeRoutine:
+            return "Claude records starts and skips, but not complete outcomes."
+        }
+    }
+
+    private var shouldShowAdvancedWrapping: Bool {
+        guard job.source == .launchd else {
+            return false
+        }
+        return !job.provenance.isYours
+            || model.isManaged(job)
+            || model.wrapperNeedsAttention(job)
+    }
+
+    private var rewriteConfirmationDetail: String {
+        "Ticker will rewrite this plist's command. Ticker does not reload launchd jobs automatically; you must run the reload commands shown after the change."
+    }
+
+    private var sourceName: String {
+        switch job.source {
+        case .launchd: return "launchd"
+        case .crontab: return "crontab"
+        case .claudeRoutine: return "Claude routine"
+        }
+    }
+
+    private var runtimeDisclosureTitle: String {
+        switch job.runtimeStatusAttribution {
+        case .ambiguous, .unavailable, .recordWithoutExit:
+            return "Why Ticker can’t verify this"
+        case .resolved, .neverExited, .none:
+            return "Runtime attribution"
+        }
+    }
+
+    private var noEvidenceText: String {
+        if job.source == .launchd {
+            return "launchd has no runtime record for this job. It may not be loaded."
+        }
+        return "Ticker has not observed a completed scheduled run."
+    }
+
+    private var lastEvidenceText: String {
+        guard let date = job.nativeStatusObservedAt ?? job.lastRunAt else {
+            return "Ticker has runtime evidence but no timestamp for it."
+        }
+        return "Observed \(Self.dateTime(date))."
+    }
+
     private func revealConfig() {
         guard let configPath = job.configPath else {
             return
@@ -407,6 +576,15 @@ struct JobDetailView: View {
         return formatter.string(from: date)
     }
 
+    private static func durationText(_ run: Run) -> String {
+        guard let duration = run.duration else {
+            return run.outcome == .running ? "Running" : "—"
+        }
+        return duration >= 60
+            ? String(format: "%.1fm", duration / 60)
+            : String(format: "%.1fs", duration)
+    }
+
     private static func displayCommand(_ command: [String]) -> String {
         if command.isEmpty {
             return "No command"
@@ -417,6 +595,30 @@ struct JobDetailView: View {
             }
             return "'\(argument.replacingOccurrences(of: "'", with: "'\\''"))'"
         }.joined(separator: " ")
+    }
+}
+
+private struct HealthSummaryView: View {
+    let color: Color
+    let icon: String
+    let title: String
+    let detail: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .font(.title3)
+                .foregroundStyle(color)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.headline)
+                Text(detail)
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -433,11 +635,25 @@ private struct DetailField<Content: View>: View {
         HStack(alignment: .top, spacing: 10) {
             Text(label)
                 .font(.caption)
-                .foregroundColor(.secondary)
-                .frame(width: 92, alignment: .trailing)
+                .foregroundStyle(.secondary)
+                .frame(width: 96, alignment: .trailing)
             content
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+}
+
+private struct PathText: View {
+    let path: String
+
+    var body: some View {
+        Text(path)
+            .font(.caption)
+            .monospaced()
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .help(path)
+            .textSelection(.enabled)
     }
 }
 
@@ -450,13 +666,13 @@ private struct DetailCallout: View {
     var body: some View {
         HStack(alignment: .top, spacing: 9) {
             Image(systemName: icon)
-                .foregroundColor(color)
+                .foregroundStyle(color)
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
-                    .font(.caption.bold())
+                    .font(.headline)
                 Text(detail)
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+                    .font(.body)
+                    .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -466,125 +682,24 @@ private struct DetailCallout: View {
     }
 }
 
-private struct DetailOutcomeBadge: View {
+private struct RunOutcomeView: View {
     let outcome: Outcome
 
     var body: some View {
-        Label(title, systemImage: icon)
-            .font(.caption.bold())
-            .foregroundColor(color)
-    }
-
-    private var title: String {
         switch outcome {
         case .running:
-            return "Running"
+            Label("Running", systemImage: "arrow.triangle.2.circlepath")
+                .foregroundStyle(.blue)
         case .success:
-            return "Success"
+            Label("Success", systemImage: "checkmark.circle")
+                .foregroundStyle(.secondary)
         case .failure:
-            return "Failure"
+            Label("Failed", systemImage: "xmark.circle.fill")
+                .foregroundStyle(.red)
         case .unknown:
-            return "Unknown"
+            Label("Unknown", systemImage: "questionmark.circle")
+                .foregroundStyle(.secondary)
         }
-    }
-
-    private var icon: String {
-        switch outcome {
-        case .running:
-            return "arrow.triangle.2.circlepath"
-        case .success:
-            return "checkmark.circle.fill"
-        case .failure:
-            return "xmark.circle.fill"
-        case .unknown:
-            return "questionmark.circle"
-        }
-    }
-
-    private var color: Color {
-        switch outcome {
-        case .running:
-            return .blue
-        case .success:
-            return .green
-        case .failure:
-            return .red
-        case .unknown:
-            return .gray
-        }
-    }
-}
-
-private struct RunHistoryRow: View {
-    let run: Run
-    let selected: Bool
-    let select: () -> Void
-
-    var body: some View {
-        Button(action: select) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(outcomeColor)
-                    .frame(width: 7, height: 7)
-                Text(Self.dateTime(run.startedAt))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Text(run.trigger.rawValue)
-                    .foregroundColor(run.trigger == .manual ? .orange : .secondary)
-                    .frame(width: 64, alignment: .leading)
-                Text(durationText)
-                    .foregroundColor(.secondary)
-                    .frame(width: 62, alignment: .trailing)
-                Text(exitText)
-                    .font(.system(.caption2, design: .monospaced))
-                    .frame(width: 52, alignment: .trailing)
-            }
-            .font(.caption)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 5)
-                    .fill(selected ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.05))
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private var outcomeColor: Color {
-        switch run.outcome {
-        case .running:
-            return .blue
-        case .success:
-            return .green
-        case .failure:
-            return .red
-        case .unknown:
-            return .gray
-        }
-    }
-
-    private var durationText: String {
-        guard let duration = run.duration else {
-            return run.outcome == .running ? "running" : "—"
-        }
-        if duration >= 60 {
-            return String(format: "%.1fm", duration / 60)
-        }
-        return String(format: "%.1fs", duration)
-    }
-
-    private var exitText: String {
-        guard let exitCode = run.exitCode else {
-            return "exit —"
-        }
-        return "exit \(exitCode)"
-    }
-
-    private static func dateTime(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .short
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
     }
 }
 
@@ -595,16 +710,17 @@ private struct OutputSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title)
-                .font(.caption.bold())
-                .foregroundColor(.secondary)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
             Text(displayText)
-                .font(.system(.caption, design: .monospaced))
+                .font(.caption)
+                .monospaced()
                 .textSelection(.enabled)
         }
     }
 
     private var displayText: String {
-        guard let text = text, !text.isEmpty else {
+        guard let text, !text.isEmpty else {
             return "No captured output"
         }
         return text
@@ -616,10 +732,39 @@ private struct ActionMessageView: View {
 
     var body: some View {
         Text(message)
-            .font(.system(.caption, design: .monospaced))
+            .font(.caption)
+            .monospaced()
             .textSelection(.enabled)
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct RewriteConfirmationSheet: View {
+    let plistName: String
+    let actionTitle: String
+    let detail: String
+    let confirm: () -> Void
+    let cancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label("Rewrite \(plistName)?", systemImage: "doc.badge.gearshape")
+                .font(.headline)
+            Text(detail)
+                .font(.body)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Cancel", action: cancel)
+                    .keyboardShortcut(.cancelAction)
+                Button(actionTitle, action: confirm)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
     }
 }

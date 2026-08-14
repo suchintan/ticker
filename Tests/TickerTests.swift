@@ -2810,16 +2810,94 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                     JobNextFirePresentation.relativeText(for: .onDemand, nextFire: nil),
                 ]
                 try check(
-                    nextFireLabels == [
-                        "kept alive",
-                        "at load",
-                        "when /tmp/watch changes",
-                        "when /tmp/queue is not empty",
-                        "on demand",
-                    ],
-                    "automatic trigger next-fire text was mislabeled"
+                    nextFireLabels.allSatisfy { $0 == nil },
+                    "test13_nonTemporalSchedules_omitDuplicateNextFireText"
                 )
-                try check(Set(nextFireLabels).count == 5, "automatic trigger labels were not distinct")
+                try check(
+                    nextFireLabels.compactMap { $0 }.isEmpty,
+                    "test13_nonTemporalSchedules_haveNoSecondLineValue"
+                )
+
+                try check(
+                    JobDisplayName.candidate(for: "com.skyvern.daily-summary") == "Daily summary",
+                    "test13_displayName_humanizesSafeFinalComponent"
+                )
+                try check(
+                    JobDisplayName.candidate(for: "com.bjango.istatmenus.fans")
+                        == "com.bjango.istatmenus.fans",
+                    "test13_displayName_preservesLossySingleComponentLabel"
+                )
+                let duplicateUser = Job(
+                    id: "launchd:cyolo-user",
+                    source: .launchd,
+                    provenance: .app("Cyolo"),
+                    label: "Cyolo",
+                    schedule: .atLoad,
+                    command: ["open", "/Applications/Cyolo.app"],
+                    cwd: nil,
+                    enabled: true,
+                    configPath: FileManager.default.homeDirectoryForCurrentUser
+                        .appendingPathComponent("Library/LaunchAgents/Cyolo.plist").path,
+                    lastKnownExit: nil,
+                    lastRunAt: nil,
+                    lastScheduledFor: nil,
+                    managed: false
+                )
+                let duplicateLocal = Job(
+                    id: "launchd:cyolo-local",
+                    source: .launchd,
+                    provenance: .app("Cyolo"),
+                    label: "Cyolo",
+                    schedule: .keepAlive,
+                    command: ["/Library/Application Support/cyolo/connect/connect"],
+                    cwd: nil,
+                    enabled: true,
+                    configPath: "/Library/LaunchAgents/Cyolo.plist",
+                    lastKnownExit: nil,
+                    lastRunAt: nil,
+                    lastScheduledFor: nil,
+                    managed: false
+                )
+                try check(
+                    JobDisplayName.disambiguated(
+                        for: duplicateUser,
+                        among: [duplicateUser, duplicateLocal]
+                    ) == "Cyolo — User"
+                        && JobDisplayName.disambiguated(
+                            for: duplicateLocal,
+                            among: [duplicateUser, duplicateLocal]
+                        ) == "Cyolo — Local",
+                    "test13_displayName_disambiguatesIdenticalLabelsWithinGroup"
+                )
+
+                let vendorFailure = makeJob(
+                    id: "launchd:vendor-failure",
+                    source: .launchd,
+                    provenance: .app("Vendor"),
+                    environment: [:],
+                    command: ["/Applications/Vendor.app/Contents/MacOS/Vendor"],
+                    lastKnownExit: ExitStatus(raw: 1)
+                )
+                model.jobs = [vendorFailure]
+                try check(
+                    !model.hasUrgentIssuesInMyJobs,
+                    "test13_vendorFailure_doesNotSetUrgentMenuBarState"
+                )
+                let missingPayload = "/tmp/test13-gone.sh"
+                let ownerFailure = makeJob(
+                    id: "launchd:owner-missing",
+                    source: .launchd,
+                    provenance: .yours,
+                    attention: .missingPayload(missingPayload),
+                    environment: [:],
+                    command: ["/bin/sh", missingPayload],
+                    enabled: false
+                )
+                model.jobs = [ownerFailure]
+                try check(
+                    model.hasUrgentIssuesInMyJobs,
+                    "test13_ownerMissingPayload_setsUrgentMenuBarState"
+                )
 
                 print("APP HARNESS PASS")
             }
@@ -2842,25 +2920,31 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
             private static func makeJob(
                 id: String,
                 source: JobSource = .crontab,
+                provenance: JobProvenance? = nil,
+                attention: JobAttention? = nil,
                 label: String? = nil,
                 environment: [String: String],
                 command: [String],
                 argv0: String? = nil,
-                runNowUnavailableReason: String? = nil
+                runNowUnavailableReason: String? = nil,
+                lastKnownExit: ExitStatus? = nil,
+                enabled: Bool = true
             ) -> Job {
                 Job(
                     id: id,
                     source: source,
+                    provenance: provenance,
+                    attention: attention,
                     label: label ?? id,
                     schedule: .cron("* * * * *"),
                     command: command,
                     argv0: argv0,
                     environment: environment,
                     cwd: nil,
-                    enabled: true,
+                    enabled: enabled,
                     runNowUnavailableReason: runNowUnavailableReason,
                     configPath: nil,
-                    lastKnownExit: nil,
+                    lastKnownExit: lastKnownExit,
                     lastRunAt: nil,
                     lastScheduledFor: nil,
                     managed: false
@@ -5709,6 +5793,386 @@ private func test12_BuiltBundlePackaging(_ tests: TestHarness) throws {
     )
 }
 
+private func test13_ProvenanceClassificationAndCaching(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round13-provenance") { root in
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let plist = root.appendingPathComponent("signed.plist")
+        let signedProgram = root.appendingPathComponent("Signed Helper")
+        let teamSignedProgram = root.appendingPathComponent("Team Signed Helper")
+        try Data("plist-v1".utf8).write(to: plist)
+        try Data("binary-v1".utf8).write(to: signedProgram)
+        try Data("binary-team".utf8).write(to: teamSignedProgram)
+
+        var signatureProbeCount = 0
+        let classifier = JobProvenanceClassifier(homeDirectory: home) { _, arguments in
+            signatureProbeCount += 1
+            if arguments.last == signedProgram.path {
+                return AdapterCommandResult(
+                    status: 0,
+                    stdout: "",
+                    stderr: "Authority=Developer ID Application: CYOLO SECURITY LTD (ABC123)\n"
+                )
+            }
+            if arguments.last == teamSignedProgram.path {
+                return AdapterCommandResult(
+                    status: 0,
+                    stdout: "",
+                    stderr: "Authority=(unavailable)\nTeamIdentifier=Y93TK974AT\n"
+                )
+            }
+            return AdapterCommandResult(status: 1, stdout: "", stderr: "unsigned")
+        }
+
+        let first = classifier.classify(
+            source: .launchd,
+            command: [signedProgram.path, "/missing/app-configuration"],
+            configPath: plist.path
+        )
+        tests.expectEqual(
+            first.provenance,
+            .app("Cyolo"),
+            "test13_signatureAuthority_stripsTeamAndNormalizesCyolo"
+        )
+        tests.expectEqual(
+            signatureProbeCount,
+            1,
+            "test13_firstClassification_performsOneSignatureProbe"
+        )
+        tests.expectEqual(
+            first.attention,
+            nil,
+            "test13_signedAppAbsoluteArgument_isNotMistakenForPayload"
+        )
+
+        let second = classifier.classify(
+            source: .launchd,
+            command: [signedProgram.path, "/missing/app-configuration"],
+            configPath: plist.path
+        )
+        tests.expectEqual(second, first, "test13_cachedClassification_preservesTypedResult")
+        tests.expectEqual(
+            signatureProbeCount,
+            1,
+            "test13_unchangedClassification_performsNoNewSubprocessWork"
+        )
+        print(
+            "TRANSCRIPT test13 cache firstProbeCount=1 "
+                + "repeatProbeCount=\(signatureProbeCount) newSubprocesses=\(signatureProbeCount - 1)"
+        )
+
+        try Data("binary-v2-with-new-identity".utf8).write(to: signedProgram)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: 2)],
+            ofItemAtPath: signedProgram.path
+        )
+        _ = classifier.classify(
+            source: .launchd,
+            command: [signedProgram.path, "/missing/app-configuration"],
+            configPath: plist.path
+        )
+        tests.expectEqual(
+            signatureProbeCount,
+            2,
+            "test13_programIdentityChange_invalidatesClassificationCache"
+        )
+
+        try Data("plist-v2".utf8).write(to: plist)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: 4)],
+            ofItemAtPath: plist.path
+        )
+        _ = classifier.classify(
+            source: .launchd,
+            command: [signedProgram.path, "/missing/app-configuration"],
+            configPath: plist.path
+        )
+        tests.expectEqual(
+            signatureProbeCount,
+            3,
+            "test13_plistIdentityOrMtimeChange_invalidatesClassificationCache"
+        )
+
+        tests.expectEqual(
+            classifier.classify(
+                source: .launchd,
+                command: [teamSignedProgram.path],
+                configPath: root.appendingPathComponent("team-signed.plist").path
+            ).provenance,
+            .app("Bjango Pty Ltd"),
+            "test13_redactedAuthority_usesStableDeveloperTeamIdentity"
+        )
+
+        let missingScript = home.appendingPathComponent("scripts/gone.sh").path
+        let payloadPlist = root.appendingPathComponent("payload.plist")
+        try Data("payload".utf8).write(to: payloadPlist)
+        let payload = classifier.classify(
+            source: .launchd,
+            command: ["/bin/sh", missingScript],
+            configPath: payloadPlist.path
+        )
+        tests.expectEqual(payload.provenance, .yours, "test13_homePayload_isYours")
+        tests.expectEqual(
+            payload.attention,
+            .missingPayload(missingScript),
+            "test13_missingPayload_isFirstClassAttentionState"
+        )
+
+        tests.expectEqual(
+            classifier.classify(
+                source: .launchd,
+                command: ["open", "/Applications/Cyolo.app"],
+                configPath: root.appendingPathComponent("cyolo.plist").path
+            ).provenance,
+            .app("Cyolo"),
+            "test13_vendorPayload_normalizesToSameCyoloOwner"
+        )
+        tests.expectEqual(
+            classifier.classify(
+                source: .launchd,
+                command: ["/bin/sh", "/var/lib/oneleet/updater.sh"],
+                configPath: root.appendingPathComponent("oneleet.plist").path
+            ).provenance,
+            .app("oneleet"),
+            "test13_vendorPayload_usesFirstVendorPathSegment"
+        )
+        tests.expectEqual(
+            classifier.classify(
+                source: .launchd,
+                command: ["/opt/homebrew/opt/redis/bin/redis-server"],
+                configPath: root.appendingPathComponent("brew.plist").path
+            ).provenance,
+            .packageManager("Homebrew"),
+            "test13_packagePrefix_isHomebrew"
+        )
+        tests.expectEqual(
+            classifier.classify(
+                source: .launchd,
+                command: ["/usr/libexec/example-helper"],
+                configPath: root.appendingPathComponent("system.plist").path
+            ).provenance,
+            .system,
+            "test13_systemPrefix_isSystem"
+        )
+        if case .unknown = classifier.classify(
+            source: .launchd,
+            command: ["/usr/bin/plain-tool"],
+            configPath: root.appendingPathComponent("unknown.plist").path
+        ).provenance {
+            tests.expect(true, "test13_unattributedBinary_hasTypedUnknownReason")
+        } else {
+            tests.expect(false, "test13_unattributedBinary_hasTypedUnknownReason")
+        }
+        tests.expectEqual(
+            classifier.classify(source: .crontab, command: [], configPath: nil).provenance,
+            .yours,
+            "test13_crontab_isAlwaysYours"
+        )
+        tests.expectEqual(
+            classifier.classify(source: .claudeRoutine, command: [], configPath: nil).provenance,
+            .yours,
+            "test13_claudeRoutine_isAlwaysYours"
+        )
+
+        let encodedJob = Job(
+            id: "launchd:missing",
+            source: .launchd,
+            provenance: payload.provenance,
+            attention: payload.attention,
+            label: "com.example.missing",
+            schedule: .onDemand,
+            command: ["/bin/sh", missingScript],
+            cwd: nil,
+            enabled: true,
+            configPath: payloadPlist.path,
+            lastKnownExit: nil,
+            lastRunAt: nil,
+            lastScheduledFor: nil,
+            managed: false
+        )
+        let object = try require(
+            try JSONSerialization.jsonObject(with: JSONEncoder().encode(encodedJob))
+                as? [String: Any],
+            "test13 encoded job object"
+        )
+        tests.expect(
+            !encodedJob.canRunNow
+                && encodedJob.effectiveRunNowUnavailableReason?.contains(missingScript) == true,
+            "test13_missingPayload_disablesManualRunWithExactReason"
+        )
+        let encodedProvenance = object["provenance"] as? [String: Any]
+        let encodedAttention = object["attention"] as? [String: Any]
+        tests.expectEqual(
+            encodedProvenance?["kind"] as? String,
+            "yours",
+            "test13_jobJSON_includesTypedProvenance"
+        )
+        tests.expectEqual(
+            encodedAttention?["kind"] as? String,
+            "missingPayload",
+            "test13_jobJSON_includesTypedAttention"
+        )
+    }
+}
+
+private func test13_CLISurfacesMissingPayload(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round13-cli") { root in
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        let launchAgents = home.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+        let claudeRoot = root.appendingPathComponent("claude-empty", isDirectory: true)
+        try FileManager.default.createDirectory(at: launchAgents, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: claudeRoot, withIntermediateDirectories: true)
+        let missingPayload = home.appendingPathComponent(".claude/scripts/gone.sh").path
+        try writePropertyList(
+            [
+                "Label": "com.example.test13.missing",
+                "ProgramArguments": ["/bin/sh", missingPayload],
+                "StartInterval": 60,
+            ],
+            to: launchAgents.appendingPathComponent("com.example.test13.missing.plist")
+        )
+        let launchctl = try test10_fakeLaunchctl(in: root)
+        let storePath = root.appendingPathComponent("runs.sqlite").path
+        let environment = [
+            "TICKER_TEST_HOME_DIRECTORY": home.path,
+            "TICKER_TEST_LAUNCHD_DIRECTORIES": launchAgents.path,
+            "TICKER_TEST_CLAUDE_ROOTS": claudeRoot.path,
+            "TICKER_TEST_LAUNCHCTL_PATH": launchctl.path,
+            "TICKER_STORE_PATH": storePath,
+        ]
+        let tickerPath = try test3A_builtCLIPath()
+
+        let list = try test3A_runProcess(tickerPath, ["list"], environment: environment)
+        tests.expectEqual(list.status, 0, "test13_list_missingPayload_exitsSuccessfully")
+        tests.expect(
+            list.stdout.contains("broken")
+                && list.stdout.contains("Missing payload")
+                && list.stdout.contains(missingPayload),
+            "test13_list_missingPayload_isVisiblyBroken"
+        )
+
+        let json = try test3A_runProcess(tickerPath, ["list", "--json"], environment: environment)
+        let records = try require(
+            try JSONSerialization.jsonObject(with: Data(json.stdout.utf8)) as? [[String: Any]],
+            "test13 list JSON records"
+        )
+        let record = try require(
+            records.first { $0["label"] as? String == "com.example.test13.missing" },
+            "test13 list JSON record"
+        )
+        let provenance = record["provenance"] as? [String: Any]
+        let attention = record["attention"] as? [String: Any]
+        tests.expectEqual(
+            provenance?["kind"] as? String,
+            "yours",
+            "test13_listJSON_reportsYoursProvenance"
+        )
+        tests.expectEqual(
+            attention?["kind"] as? String,
+            "missingPayload",
+            "test13_listJSON_reportsMissingPayloadAttention"
+        )
+        tests.expectEqual(
+            record["isBroken"] as? Bool,
+            true,
+            "test13_listJSON_reportsBrokenState"
+        )
+
+        let doctor = try test3A_runProcess(tickerPath, ["doctor"], environment: environment)
+        tests.expectEqual(doctor.status, 0, "test13_doctor_missingPayload_exitsSuccessfully")
+        tests.expect(
+            doctor.stdout.contains("broken: missing payload at \(missingPayload)"),
+            "test13_doctor_reportsMissingPayloadAsBroken"
+        )
+    }
+}
+
+private func test13_UIArchitectureContract(_ tests: TestHarness) throws {
+    let repository = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let listSource = try String(
+        contentsOf: repository.appendingPathComponent("Sources/TickerApp/JobListView.swift"),
+        encoding: .utf8
+    )
+    let detailSource = try String(
+        contentsOf: repository.appendingPathComponent("Sources/TickerApp/JobDetailView.swift"),
+        encoding: .utf8
+    )
+    let appSource = try String(
+        contentsOf: repository.appendingPathComponent("Sources/TickerApp/TickerApp.swift"),
+        encoding: .utf8
+    )
+
+    tests.expect(
+        listSource.contains("NavigationSplitView")
+            && listSource.contains("List(selection:")
+            && listSource.contains(".listStyle(.sidebar)"),
+        "test13_sidebar_usesNativeNavigationAndSelection"
+    )
+    tests.expect(
+        listSource.contains("@AppStorage")
+            && listSource.contains("DisclosureGroup")
+            && listSource.contains("Section(\"My Jobs\")"),
+        "test13_sidebar_persistsProvenanceGroupExpansion"
+    )
+    tests.expect(
+        listSource.contains(".searchable(")
+            && listSource.contains("Other Jobs")
+            && listSource.contains("Package Managers"),
+        "test13_sidebar_searchesAcrossProvenanceGroups"
+    )
+    tests.expect(
+        !listSource.contains("HSplitView")
+            && !listSource.contains("private var footer")
+            && !listSource.contains("OutcomeChip"),
+        "test13_sidebar_removesLegacyChromeAndRoutineCapsules"
+    )
+    tests.expect(
+        detailSource.contains("Table(")
+            && detailSource.contains("DisclosureGroup(\"Configuration\")")
+            && detailSource.contains("DisclosureGroup(\"Advanced\")"),
+        "test13_detail_prioritizesHistoryAndCollapsesDiagnostics"
+    )
+    tests.expect(
+        detailSource.contains("truncationMode(.middle)")
+            && detailSource.contains("textSelection(.enabled)")
+            && detailSource.contains("borderedProminent"),
+        "test13_detail_usesReviewedPathAndActionPresentation"
+    )
+    tests.expect(
+        appSource.contains("job.provenance == .yours")
+            || appSource.contains("model.hasUrgentIssuesInMyJobs"),
+        "test13_menuBarFailure_isScopedToMyJobs"
+    )
+    tests.expect(
+        listSource.contains("job.command.joined")
+            && listSource.contains("job.configPath")
+            && listSource.contains("job.provenance.displayName")
+            && listSource.contains("isSearching && hasMatches"),
+        "test13_search_coversCommandPathOwnerAndExpandsMatches"
+    )
+    tests.expect(
+        listSource.contains("if model.needsAttention(job) { return 0 }")
+            && listSource.contains("case .running: return 1")
+            && listSource.contains("case .unknown: return 2")
+            && listSource.contains("case .success: return 3")
+            && listSource.contains("if !job.enabled { return 4 }"),
+        "test13_sidebarSort_usesReviewedAttentionEvidenceOrder"
+    )
+    tests.expect(
+        detailSource.contains("RewriteConfirmationSheet")
+            && detailSource.contains("plistName:")
+            && detailSource.contains("you must run the reload commands")
+            && detailSource.contains("showRewriteConfirmation = true"),
+        "test13_plistRewrite_requiresNamedReloadConfirmation"
+    )
+    tests.expect(
+        detailSource.contains("Missing payload")
+            && detailSource.contains("This job cannot run")
+            && detailSource.contains("job.attention"),
+        "test13_detail_surfacesMissingPayloadAsBrokenAlert"
+    )
+}
+
 
 @main
 private enum TickerTests {
@@ -5716,7 +6180,33 @@ private enum TickerTests {
         if CommandLine.arguments.dropFirst().first == "--test9-crash-after-exchange" {
             test9_crashAfterFirstExchange(arguments: Array(CommandLine.arguments.dropFirst()))
         }
+        if ProcessInfo.processInfo.environment["TICKER_TEST13_UI_ONLY"] == "1" {
+            let tests = TestHarness()
+            tests.run("round 13 provenance-first UI architecture") {
+                try test13_UIArchitectureContract(tests)
+            }
+            tests.finish()
+        }
+        if ProcessInfo.processInfo.environment["TICKER_TEST13_ONLY"] == "1" {
+            let tests = TestHarness()
+            tests.run("round 13 provenance classification and cache") {
+                try test13_ProvenanceClassificationAndCaching(tests)
+            }
+            tests.run("round 13 CLI missing payload") {
+                try test13_CLISurfacesMissingPayload(tests)
+            }
+            tests.run("round 13 provenance-first UI architecture") {
+                try test13_UIArchitectureContract(tests)
+            }
+            tests.finish()
+        }
         let tests = TestHarness()
+        tests.run("round 13 provenance classification and cache") {
+            try test13_ProvenanceClassificationAndCaching(tests)
+        }
+        tests.run("round 13 CLI missing payload") {
+            try test13_CLISurfacesMissingPayload(tests)
+        }
         tests.run("ExitStatus tests") { testExitStatus(tests) }
         tests.run("cron and schedule tests") { try testCronAndSchedules(tests) }
         tests.run("launchd adapter tests") { try testLaunchdAdapter(tests) }
@@ -5838,6 +6328,9 @@ private enum TickerTests {
         }
         tests.run("round 12 built bundle packaging") {
             try test12_BuiltBundlePackaging(tests)
+        }
+        tests.run("round 13 provenance-first UI architecture") {
+            try test13_UIArchitectureContract(tests)
         }
         tests.finish()
     }
