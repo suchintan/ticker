@@ -454,7 +454,7 @@ final class AppModel: ObservableObject {
         }
         let bundled = Bundle.main.bundleURL
             .appendingPathComponent("Contents", isDirectory: true)
-            .appendingPathComponent("MacOS", isDirectory: true)
+            .appendingPathComponent("Helpers", isDirectory: true)
             .appendingPathComponent("ticker", isDirectory: false)
         if FileManager.default.isExecutableFile(atPath: bundled.path) {
             return bundled.path

@@ -754,13 +754,13 @@ private func test2A_ProgramKeyWrapping(_ tests: TestHarness) throws {
             plistURL: plistURL
         )
 
-        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/Helpers/ticker")
         let wrapped = try test2A_readPropertyList(plistURL)
         let wrappedArguments = try require(wrapped["ProgramArguments"] as? [String], "wrapped arguments")
         tests.expect(wrapped["Program"] == nil, "test2A Program-only wrap removes Program")
         tests.expectEqual(
             wrappedArguments.first,
-            "/Applications/Ticker.app/Contents/MacOS/ticker",
+            "/Applications/Ticker.app/Contents/Helpers/ticker",
             "test2A Program-only wrap makes ticker the effective executable"
         )
         tests.expectEqual(
@@ -2934,7 +2934,7 @@ private func test4A_BackupAuthenticity(_ tests: TestHarness) throws {
             plistURL: plistURL
         )
 
-        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/Helpers/ticker")
         let wrappedData = try Data(contentsOf: plistURL)
         let backupPath = try require(
             try store.managedBackupPath(jobID: job.id),
@@ -3451,7 +3451,7 @@ private func test5_UnwrapResetsHealthWithoutDeletingHistory(_ tests: TestHarness
             backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
         )
 
-        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/Helpers/ticker")
         _ = try test5_finish(
             store: store,
             jobID: job.id,
@@ -4141,7 +4141,7 @@ private func test7_UnwrapPreservesStartInterval(_ tests: TestHarness) throws {
                 "StartInterval": 3_600,
             ]
         )
-        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/Helpers/ticker")
         var edited = try test2A_readPropertyList(plistURL)
         edited["StartInterval"] = 300
         try writePropertyList(edited, to: plistURL)
@@ -4182,7 +4182,7 @@ private func test7_UnwrapPreservesEnvironmentVariables(_ tests: TestHarness) thr
                 "ProgramArguments": ["/bin/echo", "original"],
             ]
         )
-        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/Helpers/ticker")
         var edited = try test2A_readPropertyList(plistURL)
         edited["EnvironmentVariables"] = ["ADDED": "two", "ORIGINAL": "changed"]
         try writePropertyList(edited, to: plistURL)
@@ -4213,7 +4213,7 @@ private func test7_UnwrapRejectsOwnedKeyConflict(_ tests: TestHarness) throws {
                 "StartInterval": 60,
             ]
         )
-        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/Helpers/ticker")
         let backupPath = try require(
             try store.managedBackupPath(jobID: job.id),
             "test7 conflict backup path"
@@ -4275,7 +4275,7 @@ private func test7_WrapRejectsConcurrentSourceChange(_ tests: TestHarness) throw
         )
 
         do {
-            _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+            _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/Helpers/ticker")
             tests.expect(false, "test7_concurrentSourceChange_abortsWrap")
         } catch {
             tests.expect(
@@ -4433,7 +4433,7 @@ private func test7_WrapAndUnwrapPreserveFileMetadata(_ tests: TestHarness) throw
                 + aclBefore.replacingOccurrences(of: "\n", with: "|")
         )
 
-        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+        _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/Helpers/ticker")
         let afterWrap = try test7_fileMetadata(at: plistURL)
         print(
             "TRANSCRIPT test7 stat after-wrap uid=\(afterWrap.owner) gid=\(afterWrap.group) "
@@ -4515,7 +4515,7 @@ private func test7_SystemDaemonWrapIsRejected(_ tests: TestHarness) throws {
         )
 
         do {
-            _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
+            _ = try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/Helpers/ticker")
             tests.expect(false, "test7_systemDaemon_wrapIsRejected")
         } catch {
             tests.expect(
@@ -4899,7 +4899,7 @@ private func test9_PersistentIdentityAliases(_ tests: TestHarness) throws {
 
 private func test10_LegacyWrapperRemoval(_ tests: TestHarness) throws {
     let id = "launchd:com.example.test10.legacy#111111111111"
-    let unversioned = ["/Applications/Ticker.app/Contents/MacOS/ticker", "run",
+    let unversioned = ["/Applications/Ticker.app/Contents/Helpers/ticker", "run",
                        "--label", id, "--", "/usr/bin/true"]
     tests.expect(LaunchdWrapper.decode(unversioned) == nil,
                  "test10_unversionedWrapper_isNotRecognized")
@@ -4995,7 +4995,7 @@ private func test10_ConcurrentEvidenceMigration(_ tests: TestHarness) throws {
 }
 
 private func test10_ExplicitSingularIdentityReconciliation(_ tests: TestHarness) throws {
-    let tickerPath = "/Applications/Ticker.app/Contents/MacOS/ticker"
+    let tickerPath = "/Applications/Ticker.app/Contents/Helpers/ticker"
     try withTemporaryDirectory("round10-two-moves") { directory in
         let firstDirectory = directory.appendingPathComponent("first", isDirectory: true)
         let secondDirectory = directory.appendingPathComponent("second", isDirectory: true)
@@ -5367,7 +5367,7 @@ private func test11_AmbiguousWrapperExplanationMatchesCause(_ tests: TestHarness
         )
         _ = try wrapper.wrap(
             job: job,
-            tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"
+            tickerPath: "/Applications/Ticker.app/Contents/Helpers/ticker"
         )
         var edited = try test2A_readPropertyList(plistURL)
         var arguments = try require(
@@ -5510,7 +5510,7 @@ private func test9_MetadataOnlyConcurrentChange(_ tests: TestHarness) throws {
             plistURL: plistURL
         )
         tests.expectThrows(
-            try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"),
+            try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/Helpers/ticker"),
             "test9_metadataOnlyConcurrentChange_abortsRewrite"
         )
         tests.expectEqual(
@@ -5554,7 +5554,7 @@ private func test9_crashAfterFirstExchange(arguments: [String]) -> Never {
         )
         _ = try wrapper.wrap(
             job: job,
-            tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"
+            tickerPath: "/Applications/Ticker.app/Contents/Helpers/ticker"
         )
     } catch {
         Darwin._exit(92)
@@ -5631,6 +5631,82 @@ private func test9_InterruptedExchangeRecovery(_ tests: TestHarness) throws {
             "test10_recoveryScan_preservesUnrelatedExchangeRecord"
         )
     }
+}
+
+private func test12_BuiltBundlePackaging(_ tests: TestHarness) throws {
+    _ = try test3A_builtCLIPath()
+
+    let repository = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let bundle = repository.appendingPathComponent("Ticker.app", isDirectory: true)
+    let infoURL = bundle.appendingPathComponent("Contents/Info.plist")
+    let infoData = try Data(contentsOf: infoURL)
+    let info = try require(
+        try PropertyListSerialization.propertyList(
+            from: infoData,
+            options: [],
+            format: nil
+        ) as? [String: Any],
+        "test12 bundle Info.plist"
+    )
+    let executableName = try require(
+        info["CFBundleExecutable"] as? String,
+        "test12 CFBundleExecutable"
+    )
+    let version = try require(
+        info["CFBundleShortVersionString"] as? String,
+        "test12 CFBundleShortVersionString"
+    )
+    let appExecutable = bundle
+        .appendingPathComponent("Contents/MacOS", isDirectory: true)
+        .appendingPathComponent(executableName)
+    let cliExecutable = bundle
+        .appendingPathComponent("Contents/Helpers", isDirectory: true)
+        .appendingPathComponent("ticker")
+
+    tests.expect(
+        FileManager.default.isExecutableFile(atPath: appExecutable.path),
+        "test12_CFBundleExecutable_existsAndIsExecutable"
+    )
+    tests.expect(
+        FileManager.default.isExecutableFile(atPath: cliExecutable.path),
+        "test12_bundledCLI_existsAndIsExecutable"
+    )
+    tests.expect(
+        appExecutable.path.lowercased() != cliExecutable.path.lowercased(),
+        "test12_GUIAndCLIPaths_doNotCollideCaseInsensitively"
+    )
+
+    let appIdentity = try FileManager.default.attributesOfItem(atPath: appExecutable.path)[
+        .systemFileNumber
+    ] as? NSNumber
+    let cliIdentity = try FileManager.default.attributesOfItem(atPath: cliExecutable.path)[
+        .systemFileNumber
+    ] as? NSNumber
+    tests.expect(
+        appIdentity != nil && cliIdentity != nil && appIdentity != cliIdentity,
+        "test12_GUIAndCLI_areSimultaneouslyDistinctFiles"
+    )
+
+    let appLinks = try test3A_runProcess("/usr/bin/otool", ["-L", appExecutable.path])
+    let cliLinks = try test3A_runProcess("/usr/bin/otool", ["-L", cliExecutable.path])
+    tests.expectEqual(appLinks.status, 0, "test12_CFBundleExecutable_otoolSucceeds")
+    tests.expect(
+        appLinks.stdout.contains("SwiftUI.framework"),
+        "test12_CFBundleExecutable_linksSwiftUI"
+    )
+    tests.expectEqual(cliLinks.status, 0, "test12_bundledCLI_otoolSucceeds")
+    tests.expect(
+        !cliLinks.stdout.contains("SwiftUI.framework"),
+        "test12_bundledCLI_doesNotLinkSwiftUI"
+    )
+
+    let cliVersion = try test3A_runProcess(cliExecutable.path, ["--version"])
+    tests.expectEqual(cliVersion.status, 0, "test12_bundledCLI_versionExitsSuccessfully")
+    tests.expectEqual(
+        cliVersion.stdout.trimmingCharacters(in: .whitespacesAndNewlines),
+        "ticker \(version)",
+        "test12_bundledCLI_reportsBundleVersion"
+    )
 }
 
 
@@ -5759,6 +5835,9 @@ private enum TickerTests {
         }
         tests.run("round 11 ambiguous wrapper explanation") {
             try test11_AmbiguousWrapperExplanationMatchesCause(tests)
+        }
+        tests.run("round 12 built bundle packaging") {
+            try test12_BuiltBundlePackaging(tests)
         }
         tests.finish()
     }

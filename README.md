@@ -88,7 +88,7 @@ When you run `ticker wrap <launchd-job-id>`, Ticker makes these on-disk changes:
    becomes:
 
    ```text
-   ["/Applications/Ticker.app/Contents/MacOS/ticker", "run", "--ticker-wrapper-version", "1",
+   ["/Applications/Ticker.app/Contents/Helpers/ticker", "run", "--ticker-wrapper-version", "1",
     "--label", "launchd:com.foo.bar#0123456789ab", "--", "/bin/bash", "/path/to/job.sh", "--flag"]
    ```
 
