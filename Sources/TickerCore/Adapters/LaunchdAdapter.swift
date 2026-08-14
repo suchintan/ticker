@@ -17,20 +17,26 @@ private final class AdapterDataBox {
 
 internal enum AdapterCommandError: LocalizedError {
     case failed(executable: String, arguments: [String], status: Int32, output: String)
+    case timedOut(executable: String, arguments: [String], seconds: TimeInterval)
 
     internal var errorDescription: String? {
         switch self {
         case let .failed(executable, arguments, status, output):
             let command = ([executable] + arguments).joined(separator: " ")
-            if output.isEmpty {
-                return "\(command) exited with status \(status)"
-            }
-            return "\(command) exited with status \(status): \(output)"
+            return "\(command) exited with status \(status)"
+                + (output.isEmpty ? "" : ": \(output)")
+        case let .timedOut(executable, arguments, seconds):
+            let command = ([executable] + arguments).joined(separator: " ")
+            return "\(command) timed out after \(String(format: "%.1f", seconds)) seconds"
         }
     }
 }
 
-internal func runAdapterCommand(executable: URL, arguments: [String]) throws -> AdapterCommandResult {
+internal func runAdapterCommand(
+    executable: URL,
+    arguments: [String],
+    timeout: TimeInterval = 2
+) throws -> AdapterCommandResult {
     let process = Process()
     let standardOutput = Pipe()
     let standardError = Pipe()
@@ -39,8 +45,6 @@ internal func runAdapterCommand(executable: URL, arguments: [String]) throws -> 
     process.arguments = arguments
     process.standardOutput = standardOutput
     process.standardError = standardError
-
-    try process.run()
 
     let outputData = AdapterDataBox()
     let errorData = AdapterDataBox()
@@ -56,13 +60,23 @@ internal func runAdapterCommand(executable: URL, arguments: [String]) throws -> 
         readers.leave()
     }
 
-    process.waitUntilExit()
+    let exited = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in exited.signal() }
+    try process.run()
+    if exited.wait(timeout: .now() + timeout) == .timedOut {
+        process.terminate()
+        if exited.wait(timeout: .now() + .milliseconds(250)) == .timedOut {
+            _ = Darwin.kill(process.processIdentifier, SIGKILL)
+            _ = exited.wait(timeout: .now() + .seconds(1))
+        }
+        readers.wait()
+        throw AdapterCommandError.timedOut(executable: executable.path,
+                                           arguments: arguments, seconds: timeout)
+    }
     readers.wait()
-    return AdapterCommandResult(
-        status: process.terminationStatus,
+    return AdapterCommandResult(status: process.terminationStatus,
         stdout: String(decoding: outputData.data, as: UTF8.self),
-        stderr: String(decoding: errorData.data, as: UTF8.self)
-    )
+        stderr: String(decoding: errorData.data, as: UTF8.self))
 }
 
 public enum LaunchdWrapper {
@@ -70,19 +84,6 @@ public enum LaunchdWrapper {
 
     public static func decode(
         _ argv: [String]
-    ) -> (label: String, original: [String], argv0: String?)? {
-        decode(argv, requiresVersionMarker: true)
-    }
-
-    public static func decodeLegacy(
-        _ argv: [String]
-    ) -> (label: String, original: [String], argv0: String?)? {
-        decode(argv, requiresVersionMarker: false)
-    }
-
-    private static func decode(
-        _ argv: [String],
-        requiresVersionMarker: Bool
     ) -> (label: String, original: [String], argv0: String?)? {
         guard argv.count >= 5,
               URL(fileURLWithPath: argv[0]).lastPathComponent == "ticker",
@@ -98,8 +99,7 @@ public enum LaunchdWrapper {
         while index < argv.count, argv[index] != "--" {
             switch argv[index] {
             case "--ticker-wrapper-version":
-                guard requiresVersionMarker,
-                      wrapperVersion == nil,
+                guard wrapperVersion == nil,
                       index + 1 < argv.count
                 else {
                     return nil
@@ -123,7 +123,7 @@ public enum LaunchdWrapper {
             }
         }
 
-        guard (!requiresVersionMarker || wrapperVersion == currentVersion),
+        guard wrapperVersion == currentVersion,
               let label,
               index < argv.count,
               argv[index] == "--",
@@ -178,6 +178,16 @@ public final class LaunchdAdapter: JobSourceAdapter {
 
     public convenience init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
+        #if TICKER_TESTING
+        if let paths = ProcessInfo.processInfo.environment["TICKER_TEST_LAUNCHD_DIRECTORIES"],
+           !paths.isEmpty {
+            self.init(searchDirectories: paths.split(separator: ":").map {
+                    URL(fileURLWithPath: String($0), isDirectory: true) },
+                launchctlURL: URL(fileURLWithPath: "/bin/launchctl"),
+                commandRunner: { try runAdapterCommand(executable: $0, arguments: $1) })
+            return
+        }
+        #endif
         self.init(
             searchDirectories: [
                 home.appendingPathComponent("Library/LaunchAgents", isDirectory: true),
@@ -185,7 +195,7 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 URL(fileURLWithPath: "/Library/LaunchDaemons", isDirectory: true),
             ],
             launchctlURL: URL(fileURLWithPath: "/bin/launchctl"),
-            commandRunner: runAdapterCommand
+            commandRunner: { try runAdapterCommand(executable: $0, arguments: $1) }
         )
     }
 
@@ -349,9 +359,7 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 literalCommand = []
                 literalArgv0 = nil
             }
-            let versionedWrapper = LaunchdWrapper.decode(programArguments ?? [])
-            let observedWrapper = versionedWrapper
-                ?? LaunchdWrapper.decodeLegacy(programArguments ?? [])
+            let observedWrapper = LaunchdWrapper.decode(programArguments ?? [])
 
             let userName = nonEmptyString(dictionary["UserName"] as? String)
             let groupName = nonEmptyString(dictionary["GroupName"] as? String)
@@ -369,7 +377,7 @@ public final class LaunchdAdapter: JobSourceAdapter {
                     userName: userName,
                     groupName: groupName
                 ),
-                managed: versionedWrapper != nil,
+                managed: observedWrapper != nil,
                 cwd: dictionary["WorkingDirectory"] as? String,
                 standardOutPath: dictionary["StandardOutPath"] as? String,
                 standardErrorPath: dictionary["StandardErrorPath"] as? String,

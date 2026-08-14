@@ -435,6 +435,11 @@ private struct TickerCLI {
         guard let jobID = label, !jobID.isEmpty else {
             throw CLIError.usage("run requires --label <id>")
         }
+        guard trigger == .manual || wrapperVersionSeen else {
+            throw CLIError.usage(
+                "scheduled run requires --ticker-wrapper-version \(LaunchdWrapper.currentVersion)"
+            )
+        }
         var childEnvironment: [String: String]?
         var childWorkingDirectory: String?
         var wrapperRuntimeSnapshot: LaunchdRuntimeSnapshot?
@@ -464,39 +469,42 @@ private struct TickerCLI {
             }
             childEnvironment = SchedulerEnvironment.effectiveEnvironment(for: job)
             childWorkingDirectory = job.cwd
-        } else if !wrapperVersionSeen,
-                  jobID.hasPrefix("launchd:") || jobID.hasPrefix("claude:") {
-            let discoveredJob = JobRegistry.standard().discoverAll().jobs.first {
-                $0.id == jobID
-            }
-            if let discoveredJob, !discoveredJob.canRunNow {
-                throw CLIError.operation(
-                    "Cannot run \(discoveredJob.label): "
-                        + (discoveredJob.runNowUnavailableReason
-                            ?? "Ticker cannot faithfully reproduce its scheduled execution context.")
-                )
-            }
-        }
-
-        if trigger == .scheduled && wrapperVersionSeen {
+        } else {
             do {
-                let snapshot = try LaunchdRuntimeProbe.snapshot(
-                    jobID: jobID,
-                    launchctlURL: scheduledLaunchctlURL()
+                let store = try SQLiteRunStore(
+                    path: configuredStorePath(scheduledWrapperInvocation: true)
                 )
-                guard snapshot.processID == getpid() else {
-                    let reportedPID = snapshot.processID.map { String($0) } ?? "none"
+                let launchdJobs = try LaunchdAdapter().discover()
+                let job = try LaunchdInvocationIdentity.resolve(
+                    claimedJobID: jobID,
+                    jobs: launchdJobs,
+                    canonicalize: store.canonicalJobID
+                )
+                guard childArguments == job.command, originalArgv0 == job.argv0 else {
                     throw LaunchdRuntimeProbeError(
-                        message: "launchd reports pid \(reportedPID), not this wrapper pid \(getpid())"
+                        message: "scheduled command does not match the discovered wrapper for \(job.id)"
                     )
                 }
-                wrapperRuntimeSnapshot = snapshot
+                let status = try LaunchdRuntimeProbe.ownership(
+                    job: job,
+                    processID: getpid(),
+                    launchctlURL: scheduledLaunchctlURL()
+                )
+                switch status {
+                case .owned(let snapshot):
+                    wrapperRuntimeSnapshot = snapshot
+                case .serviceNotPublished:
+                    throw LaunchdRuntimeProbeError(
+                        message: "launchd service exists but has not published this wrapper pid yet"
+                    )
+                }
             } catch {
                 recordingAuthorized = false
-                writeStandardError(
-                    "ticker: scheduled wrapper ownership not proven for \(jobID); "
-                        + "executing without recording history: \(error.localizedDescription)\n"
-                )
+                let message = "scheduled wrapper ownership not proven for \(jobID); "
+                    + "executing without recording history: \(error.localizedDescription)"
+                writeStandardError("ticker: \(message)\n")
+                try? SQLiteRunStore(path: configuredStorePath(scheduledWrapperInvocation: true))
+                    .recordRecorderDiagnostic(claimedJobID: jobID, message: message)
             }
         }
 
@@ -506,7 +514,7 @@ private struct TickerCLI {
             originalArgv0: originalArgv0,
             tailBytes: tailBytes,
             trigger: trigger,
-            scheduledWrapperInvocation: trigger == .scheduled && wrapperVersionSeen,
+            scheduledWrapperInvocation: trigger == .scheduled,
             recordingAuthorized: recordingAuthorized,
             wrapperRuntimeSnapshot: wrapperRuntimeSnapshot,
             environment: childEnvironment,
@@ -675,10 +683,6 @@ private struct TickerCLI {
         }
 
         let store = try SQLiteRunStore(path: configuredStorePath())
-        _ = try store.migrateLegacyJobIDs(
-            discoveredJobs: discovery.jobs,
-            discoveryComplete: discovery.errors.isEmpty
-        )
         let health = try store.scheduledHealthRuns()
         let records = discovery.jobs.sorted { left, right in
             if left.source.rawValue == right.source.rawValue {
@@ -752,11 +756,6 @@ private struct TickerCLI {
         }
 
         let store = try SQLiteRunStore(path: configuredStorePath())
-        let discovery = discoverJobs()
-        _ = try store.migrateLegacyJobIDs(
-            discoveredJobs: discovery.jobs,
-            discoveryComplete: discovery.complete
-        )
         let runs = try store.runs(jobID: jobID, limit: limit)
         if json {
             let records = runs.map { run in
@@ -810,10 +809,6 @@ private struct TickerCLI {
         let discovery = discoverJobs()
         let job = try findJob(id: arguments[0], in: discovery.jobs)
         let store = try SQLiteRunStore(path: configuredStorePath())
-        _ = try store.migrateLegacyJobIDs(
-            discoveredJobs: discovery.jobs,
-            discoveryComplete: discovery.complete
-        )
         let wrapper = JobWrapper(store: store)
         let commands = try wrapper.wrap(job: job, tickerPath: currentExecutablePath())
         print(commands.unload)
@@ -827,10 +822,6 @@ private struct TickerCLI {
         let discovery = discoverJobs()
         let job = try findJob(id: arguments[0], in: discovery.jobs)
         let store = try SQLiteRunStore(path: configuredStorePath())
-        _ = try store.migrateLegacyJobIDs(
-            discoveredJobs: discovery.jobs,
-            discoveryComplete: discovery.complete
-        )
         let wrapper = JobWrapper(store: store)
         let commands = try wrapper.unwrap(job: job)
         print(commands.unload)
@@ -841,10 +832,6 @@ private struct TickerCLI {
         let discovery = discoverJobs()
         let discoveredJobs = discovery.jobs
         let store = try SQLiteRunStore(path: configuredStorePath())
-        let migration = try store.migrateLegacyJobIDs(
-            discoveredJobs: discoveredJobs,
-            discoveryComplete: discovery.complete
-        )
         if arguments.count == 2, arguments[0] == "--clear-stale" {
             let job = try findJob(id: arguments[1], in: discoveredJobs)
             let state = try JobWrapper(store: store).recoveryState(job: job)
@@ -876,8 +863,8 @@ private struct TickerCLI {
                 print("\(job.id)\terror: \(error.localizedDescription)")
             }
         }
-        for legacyID in migration.orphanedLegacyJobIDs {
-            print("\(legacyID)\torphaned-history")
+        for diagnostic in try store.recorderDiagnostics() {
+            print("recorder-diagnostic\t\(diagnostic.claimedJobID)\t\(diagnostic.message)")
         }
     }
 

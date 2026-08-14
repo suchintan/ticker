@@ -60,7 +60,7 @@ public final class CrontabAdapter: JobSourceAdapter {
             ?? "/usr/bin/crontab"
         self.init(
             crontabURL: URL(fileURLWithPath: configuredPath),
-            commandRunner: runAdapterCommand
+            commandRunner: { try runAdapterCommand(executable: $0, arguments: $1) }
         )
     }
 

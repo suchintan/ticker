@@ -18,38 +18,26 @@ public enum RunStorePathPolicy {
 }
 
 public struct SQLiteRunStoreError: Error, LocalizedError {
-    public let operation: String
-    public let code: Int32
-    public let message: String
+    public let operation: String; public let code: Int32; public let message: String
 
-    public var errorDescription: String? {
-        return "SQLite \(operation) failed (code \(code)): \(message)"
-    }
+    public var errorDescription: String? { "SQLite \(operation) failed (code \(code)): \(message)" }
 }
 
-public struct JobIdentityMigrationReport: Equatable {
-    public let performed: Bool
-    public let migratedJobIDs: [String: String]
-    public let orphanedLegacyJobIDs: [String]
+public struct RecorderDiagnostic: Equatable {
+    public let claimedJobID: String; public let message: String
+}
 
-    public init(
-        performed: Bool,
-        migratedJobIDs: [String: String],
-        orphanedLegacyJobIDs: [String]
-    ) {
-        self.performed = performed
-        self.migratedJobIDs = migratedJobIDs
-        self.orphanedLegacyJobIDs = orphanedLegacyJobIDs
-    }
+public struct BackupSourceClaim: Equatable {
+    public let jobID: String; public let sourcePlistPath: String
 }
 
 public final class SQLiteRunStore: RunStore {
     private static let schemaVersion = "4"
-    private static let jobIdentityMigrationKey = "job_identity_v2"
     private static let runTriggerHealthMigrationKey = "run_trigger_health_v3"
 
     private let database: OpaquePointer
     private let queue = DispatchQueue(label: "com.ticker.SQLiteRunStore")
+    private let afterBeginRunCanonicalization: (() -> Void)?
 
     public static func defaultPath() -> String {
         return FileManager.default.homeDirectoryForCurrentUser
@@ -72,7 +60,9 @@ public final class SQLiteRunStore: RunStore {
 
     internal init(
         path: String,
-        beforeRunsTriggerMigration: (() -> Void)?
+        beforeRunsTriggerMigration: (() -> Void)?,
+        beforeRunEvidenceMigration: (() -> Void)? = nil,
+        afterBeginRunCanonicalization: (() -> Void)? = nil
     ) throws {
         let databaseURL = URL(fileURLWithPath: path)
         let directory = databaseURL.deletingLastPathComponent()
@@ -121,6 +111,13 @@ public final class SQLiteRunStore: RunStore {
                 CREATE TABLE IF NOT EXISTS job_identity_aliases(
                   old_job_id TEXT PRIMARY KEY, new_job_id TEXT NOT NULL,
                   created_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS recorder_diagnostics(
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  claimed_job_id TEXT NOT NULL, occurred_at REAL NOT NULL,
+                  message TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS backup_source_claims(
+                  backup_path TEXT PRIMARY KEY, job_id TEXT NOT NULL,
+                  source_plist_path TEXT NOT NULL, rebound_at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);
                 """
             )
@@ -128,7 +125,10 @@ public final class SQLiteRunStore: RunStore {
                 database: validDatabase,
                 beforeMigration: beforeRunsTriggerMigration
             )
-            try Self.ensureRunEvidenceColumns(database: validDatabase)
+            try Self.ensureRunEvidenceColumns(
+                database: validDatabase,
+                beforeMigration: beforeRunEvidenceMigration
+            )
             try Self.stampSchemaVersion(database: validDatabase)
         } catch {
             sqlite3_close_v2(validDatabase)
@@ -136,6 +136,7 @@ public final class SQLiteRunStore: RunStore {
         }
 
         database = validDatabase
+        self.afterBeginRunCanonicalization = afterBeginRunCanonicalization
     }
 
     deinit {
@@ -151,40 +152,33 @@ public final class SQLiteRunStore: RunStore {
         context: RunStartContext?
     ) throws -> Int64 {
         return try queue.sync {
-            let canonicalID = try canonicalJobIDLocked(jobID)
-            let statement = try prepare(
-                """
-                INSERT INTO runs(
-                  job_id, started_at, trigger, process_id, boot_session_id,
-                  native_exit_status_at_start, launchd_run_count_at_start
-                ) VALUES(?, ?, ?, ?, ?, ?, ?);
-                """
-            )
-            defer { sqlite3_finalize(statement) }
+            try withImmediateTransaction {
+                let canonicalID = try canonicalJobIDLocked(jobID)
+                afterBeginRunCanonicalization?()
+                let statement = try prepare(
+                    """
+                    INSERT INTO runs(
+                      job_id, started_at, trigger, process_id, boot_session_id,
+                      native_exit_status_at_start, launchd_run_count_at_start
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?);
+                    """
+                )
+                defer { sqlite3_finalize(statement) }
 
-            try bind(canonicalID, to: 1, in: statement)
-            try bind(startedAt.timeIntervalSince1970, to: 2, in: statement)
-            try bind(trigger.rawValue, to: 3, in: statement)
-            if let context {
-                try bind(context.processID, to: 4, in: statement)
-                try bind(context.bootSessionID, to: 5, in: statement)
-                if let nativeExitStatusAtStart = context.nativeExitStatusAtStart {
-                    try bind(nativeExitStatusAtStart, to: 6, in: statement)
+                try bind(canonicalID, to: 1, in: statement)
+                try bind(startedAt.timeIntervalSince1970, to: 2, in: statement)
+                try bind(trigger.rawValue, to: 3, in: statement)
+                if let context {
+                    try bind(context.processID, to: 4, in: statement)
+                    try bind(context.bootSessionID, to: 5, in: statement)
+                    try bind(context.nativeExitStatusAtStart, to: 6, in: statement)
+                    try bind(context.launchdRunCountAtStart, to: 7, in: statement)
                 } else {
-                    try bindNull(to: 6, in: statement)
+                    for index in Int32(4)...Int32(7) { try bindNull(to: index, in: statement) }
                 }
-                if let launchdRunCountAtStart = context.launchdRunCountAtStart {
-                    try bind(launchdRunCountAtStart, to: 7, in: statement)
-                } else {
-                    try bindNull(to: 7, in: statement)
-                }
-            } else {
-                for index in Int32(4)...Int32(7) {
-                    try bindNull(to: index, in: statement)
-                }
+                try stepDone(statement, operation: "insert run")
+                return sqlite3_last_insert_rowid(database)
             }
-            try stepDone(statement, operation: "insert run")
-            return sqlite3_last_insert_rowid(database)
         }
     }
 
@@ -292,7 +286,7 @@ public final class SQLiteRunStore: RunStore {
                          native_exit_status_at_start, launchd_run_count_at_start,
                          ROW_NUMBER() OVER (
                            PARTITION BY job_id
-                           ORDER BY started_at DESC, id DESC
+                           ORDER BY id DESC
                          ) AS position
                   FROM eligible_runs
                 )
@@ -309,9 +303,7 @@ public final class SQLiteRunStore: RunStore {
             var result: [String: Run] = [:]
             result.reserveCapacity(latestRuns.count)
             for run in latestRuns {
-                if let existing = result[run.jobID],
-                   (existing.startedAt > run.startedAt
-                    || (existing.startedAt == run.startedAt && existing.id > run.id)) {
+                if let existing = result[run.jobID], existing.id > run.id {
                     continue
                 }
                 result[run.jobID] = run
@@ -328,43 +320,71 @@ public final class SQLiteRunStore: RunStore {
         }
     }
 
-    public func markManaged(jobID: String, backupPath: String?) throws {
+    public func recordRecorderDiagnostic(claimedJobID: String, message: String) throws {
         try queue.sync {
-            let canonicalID = try canonicalJobIDLocked(jobID)
             let statement = try prepare(
-                """
-                INSERT INTO managed_jobs(job_id, wrapped_at, backup_path)
-                VALUES(?, ?, ?)
-                ON CONFLICT(job_id) DO UPDATE SET
-                  wrapped_at = excluded.wrapped_at,
-                  backup_path = excluded.backup_path;
-                """
+                "INSERT INTO recorder_diagnostics(claimed_job_id, occurred_at, message) VALUES(?, ?, ?);"
             )
             defer { sqlite3_finalize(statement) }
-
-            try bind(canonicalID, to: 1, in: statement)
+            try bind(claimedJobID, to: 1, in: statement)
             try bind(Date().timeIntervalSince1970, to: 2, in: statement)
-            if let backupPath = backupPath {
-                try bind(backupPath, to: 3, in: statement)
-            } else {
-                try bindNull(to: 3, in: statement)
+            try bind(message, to: 3, in: statement)
+            try stepDone(statement, operation: "record recorder diagnostic")
+        }
+    }
+
+    public func recorderDiagnostics(limit: Int = 20) throws -> [RecorderDiagnostic] {
+        try queue.sync {
+            let statement = try prepare(
+                "SELECT claimed_job_id, message FROM recorder_diagnostics ORDER BY id DESC LIMIT ?;"
+            )
+            defer { sqlite3_finalize(statement) }
+            try bind(max(0, limit), to: 1, in: statement)
+            var result: [RecorderDiagnostic] = []
+            while true {
+                let stepResult = sqlite3_step(statement)
+                if stepResult == SQLITE_DONE {
+                    return result
+                }
+                guard stepResult == SQLITE_ROW,
+                      let claimedJobID = textColumn(0, in: statement),
+                      let message = textColumn(1, in: statement) else {
+                    throw databaseError(operation: "read recorder diagnostics", code: stepResult)
+                }
+                result.append(RecorderDiagnostic(
+                    claimedJobID: claimedJobID,
+                    message: message
+                ))
             }
-            try stepDone(statement, operation: "mark managed job")
+        }
+    }
+
+    public func markManaged(jobID: String, backupPath: String?) throws {
+        try queue.sync {
+            try withImmediateTransaction {
+                let canonicalID = try canonicalJobIDLocked(jobID)
+                let statement = try prepare(
+                    """
+                    INSERT INTO managed_jobs(job_id, wrapped_at, backup_path)
+                    VALUES(?, ?, ?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                      wrapped_at = excluded.wrapped_at,
+                      backup_path = excluded.backup_path;
+                    """
+                )
+                defer { sqlite3_finalize(statement) }
+                try bind(canonicalID, to: 1, in: statement)
+                try bind(Date().timeIntervalSince1970, to: 2, in: statement)
+                try bind(backupPath, to: 3, in: statement)
+                try stepDone(statement, operation: "mark managed job")
+            }
         }
     }
 
     public func unmarkManaged(jobID: String) throws {
         try queue.sync {
-            let canonicalID = try canonicalJobIDLocked(jobID)
-            try Self.execute(database: database, sql: "BEGIN IMMEDIATE TRANSACTION;")
-            var committed = false
-            defer {
-                if !committed {
-                    try? Self.execute(database: database, sql: "ROLLBACK;")
-                }
-            }
-
-            do {
+            try withImmediateTransaction {
+                let canonicalID = try canonicalJobIDLocked(jobID)
                 let resetStatement = try prepare(
                     """
                     INSERT INTO health_resets(job_id, reset_after_run_id)
@@ -377,17 +397,11 @@ public final class SQLiteRunStore: RunStore {
                 try bind(canonicalID, to: 1, in: resetStatement)
                 try bind(canonicalID, to: 2, in: resetStatement)
                 try stepDone(resetStatement, operation: "reset stored job health")
-            }
-
-            do {
                 let deleteStatement = try prepare("DELETE FROM managed_jobs WHERE job_id = ?;")
                 defer { sqlite3_finalize(deleteStatement) }
                 try bind(canonicalID, to: 1, in: deleteStatement)
                 try stepDone(deleteStatement, operation: "unmark managed job")
             }
-
-            try Self.execute(database: database, sql: "COMMIT;")
-            committed = true
         }
     }
 
@@ -396,17 +410,56 @@ public final class SQLiteRunStore: RunStore {
             return
         }
         try queue.sync {
-            try Self.execute(database: database, sql: "BEGIN IMMEDIATE TRANSACTION;")
-            var committed = false
-            defer {
-                if !committed {
-                    try? Self.execute(database: database, sql: "ROLLBACK;")
-                }
+            try withImmediateTransaction {
+                try migrateJobIdentityLocked(from: oldJobID, to: newJobID)
             }
+        }
+    }
 
-            try migrateJobIdentityLocked(from: oldJobID, to: newJobID)
-            try Self.execute(database: database, sql: "COMMIT;")
-            committed = true
+    public func claimBackupSource(
+        backupPath: String,
+        jobID: String,
+        sourcePlistPath: String
+    ) throws {
+        try queue.sync {
+            try withImmediateTransaction {
+                try setBackupSourceClaimLocked(
+                    backupPath: backupPath,
+                    jobID: canonicalJobIDLocked(jobID),
+                    sourcePlistPath: sourcePlistPath
+                )
+            }
+        }
+    }
+
+    public func backupSourceClaim(backupPath: String) throws -> BackupSourceClaim? {
+        try queue.sync { try backupSourceClaimLocked(backupPath: backupPath) }
+    }
+
+    public func reconcileJobIdentity(
+        from oldJobID: String,
+        to newJobID: String,
+        backupPath: String,
+        sourcePlistPath: String
+    ) throws {
+        try queue.sync {
+            try withImmediateTransaction {
+                let oldCanonical = try canonicalJobIDLocked(oldJobID)
+                let claim = try backupSourceClaimLocked(backupPath: backupPath)
+                guard try claim.map({ try canonicalJobIDLocked($0.jobID) }) == oldCanonical else {
+                    throw SQLiteRunStoreError(
+                        operation: "reconcile job identity",
+                        code: SQLITE_CONSTRAINT,
+                        message: "Backup \(backupPath) is not currently claimed by \(oldCanonical)"
+                    )
+                }
+                try migrateJobIdentityLocked(from: oldCanonical, to: newJobID)
+                try setBackupSourceClaimLocked(
+                    backupPath: backupPath,
+                    jobID: canonicalJobIDLocked(newJobID),
+                    sourcePlistPath: sourcePlistPath
+                )
+            }
         }
     }
 
@@ -455,141 +508,6 @@ public final class SQLiteRunStore: RunStore {
             }
             throw databaseError(operation: "read managed job backup", code: result)
         }
-    }
-
-    public func migrateLegacyJobIDs(
-        discoveredJobs: [Job],
-        discoveryComplete: Bool = true
-    ) throws -> JobIdentityMigrationReport {
-        let candidates = Self.legacyIdentityCandidates(discoveredJobs)
-        return try queue.sync {
-            if !discoveryComplete {
-                return JobIdentityMigrationReport(
-                    performed: false,
-                    migratedJobIDs: [:],
-                    orphanedLegacyJobIDs: try storedLegacyJobIDs()
-                )
-            }
-
-            try Self.execute(database: database, sql: "BEGIN IMMEDIATE TRANSACTION;")
-            var committed = false
-            defer {
-                if !committed {
-                    try? Self.execute(database: database, sql: "ROLLBACK;")
-                }
-            }
-
-            do {
-                let legacyIDs = try storedLegacyJobIDs()
-                if try schemaMetaValue(forKey: Self.jobIdentityMigrationKey) != nil {
-                    try Self.execute(database: database, sql: "COMMIT;")
-                    committed = true
-                    return JobIdentityMigrationReport(
-                        performed: false,
-                        migratedJobIDs: [:],
-                        orphanedLegacyJobIDs: legacyIDs
-                    )
-                }
-
-                var migrated: [String: String] = [:]
-                for legacyID in legacyIDs {
-                    guard let matches = candidates[legacyID], matches.count == 1,
-                          let newID = matches.first else {
-                        continue
-                    }
-                    try migrateJobIdentityLocked(from: legacyID, to: newID)
-                    migrated[legacyID] = newID
-                }
-                try setSchemaMetaValue("complete", forKey: Self.jobIdentityMigrationKey)
-                let orphaned = try storedLegacyJobIDs()
-                try Self.execute(database: database, sql: "COMMIT;")
-                committed = true
-                return JobIdentityMigrationReport(
-                    performed: true,
-                    migratedJobIDs: migrated,
-                    orphanedLegacyJobIDs: orphaned
-                )
-            } catch {
-                throw error
-            }
-        }
-    }
-
-    private static func legacyIdentityCandidates(_ jobs: [Job]) -> [String: Set<String>] {
-        var result: [String: Set<String>] = [:]
-        for job in jobs where job.source == .launchd || job.source == .claudeRoutine {
-            guard let separator = job.id.lastIndex(of: "#") else {
-                continue
-            }
-            let suffix = job.id[job.id.index(after: separator)...]
-            guard suffix.count == 12,
-                  suffix.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
-                continue
-            }
-            result[String(job.id[..<separator]), default: []].insert(job.id)
-        }
-        return result
-    }
-
-    private func storedLegacyJobIDs() throws -> [String] {
-        let statement = try prepare(
-            """
-            SELECT job_id FROM runs
-            WHERE instr(job_id, '#') = 0
-              AND (job_id LIKE 'launchd:%' OR job_id LIKE 'claude:%')
-            UNION
-            SELECT job_id FROM managed_jobs
-            WHERE instr(job_id, '#') = 0
-              AND (job_id LIKE 'launchd:%' OR job_id LIKE 'claude:%')
-            UNION
-            SELECT job_id FROM health_resets
-            WHERE instr(job_id, '#') = 0
-              AND job_id LIKE 'launchd:%'
-            ORDER BY job_id;
-            """
-        )
-        defer { sqlite3_finalize(statement) }
-
-        var result: [String] = []
-        while true {
-            let stepResult = sqlite3_step(statement)
-            if stepResult == SQLITE_ROW {
-                if let jobID = textColumn(0, in: statement) {
-                    result.append(jobID)
-                }
-            } else if stepResult == SQLITE_DONE {
-                return result
-            } else {
-                throw databaseError(operation: "read legacy job ids", code: stepResult)
-            }
-        }
-    }
-
-    private func schemaMetaValue(forKey key: String) throws -> String? {
-        let statement = try prepare("SELECT value FROM schema_meta WHERE key = ? LIMIT 1;")
-        defer { sqlite3_finalize(statement) }
-        try bind(key, to: 1, in: statement)
-        let stepResult = sqlite3_step(statement)
-        if stepResult == SQLITE_ROW {
-            return textColumn(0, in: statement)
-        }
-        if stepResult == SQLITE_DONE {
-            return nil
-        }
-        throw databaseError(operation: "read schema metadata", code: stepResult)
-    }
-
-    private func setSchemaMetaValue(_ value: String, forKey key: String) throws {
-        let statement = try prepare(
-            """
-            INSERT INTO schema_meta(key, value) VALUES(?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value;
-            """
-        )
-        defer { sqlite3_finalize(statement) }
-        try bind(key, to: 1, in: statement)
-        try bind(value, to: 2, in: statement)
-        try stepDone(statement, operation: "write schema metadata")
     }
 
     private func canonicalJobIDLocked(_ jobID: String) throws -> String {
@@ -670,6 +588,47 @@ public final class SQLiteRunStore: RunStore {
         try bind(newJobID, to: 2, in: statement)
         try bind(Date().timeIntervalSince1970, to: 3, in: statement)
         try stepDone(statement, operation: "persist job identity alias")
+    }
+
+    private func backupSourceClaimLocked(backupPath: String) throws -> BackupSourceClaim? {
+        let statement = try prepare(
+            "SELECT job_id, source_plist_path FROM backup_source_claims WHERE backup_path = ? LIMIT 1;"
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(backupPath, to: 1, in: statement)
+        let stepResult = sqlite3_step(statement)
+        if stepResult == SQLITE_DONE {
+            return nil
+        }
+        guard stepResult == SQLITE_ROW,
+              let jobID = textColumn(0, in: statement),
+              let sourcePlistPath = textColumn(1, in: statement) else {
+            throw databaseError(operation: "read backup source claim", code: stepResult)
+        }
+        return BackupSourceClaim(jobID: jobID, sourcePlistPath: sourcePlistPath)
+    }
+
+    private func setBackupSourceClaimLocked(
+        backupPath: String,
+        jobID: String,
+        sourcePlistPath: String
+    ) throws {
+        let statement = try prepare(
+            """
+            INSERT INTO backup_source_claims(backup_path, job_id, source_plist_path, rebound_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(backup_path) DO UPDATE SET
+              job_id = excluded.job_id,
+              source_plist_path = excluded.source_plist_path,
+              rebound_at = excluded.rebound_at;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(backupPath, to: 1, in: statement)
+        try bind(jobID, to: 2, in: statement)
+        try bind(sourcePlistPath, to: 3, in: statement)
+        try bind(Date().timeIntervalSince1970, to: 4, in: statement)
+        try stepDone(statement, operation: "write backup source claim")
     }
 
     private func managedRowExistsLocked(_ jobID: String) throws -> Bool {
@@ -811,6 +770,16 @@ public final class SQLiteRunStore: RunStore {
         }
     }
 
+    private func withImmediateTransaction<T>(_ body: () throws -> T) throws -> T {
+        try Self.execute(database: database, sql: "BEGIN IMMEDIATE TRANSACTION;")
+        var committed = false
+        defer { if !committed { try? Self.execute(database: database, sql: "ROLLBACK;") } }
+        let result = try body()
+        try Self.execute(database: database, sql: "COMMIT;")
+        committed = true
+        return result
+    }
+
     private static func stampSchemaVersion(database: OpaquePointer) throws {
         var statement: OpaquePointer?
         let sql = """
@@ -899,20 +868,39 @@ public final class SQLiteRunStore: RunStore {
         committed = true
     }
 
-    private static func ensureRunEvidenceColumns(database: OpaquePointer) throws {
+    private static func ensureRunEvidenceColumns(
+        database: OpaquePointer,
+        beforeMigration: (() -> Void)?
+    ) throws {
         let requiredColumns: [(name: String, declaration: String)] = [
             ("process_id", "INTEGER"),
             ("boot_session_id", "TEXT"),
             ("native_exit_status_at_start", "INTEGER"),
             ("launchd_run_count_at_start", "INTEGER"),
         ]
-        let existingColumns = try runColumnNames(database: database)
+        let observedColumns = try runColumnNames(database: database)
+        guard !requiredColumns.allSatisfy({ observedColumns.contains($0.name) }) else {
+            return
+        }
+        beforeMigration?()
+
+        try execute(database: database, sql: "BEGIN IMMEDIATE TRANSACTION;")
+        var committed = false
+        defer {
+            if !committed {
+                try? execute(database: database, sql: "ROLLBACK;")
+            }
+        }
+        var existingColumns = try runColumnNames(database: database)
         for column in requiredColumns where !existingColumns.contains(column.name) {
             try execute(
                 database: database,
                 sql: "ALTER TABLE runs ADD COLUMN \(column.name) \(column.declaration);"
             )
+            existingColumns.insert(column.name)
         }
+        try execute(database: database, sql: "COMMIT;")
+        committed = true
     }
 
     private static func runColumnNames(database: OpaquePointer) throws -> Set<String> {
@@ -1126,11 +1114,26 @@ public final class SQLiteRunStore: RunStore {
         }
     }
 
+    private func bind(_ value: Int32?, to index: Int32, in statement: OpaquePointer) throws {
+        if let value { try bind(value, to: index, in: statement) }
+        else { try bindNull(to: index, in: statement) }
+    }
+
     private func bind(_ value: Int64, to index: Int32, in statement: OpaquePointer) throws {
         let result = sqlite3_bind_int64(statement, index, value)
         guard result == SQLITE_OK else {
             throw databaseError(operation: "bind integer", code: result)
         }
+    }
+
+    private func bind(_ value: Int64?, to index: Int32, in statement: OpaquePointer) throws {
+        if let value { try bind(value, to: index, in: statement) }
+        else { try bindNull(to: index, in: statement) }
+    }
+
+    private func bind(_ value: String?, to index: Int32, in statement: OpaquePointer) throws {
+        if let value { try bind(value, to: index, in: statement) }
+        else { try bindNull(to: index, in: statement) }
     }
 
     private func bindNull(to index: Int32, in statement: OpaquePointer) throws {

@@ -419,13 +419,6 @@ private func testLaunchdWrapperDecode(_ tests: TestHarness) throws {
         "LaunchdWrapper requires versioned provenance"
     )
     tests.expectEqual(
-        LaunchdWrapper.decodeLegacy([
-            "ticker", "run", "--label", "launchd:com.example", "--", "/bin/bash",
-        ])?.label,
-        "launchd:com.example",
-        "LaunchdWrapper explicitly recognizes legacy wrappers"
-    )
-    tests.expectEqual(
         LaunchdWrapper.decode(["/bin/bash", "/tmp/job.sh"])?.label,
         nil,
         "LaunchdWrapper rejects unwrapped argv"
@@ -935,8 +928,15 @@ private func test2A_SQLiteTextRoundTrip(_ tests: TestHarness) throws {
 private func test3A_CLIHardening(_ tests: TestHarness) throws {
     let tickerPath = try test3A_builtCLIPath()
     try withTemporaryDirectory("round3a-cli") { directory in
-        let storePath = directory.appendingPathComponent("ticker.db").path
-        let environment = ["TICKER_STORE_PATH": storePath]
+        let storePath = test10_compiledStorePath()
+        test10_removeStore(at: storePath)
+        defer { test10_removeStore(at: storePath) }
+        let fakeLaunchctl = try test10_fakeLaunchctl(in: directory)
+        let store = try SQLiteRunStore(path: storePath)
+        let environment = [
+            "TICKER_TEST_LAUNCHCTL_PATH": fakeLaunchctl.path,
+            "TICKER_TEST_LAUNCHD_DIRECTORIES": directory.path,
+        ]
 
         let invalidTail = try test3A_runProcess(
             tickerPath,
@@ -960,22 +960,31 @@ private func test3A_CLIHardening(_ tests: TestHarness) throws {
             "test3A run without a child explains the missing command"
         )
 
-        let tailJobID = "test3A-tail-clamp"
+        let tailCommand = [
+            "/usr/bin/python3", "-c",
+            "import sys; sys.stdout.write('A' * (1048576 + 257) + 'END')",
+        ]
+        let tailInvocation = try test10_wrappedInvocation(
+            directory: directory,
+            label: "com.example.test3A.tail-clamp",
+            command: tailCommand,
+            tickerPath: tickerPath,
+            store: store
+        )
+        var tailArguments = Array(tailInvocation.arguments.dropFirst())
+        tailArguments.insert(
+            contentsOf: ["--tail-bytes", "2000000"],
+            at: try require(tailArguments.firstIndex(of: "--"), "test3A wrapper separator")
+        )
         let oversized = try test3A_runProcess(
             tickerPath,
-            [
-                "run", "--label", tailJobID,
-                "--tail-bytes", "2000000",
-                "--", "/usr/bin/python3", "-c",
-                "import sys; sys.stdout.write('A' * (1048576 + 257) + 'END')",
-            ],
+            tailArguments,
             environment: environment,
             timeout: 30
         )
         tests.expectEqual(oversized.status, 0, "test3A oversized tail run exits successfully")
-        let store = try SQLiteRunStore(path: storePath)
         let storedTail = try require(
-            try store.latestRun(jobID: tailJobID)?.stdoutTail,
+            try store.latestRun(jobID: tailInvocation.job.id)?.stdoutTail,
             "test3A stored clamped tail"
         )
         tests.expectEqual(
@@ -991,15 +1000,21 @@ private func test3A_CLIHardening(_ tests: TestHarness) throws {
         let pipelineOutput = try FileHandle(forWritingTo: pipelineOutputURL)
         defer { try? pipelineOutput.close() }
 
+        let pipelineCommand = [
+            "/bin/sh", "-c", "echo $$ > '\(shellPIDURL.path)'; sleep 600 | cat",
+        ]
+        let pipelineInvocation = try test10_wrappedInvocation(
+            directory: directory,
+            label: "com.example.test3A.signal-tree",
+            command: pipelineCommand,
+            tickerPath: tickerPath,
+            store: store
+        )
         let pipeline = Process()
         pipeline.executableURL = URL(fileURLWithPath: tickerPath)
-        pipeline.arguments = [
-            "run", "--label", "test3A-signal-tree",
-            "--", "/bin/sh", "-c",
-            "echo $$ > '\(shellPIDURL.path)'; sleep 600 | cat",
-        ]
+        pipeline.arguments = Array(pipelineInvocation.arguments.dropFirst())
         var pipelineEnvironment = ProcessInfo.processInfo.environment
-        pipelineEnvironment["TICKER_STORE_PATH"] = storePath
+        environment.forEach { pipelineEnvironment[$0.key] = $0.value }
         pipeline.environment = pipelineEnvironment
         pipeline.standardOutput = pipelineOutput
         pipeline.standardError = pipelineOutput
@@ -1084,6 +1099,54 @@ private final class test3A_DataBox {
 }
 
 private var test3A_cachedCLIPath: String?
+
+private func test10_compiledStorePath() -> String {
+    FileManager.default.temporaryDirectory
+        .appendingPathComponent("ticker-compiled-test-default", isDirectory: true)
+        .appendingPathComponent("ticker-\(getpid()).db")
+        .path
+}
+
+private func test10_removeStore(at path: String) {
+    try? FileManager.default.removeItem(atPath: path)
+    try? FileManager.default.removeItem(atPath: path + "-wal")
+    try? FileManager.default.removeItem(atPath: path + "-shm")
+}
+
+private func test10_fakeLaunchctl(in directory: URL) throws -> URL {
+    let url = directory.appendingPathComponent("launchctl")
+    try """
+    #!/bin/sh
+    printf 'gui/test = {\n    pid = %s\n    runs = 1\n    last exit code = 0\n}\n' "$PPID"
+    """.write(to: url, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    return url
+}
+
+private func test10_wrappedInvocation(
+    directory: URL,
+    label: String,
+    command: [String],
+    tickerPath: String,
+    store: SQLiteRunStore
+) throws -> (job: Job, arguments: [String]) {
+    let plistURL = directory.appendingPathComponent("\(label).plist")
+    try writePropertyList([
+        "Label": label,
+        "ProgramArguments": command,
+    ], to: plistURL)
+    let job = try test8_discoverLaunchdJob(in: [directory], label: label)
+    let wrapper = JobWrapper(
+        store: store,
+        backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
+    )
+    _ = try wrapper.wrap(job: job, tickerPath: tickerPath)
+    let arguments = try require(
+        try test2A_readPropertyList(plistURL)["ProgramArguments"] as? [String],
+        "test10 wrapped invocation \(label)"
+    )
+    return (job, arguments)
+}
 
 private func test3A_builtCLIPath() throws -> String {
     if let test3A_cachedCLIPath {
@@ -2456,6 +2519,8 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
 
                 let adapter = BlockingAdapter()
                 let store = try SQLiteRunStore(path: root.appendingPathComponent("runs.sqlite").path)
+                try store.recordRecorderDiagnostic(claimedJobID: "launchd:test10-app",
+                                                    message: "ownership probe unavailable")
                 let model = AppModel(registry: JobRegistry(adapters: [adapter]), store: store)
 
                 model.refresh()
@@ -2470,6 +2535,8 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                     "refresh requested during discovery never executed"
                 )
                 try check(adapter.discoveryCount == 2, "overlapping refreshes did not coalesce to one pass")
+                try check(waitUntil { model.errors.contains { $0.contains("ownership probe unavailable") } },
+                          "test10_app_refresh_didNotSurfaceRecorderDiagnostic")
 
                 let noPathJob = makeJob(
                     id: "cron:no-path",
@@ -2576,50 +2643,6 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                 )
                 let busyRunNow = JobRunNowPresentation(job: declaredPathJob, busy: true)
                 try check(!busyRunNow.isEnabled, "busy Run Now presentation was enabled")
-
-                let migrationStore = try SQLiteRunStore(
-                    path: root.appendingPathComponent("migration.sqlite").path
-                )
-                let legacyJobID = "launchd:gui-migration"
-                let currentJob = makeJob(
-                    id: "launchd:gui-migration#0123456789ab",
-                    source: .launchd,
-                    label: "gui-migration",
-                    environment: [:],
-                    command: ["/usr/bin/true"]
-                )
-                let legacyRunID = try migrationStore.beginRun(
-                    jobID: legacyJobID,
-                    startedAt: Date(timeIntervalSince1970: 1_000)
-                )
-                try migrationStore.finishRun(
-                    id: legacyRunID,
-                    exitCode: 0,
-                    stdoutTail: "",
-                    stderrTail: "",
-                    finishedAt: Date(timeIntervalSince1970: 1_001)
-                )
-                let migrationModel = AppModel(
-                    registry: JobRegistry(
-                        adapters: [StaticAdapter(source: .launchd, jobs: [currentJob])]
-                    ),
-                    store: migrationStore
-                )
-                migrationModel.refresh()
-                try check(
-                    waitUntil { migrationModel.jobs == [currentJob] },
-                    "GUI refresh did not finish identity discovery"
-                )
-                let migratedRun = try migrationStore.latestRun(jobID: currentJob.id)
-                try check(
-                    migratedRun != nil,
-                    "GUI refresh did not migrate legacy run history before publishing"
-                )
-                let legacyAliasRun = try migrationStore.latestRun(jobID: legacyJobID)
-                try check(
-                    legacyAliasRun?.jobID == currentJob.id,
-                    "GUI refresh did not canonicalize legacy history lookup"
-                )
 
                 let identityOriginalDirectory = root.appendingPathComponent(
                     "identity-original",
@@ -2885,7 +2908,6 @@ private func test4A_BackupAuthenticity(_ tests: TestHarness) throws {
             "ProgramArguments": ["/bin/echo", "original"],
             "KeepAlive": true,
         ], to: plistURL)
-        let originalData = try Data(contentsOf: plistURL)
         let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
         let wrapper = JobWrapper(
             store: store,
@@ -2922,223 +2944,39 @@ private func test4A_BackupAuthenticity(_ tests: TestHarness) throws {
             "test4A refused mismatched restore leaves the live plist unchanged"
         )
 
-        try originalData.write(to: backupURL)
-        let metadataURL = backupURL.appendingPathExtension("metadata.json")
-        let metadataData = try Data(contentsOf: metadataURL)
-        var legacyMetadata = try require(
-            try JSONSerialization.jsonObject(with: metadataData) as? [String: Any],
-            "test4A backup metadata dictionary"
-        )
-        legacyMetadata["version"] = 1
-        legacyMetadata.removeValue(forKey: "backupByteCount")
-        legacyMetadata.removeValue(forKey: "backupSHA256")
-        try JSONSerialization.data(withJSONObject: legacyMetadata, options: [.sortedKeys])
-            .write(to: metadataURL)
-
-        tests.expectEqual(
-            try wrapper.recoveryState(job: job),
-            .wrappedBackupUnverified,
-            "test4A digest-less legacy metadata is unverified"
-        )
-        tests.expectThrows(
-            try wrapper.unwrap(job: job),
-            "test4A unwrap refuses digest-less legacy metadata"
-        )
-    }
-}
-
-private func test4A_WrapperProvenance(_ tests: TestHarness) throws {
-    try withTemporaryDirectory("round4a-wrapper-provenance") { directory in
-        let plistURL = directory.appendingPathComponent("vendor-ticker.plist")
-        try writePropertyList([
-            "Label": "com.vendor.ticker",
-            "ProgramArguments": ["/bin/echo", "vendor"],
-        ], to: plistURL)
-        let adapter = LaunchdAdapter(searchDirectories: [directory]) { _, _ in
-            AdapterCommandResult(status: 0, stdout: "", stderr: "")
-        }
-        let jobID = try require(
-            try adapter.discover().first?.id,
-            "test4A canonical vendor fixture id"
-        )
-        try writePropertyList([
-            "Label": "com.vendor.ticker",
-            "ProgramArguments": [
-                "/opt/vendor/ticker",
-                "run",
-                "--label",
-                jobID,
-                "--",
-                "/bin/echo",
-                "vendor",
-            ],
-        ], to: plistURL)
-        let originalData = try Data(contentsOf: plistURL)
-        let job = try require(
-            try adapter.discover().first,
-            "test4A discovered vendor ticker job"
-        )
-        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
-        let wrapper = JobWrapper(
-            store: store,
-            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
-        )
-
-        tests.expectEqual(
-            try wrapper.recoveryState(job: job),
-            .ambiguousTickerInvocation,
-            "test4A basename-only vendor ticker syntax is ambiguous without provenance"
-        )
-        tests.expect(!wrapper.isWrapped(job: job), "test4A ambiguous vendor ticker is not managed")
-        tests.expect(!job.managed, "test4A adapter does not mark legacy vendor ticker syntax managed")
-        tests.expectThrows(
-            try wrapper.wrap(job: job, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"),
-            "test4A wrap refuses to rewrite an unproven vendor ticker command"
-        )
-        tests.expectThrows(
-            try wrapper.unwrap(job: job),
-            "test4A unwrap refuses an unproven vendor ticker command"
-        )
-        tests.expectEqual(
-            try Data(contentsOf: plistURL),
-            originalData,
-            "test4A provenance refusals preserve the vendor plist bytes"
-        )
-    }
-}
-
-private func test4A_IdentityStorageMigration(_ tests: TestHarness) throws {
-    try withTemporaryDirectory("round4a-identity-migration") { directory in
-        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
-        let uniqueLegacy = "launchd:com.example.unique"
-        let uniqueCurrent = "\(uniqueLegacy)#111111111111"
-        let ambiguousLegacy = "launchd:com.example.ambiguous"
-        let unmatchedLegacy = "claude:unmatched-task"
-
-        let uniqueRun = try store.beginRun(
-            jobID: uniqueLegacy,
-            startedAt: Date(timeIntervalSince1970: 10)
-        )
-        try store.finishRun(
-            id: uniqueRun,
-            exitCode: 0,
-            stdoutTail: "unique",
-            stderrTail: "",
-            finishedAt: Date(timeIntervalSince1970: 11)
-        )
-        _ = try store.beginRun(jobID: ambiguousLegacy, startedAt: Date(timeIntervalSince1970: 20))
-        _ = try store.beginRun(jobID: unmatchedLegacy, startedAt: Date(timeIntervalSince1970: 30))
-        try store.markManaged(jobID: uniqueLegacy, backupPath: "/tmp/unique-backup")
-        try store.markManaged(jobID: ambiguousLegacy, backupPath: "/tmp/ambiguous-backup")
-
-        func makeJob(_ id: String, label: String) -> Job {
-            Job(
-                id: id,
-                source: .launchd,
-                label: label,
-                schedule: .onDemand,
-                command: ["/bin/true"],
-                cwd: nil,
-                enabled: true,
-                configPath: directory.appendingPathComponent("\(label).plist").path,
-                lastKnownExit: nil,
-                lastRunAt: nil,
-                lastScheduledFor: nil,
-                managed: false
-            )
-        }
-        let jobs = [
-            makeJob(uniqueCurrent, label: "unique"),
-            makeJob("\(ambiguousLegacy)#222222222222", label: "ambiguous-a"),
-            makeJob("\(ambiguousLegacy)#333333333333", label: "ambiguous-b"),
-        ]
-
-        let deferred = try store.migrateLegacyJobIDs(
-            discoveredJobs: jobs,
-            discoveryComplete: false
-        )
-        tests.expect(!deferred.performed, "test4A partial discovery defers the once-only migration")
-        tests.expectEqual(
-            try store.runs(jobID: uniqueLegacy, limit: 10).map(\.id),
-            [uniqueRun],
-            "test4A deferred migration leaves legacy rows unchanged"
-        )
-
-        let first = try store.migrateLegacyJobIDs(discoveredJobs: jobs)
-        tests.expect(first.performed, "test4A identity migration executes once")
-        tests.expectEqual(
-            first.migratedJobIDs,
-            [uniqueLegacy: uniqueCurrent],
-            "test4A identity migration rekeys only a uniquely mapped legacy id"
-        )
-        tests.expectEqual(
-            first.orphanedLegacyJobIDs,
-            [unmatchedLegacy, ambiguousLegacy].sorted(),
-            "test4A ambiguous and unmatched legacy history is reported as orphaned"
-        )
-        tests.expectEqual(
-            try store.runs(jobID: uniqueCurrent, limit: 10).map(\.id),
-            [uniqueRun],
-            "test4A run history moves to the topology-independent id without duplication"
-        )
-        tests.expectEqual(
-            try store.runs(jobID: uniqueLegacy, limit: 10).map(\.jobID),
-            [uniqueCurrent],
-            "test4A migrated legacy lookup resolves through the persistent alias"
-        )
-        tests.expectEqual(
-            try store.managedBackupPath(jobID: uniqueCurrent),
-            "/tmp/unique-backup",
-            "test4A managed backup row moves to the topology-independent id"
-        )
-        let managedIDsAfterMigration = try store.managedJobIDs()
-        tests.expect(
-            managedIDsAfterMigration.contains(ambiguousLegacy),
-            "test4A ambiguous managed row remains under its legacy id"
-        )
-
-        let second = try store.migrateLegacyJobIDs(
-            discoveredJobs: jobs.filter { !$0.id.hasSuffix("333333333333") }
-        )
-        tests.expect(!second.performed, "test4A identity migration marker prevents a second rewrite")
-        tests.expect(
-            second.orphanedLegacyJobIDs.contains(ambiguousLegacy),
-            "test4A once-only migration keeps a formerly ambiguous legacy key orphaned"
-        )
-
-        let doctor = try test3A_runProcess(
-            try test3A_builtCLIPath(),
-            ["doctor"],
-            environment: ["TICKER_STORE_PATH": directory.appendingPathComponent("ticker.db").path],
-            timeout: 30
-        )
-        tests.expectEqual(doctor.status, 0, "test4A doctor completes with orphaned legacy history")
-        tests.expect(
-            doctor.stdout.contains("\(ambiguousLegacy)\torphaned-history")
-                && doctor.stdout.contains("\(unmatchedLegacy)\torphaned-history"),
-            "test4A doctor reports ambiguous and unmatched legacy history as orphaned"
-        )
     }
 }
 
 private func test4A_BlockedParentCapture(_ tests: TestHarness) throws {
     let tickerPath = try test3A_builtCLIPath()
     try withTemporaryDirectory("round4a-blocked-parent") { directory in
-        let storePath = directory.appendingPathComponent("ticker.db").path
-        let jobID = "test4A-blocked-parent"
+        let storePath = test10_compiledStorePath()
+        test10_removeStore(at: storePath)
+        defer { test10_removeStore(at: storePath) }
+        let store = try SQLiteRunStore(path: storePath)
+        let fakeLaunchctl = try test10_fakeLaunchctl(in: directory)
+        let invocation = try test10_wrappedInvocation(
+            directory: directory,
+            label: "com.example.test4A.blocked-parent",
+            command: [
+                "/usr/bin/awk",
+                "BEGIN { for (i = 0; i < 300000; i++) printf \"x\"; printf \"TAIL-4A\\n\" }",
+            ],
+            tickerPath: tickerPath,
+            store: store
+        )
         let process = Process()
         let blockedOutput = Pipe()
         process.executableURL = URL(fileURLWithPath: tickerPath)
-        process.arguments = [
-            "run",
-            "--label", jobID,
-            "--tail-bytes", "64",
-            "--",
-            "/usr/bin/awk",
-            "BEGIN { for (i = 0; i < 300000; i++) printf \"x\"; printf \"TAIL-4A\\n\" }",
-        ]
+        var processArguments = Array(invocation.arguments.dropFirst())
+        processArguments.insert(
+            contentsOf: ["--tail-bytes", "64"],
+            at: try require(processArguments.firstIndex(of: "--"), "test4A wrapper separator")
+        )
+        process.arguments = processArguments
         var environment = ProcessInfo.processInfo.environment
-        environment["TICKER_STORE_PATH"] = storePath
+        environment["TICKER_TEST_LAUNCHCTL_PATH"] = fakeLaunchctl.path
+        environment["TICKER_TEST_LAUNCHD_DIRECTORIES"] = directory.path
         process.environment = environment
         process.standardOutput = blockedOutput
         process.standardError = FileHandle.nullDevice
@@ -3155,7 +2993,7 @@ private func test4A_BlockedParentCapture(_ tests: TestHarness) throws {
         try? blockedOutput.fileHandleForReading.close()
 
         let stored = try require(
-            try SQLiteRunStore(path: storePath).latestRun(jobID: jobID),
+            try store.latestRun(jobID: invocation.job.id),
             "test4A blocked-parent run row"
         )
         print(
@@ -3174,26 +3012,40 @@ private func test4A_BlockedParentCapture(_ tests: TestHarness) throws {
 private func test4A_SignalReapingStress(_ tests: TestHarness) throws {
     let tickerPath = try test3A_builtCLIPath()
     try withTemporaryDirectory("round4a-signal-stress") { directory in
-        let storePath = directory.appendingPathComponent("ticker.db").path
+        let storePath = test10_compiledStorePath()
+        test10_removeStore(at: storePath)
+        defer { test10_removeStore(at: storePath) }
+        let store = try SQLiteRunStore(path: storePath)
+        let fakeLaunchctl = try test10_fakeLaunchctl(in: directory)
         var unexpectedStatuses: [Int32] = []
         var unfinishedRows = 0
         let iterations = 50
 
         for iteration in 0..<iterations {
-            let jobID = "test4A-signal-\(iteration)"
+            let jobDirectory = directory.appendingPathComponent(
+                "job-\(iteration)",
+                isDirectory: true
+            )
+            try FileManager.default.createDirectory(
+                at: jobDirectory,
+                withIntermediateDirectories: true
+            )
             let readyURL = directory.appendingPathComponent("ready-\(iteration)")
+            let invocation = try test10_wrappedInvocation(
+                directory: jobDirectory,
+                label: "com.example.test4A.signal-\(iteration)",
+                command: [
+                    "/bin/sh", "-c", "printf ready > '\(readyURL.path)'",
+                ],
+                tickerPath: tickerPath,
+                store: store
+            )
             let process = Process()
             process.executableURL = URL(fileURLWithPath: tickerPath)
-            process.arguments = [
-                "run",
-                "--label", jobID,
-                "--",
-                "/bin/sh",
-                "-c",
-                "printf ready > '\(readyURL.path)'",
-            ]
+            process.arguments = Array(invocation.arguments.dropFirst())
             var environment = ProcessInfo.processInfo.environment
-            environment["TICKER_STORE_PATH"] = storePath
+            environment["TICKER_TEST_LAUNCHCTL_PATH"] = fakeLaunchctl.path
+            environment["TICKER_TEST_LAUNCHD_DIRECTORIES"] = jobDirectory.path
             process.environment = environment
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
@@ -3211,7 +3063,7 @@ private func test4A_SignalReapingStress(_ tests: TestHarness) throws {
                 unexpectedStatuses.append(process.terminationStatus)
             }
 
-            let row = try SQLiteRunStore(path: storePath).latestRun(jobID: jobID)
+            let row = try store.latestRun(jobID: invocation.job.id)
             if row?.finishedAt == nil || (row?.exitCode != 0 && row?.exitCode != 143) {
                 unfinishedRows += 1
             }
@@ -3258,6 +3110,8 @@ private func test5_makeJob(
     nativeStatusObservedAt: Date? = nil,
     launchdProcessID: Int32? = nil,
     launchdRunCount: Int64? = nil,
+    launchdDomain: LaunchdDomain? = nil,
+    configPath: String? = nil,
     managed: Bool = false
 ) -> Job {
     Job(
@@ -3268,7 +3122,8 @@ private func test5_makeJob(
         command: command,
         cwd: cwd,
         enabled: true,
-        configPath: nil,
+        launchdDomain: launchdDomain,
+        configPath: configPath,
         lastKnownExit: lastKnownExit,
         nativeStatusObservedAt: nativeStatusObservedAt,
         launchdProcessID: launchdProcessID,
@@ -4602,7 +4457,7 @@ private func test7_ManualCrontabRunUsesDiscoveredContext(_ tests: TestHarness) t
         )
         let adapter = CrontabAdapter(
             crontabURL: fakeCrontab,
-            commandRunner: runAdapterCommand
+            commandRunner: { try runAdapterCommand(executable: $0, arguments: $1) }
         )
         let job = try require(try adapter.discover().first, "test7 fixture crontab job")
         let result = try test3A_runProcess(
@@ -4637,179 +4492,6 @@ private func test8_discoverLaunchdJob(
         try adapter.discover().first { $0.label == label },
         "test8 launchd job \(label)"
     )
-}
-
-private func test8_RenamedWrappedJobRecovery(_ tests: TestHarness) throws {
-    try withTemporaryDirectory("round8-renamed-wrapper") { directory in
-        let plistURL = directory.appendingPathComponent("renamed.plist")
-        try writePropertyList([
-            "Label": "com.example.test8.before",
-            "ProgramArguments": ["/bin/echo", "renamed"],
-        ], to: plistURL)
-        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
-        let wrapper = JobWrapper(
-            store: store,
-            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
-        )
-        let originalJob = try test8_discoverLaunchdJob(
-            in: [directory],
-            label: "com.example.test8.before"
-        )
-        _ = try wrapper.wrap(
-            job: originalJob,
-            tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"
-        )
-
-        var renamed = try test2A_readPropertyList(plistURL)
-        renamed["Label"] = "com.example.test8.after"
-        try writePropertyList(renamed, to: plistURL)
-        let renamedJob = try test8_discoverLaunchdJob(
-            in: [directory],
-            label: "com.example.test8.after"
-        )
-        tests.expect(originalJob.id != renamedJob.id, "test8_labelEdit_changesDiscoveredJobID")
-        tests.expectEqual(
-            try wrapper.recoveryState(job: renamedJob),
-            .identityChanged(previousJobID: originalJob.id),
-            "test8_labelEdit_surfacesExplicitIdentityRecovery"
-        )
-
-        _ = try wrapper.reconcileIdentityChange(
-            job: renamedJob,
-            tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"
-        )
-        _ = try wrapper.unwrap(job: renamedJob)
-        let restored = try test2A_readPropertyList(plistURL)
-        tests.expectEqual(
-            restored["Label"] as? String,
-            "com.example.test8.after",
-            "test8_labelEdit_unwrapPreservesNewLabel"
-        )
-        tests.expectEqual(
-            restored["ProgramArguments"] as? [String],
-            ["/bin/echo", "renamed"],
-            "test8_labelEdit_unwrapRestoresOriginalCommand"
-        )
-        let managedIDsAfterUnwrap = try store.managedJobIDs()
-        tests.expect(
-            !managedIDsAfterUnwrap.contains(originalJob.id),
-            "test8_labelEdit_unwrapClearsStaleManagedRow"
-        )
-    }
-}
-
-private func test8_MovedWrappedJobRecovery(_ tests: TestHarness) throws {
-    try withTemporaryDirectory("round8-moved-wrapper") { directory in
-        let originalDirectory = directory.appendingPathComponent("original", isDirectory: true)
-        let movedDirectory = directory.appendingPathComponent("moved", isDirectory: true)
-        try FileManager.default.createDirectory(at: originalDirectory, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: movedDirectory, withIntermediateDirectories: true)
-        let originalURL = originalDirectory.appendingPathComponent("job.plist")
-        let movedURL = movedDirectory.appendingPathComponent("job.plist")
-        try writePropertyList([
-            "Label": "com.example.test8.moved",
-            "ProgramArguments": ["/bin/echo", "moved"],
-        ], to: originalURL)
-        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
-        let wrapper = JobWrapper(
-            store: store,
-            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
-        )
-        let originalJob = try test8_discoverLaunchdJob(
-            in: [originalDirectory, movedDirectory],
-            label: "com.example.test8.moved"
-        )
-        _ = try wrapper.wrap(
-            job: originalJob,
-            tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"
-        )
-        _ = try test5_finish(
-            store: store,
-            jobID: originalJob.id,
-            trigger: .scheduled,
-            startedAt: Date(timeIntervalSince1970: 80),
-            exitCode: 0
-        )
-        try FileManager.default.moveItem(at: originalURL, to: movedURL)
-
-        let movedJob = try test8_discoverLaunchdJob(
-            in: [originalDirectory, movedDirectory],
-            label: "com.example.test8.moved"
-        )
-        tests.expect(originalJob.id != movedJob.id, "test8_pathMove_changesDiscoveredJobID")
-        tests.expectEqual(
-            try wrapper.recoveryState(job: movedJob),
-            .identityChanged(previousJobID: originalJob.id),
-            "test8_pathMove_surfacesExplicitIdentityRecovery"
-        )
-
-        _ = try wrapper.reconcileIdentityChange(
-            job: movedJob,
-            tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker"
-        )
-        let migratedArguments = try require(
-            try test2A_readPropertyList(movedURL)["ProgramArguments"] as? [String],
-            "test8 migrated wrapper arguments"
-        )
-        tests.expectEqual(
-            LaunchdWrapper.decode(migratedArguments)?.label,
-            movedJob.id,
-            "test8_pathMove_migratesEmbeddedWrapperID"
-        )
-        let movedBackupPath = try store.managedBackupPath(jobID: movedJob.id)
-        tests.expect(
-            movedBackupPath != nil,
-            "test8_pathMove_migratesManagedRowToCurrentID"
-        )
-        tests.expectEqual(
-            try store.managedBackupPath(jobID: originalJob.id),
-            movedBackupPath,
-            "test8_pathMove_oldBackupLookupCanonicalizesThroughAlias"
-        )
-        tests.expectEqual(
-            try store.runs(jobID: movedJob.id, limit: 10).map(\.outcome),
-            [.success],
-            "test8_pathMove_migratesExistingHistory"
-        )
-        tests.expectEqual(
-            try wrapper.recoveryState(job: movedJob),
-            .wrappedConsistent,
-            "test8_pathMove_migratedWrapperRemainsRecoverable"
-        )
-        _ = try wrapper.unwrap(job: movedJob)
-        tests.expectEqual(
-            try test2A_readPropertyList(movedURL)["ProgramArguments"] as? [String],
-            ["/bin/echo", "moved"],
-            "test8_pathMove_unwrapRestoresOriginalCommand"
-        )
-    }
-}
-
-private func test8_ForeignWrapperStillRejected(_ tests: TestHarness) throws {
-    try withTemporaryDirectory("round8-foreign-wrapper") { directory in
-        let originalURL = directory.appendingPathComponent("original.plist")
-        let copiedURL = directory.appendingPathComponent("copied.plist")
-        try writePropertyList([
-            "Label": "com.example.test8.owner",
-            "ProgramArguments": ["/bin/echo", "owner"],
-        ], to: originalURL)
-        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
-        let wrapper = JobWrapper(
-            store: store,
-            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
-        )
-        let owner = try test8_discoverLaunchdJob(in: [directory], label: "com.example.test8.owner")
-        _ = try wrapper.wrap(job: owner, tickerPath: "/Applications/Ticker.app/Contents/MacOS/ticker")
-        var copied = try test2A_readPropertyList(originalURL)
-        copied["Label"] = "com.example.test8.copy"
-        try writePropertyList(copied, to: copiedURL)
-        let foreign = try test8_discoverLaunchdJob(in: [directory], label: "com.example.test8.copy")
-        tests.expectEqual(
-            try wrapper.recoveryState(job: foreign),
-            .wrappedForeignLabel(embeddedJobID: owner.id),
-            "test8_copiedWrapper_withOriginalStillPresentRemainsForeign"
-        )
-    }
 }
 
 private func test9_RunLivenessAndNativeOrdering(_ tests: TestHarness) throws {
@@ -4928,7 +4610,20 @@ private func test9_RunLivenessAndNativeOrdering(_ tests: TestHarness) throws {
         )
 
         let clockRollbackID = "launchd:test9-clock-rollback#444444444444"
-        _ = try test5_finish(
+        let earlierFailureID = try test5_finish(
+            store: store,
+            jobID: clockRollbackID,
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 100),
+            exitCode: 1,
+            context: RunStartContext(
+                processID: getpid(),
+                bootSessionID: bootSessionID,
+                nativeExitStatusAtStart: 1,
+                launchdRunCountAtStart: 39
+            )
+        )
+        let laterSuccessID = try test5_finish(
             store: store,
             jobID: clockRollbackID,
             trigger: .scheduled,
@@ -4940,6 +4635,12 @@ private func test9_RunLivenessAndNativeOrdering(_ tests: TestHarness) throws {
                 nativeExitStatusAtStart: 1,
                 launchdRunCountAtStart: 40
             )
+        )
+        tests.expect(laterSuccessID > earlierFailureID, "test10_runID_isMonotonicAcrossClockRollback")
+        tests.expectEqual(
+            try store.scheduledHealthRuns()[clockRollbackID]?.id,
+            laterSuccessID,
+            "test10_healthSelection_usesRunIDAcrossClockRollback"
         )
         let clockRollbackJob = test5_makeJob(
             id: clockRollbackID,
@@ -4955,6 +4656,35 @@ private func test9_RunLivenessAndNativeOrdering(_ tests: TestHarness) throws {
             ),
             .success,
             "test9_backwardWallClock_cannotReorderNativeAndStoredEvents"
+        )
+
+        let rebootID = "launchd:test10-reboot#454545454545"
+        _ = try test5_finish(
+            store: store,
+            jobID: rebootID,
+            trigger: .scheduled,
+            startedAt: Date(timeIntervalSince1970: 350),
+            exitCode: 0,
+            context: RunStartContext(
+                processID: getpid(),
+                bootSessionID: "previous-boot-session",
+                nativeExitStatusAtStart: 1,
+                launchdRunCountAtStart: 1
+            )
+        )
+        let rebootJob = test5_makeJob(
+            id: rebootID,
+            lastKnownExit: ExitStatus(raw: 1),
+            launchdRunCount: 1,
+            managed: true
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: rebootJob,
+                scheduledHistory: try store.scheduledHealthRuns()[rebootID]
+            ),
+            .failure,
+            "test10_preRebootSuccess_cannotHideCurrentNativeFailure"
         )
 
         let laterNativeID = "launchd:test9-later-native#555555555555"
@@ -4994,180 +4724,428 @@ private func test9_PersistentIdentityAliases(_ tests: TestHarness) throws {
         let oldID = "launchd:com.example.test9.alias#111111111111"
         let middleID = "launchd:com.example.test9.alias#222222222222"
         let currentID = "launchd:com.example.test9.alias#333333333333"
-        let foreignID = "launchd:com.example.test9.foreign#444444444444"
         let backupPath = directory.appendingPathComponent("backup.plist").path
-
         do {
             let store = try SQLiteRunStore(path: databasePath)
             try store.markManaged(jobID: oldID, backupPath: backupPath)
-            _ = try test5_finish(
-                store: store,
-                jobID: oldID,
-                trigger: .scheduled,
-                startedAt: Date(timeIntervalSince1970: 10),
-                exitCode: 0
-            )
-            try store.migrateJobIdentity(from: oldID, to: middleID)
+            _ = try test5_finish(store: store, jobID: oldID, trigger: .scheduled,
+                                 startedAt: Date(timeIntervalSince1970: 10), exitCode: 0)
         }
-
+        let canonicalized = DispatchSemaphore(value: 0)
+        let releaseInsert = DispatchSemaphore(value: 0)
+        let migrationFinished = DispatchSemaphore(value: 0)
+        let hookedStore = try SQLiteRunStore(path: databasePath, beforeRunsTriggerMigration: nil,
+            afterBeginRunCanonicalization: {
+                canonicalized.signal(); _ = releaseInsert.wait(timeout: .now() + 5) })
+        let migrationStore = try SQLiteRunStore(path: databasePath)
+        let resultLock = NSLock()
+        var concurrencyErrors: [String] = []
+        let workers = DispatchGroup()
+        workers.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { workers.leave() }
+            do {
+                _ = try test5_finish(store: hookedStore, jobID: oldID, trigger: .scheduled,
+                                     startedAt: Date(timeIntervalSince1970: 20), exitCode: 1)
+            } catch {
+                resultLock.lock(); concurrencyErrors.append(error.localizedDescription)
+                resultLock.unlock()
+            }
+        }
+        tests.expectEqual(canonicalized.wait(timeout: .now() + 5), .success,
+                          "test10_lateOldWrapper_pausesAfterCanonicalization")
+        workers.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { migrationFinished.signal(); workers.leave() }
+            do {
+                try migrationStore.migrateJobIdentity(from: oldID, to: middleID)
+            } catch {
+                resultLock.lock(); concurrencyErrors.append(error.localizedDescription)
+                resultLock.unlock()
+            }
+        }
+        tests.expectEqual(migrationFinished.wait(timeout: .now() + 0.2), .timedOut,
+                          "test10_identityMigration_waitsForInFlightIdentityWrite")
+        releaseInsert.signal()
+        tests.expectEqual(workers.wait(timeout: .now() + 10), .success,
+                          "test10_interleavedIdentityWriteAndMigration_complete")
+        resultLock.lock(); let observedErrors = concurrencyErrors; resultLock.unlock()
+        tests.expectEqual(observedErrors, [],
+                          "test10_interleavedIdentityWriteAndMigration_succeed")
         let reopened = try SQLiteRunStore(path: databasePath)
-        tests.expectEqual(
-            try reopened.canonicalJobID(oldID),
-            middleID,
-            "test9_identityAlias_persistsAcrossStoreReopen"
-        )
-        _ = try test5_finish(
-            store: reopened,
-            jobID: oldID,
-            trigger: .scheduled,
-            startedAt: Date(timeIntervalSince1970: 20),
-            exitCode: 1
-        )
-        tests.expectEqual(
-            try reopened.runs(jobID: middleID, limit: 10).map(\.jobID),
-            [middleID, middleID],
-            "test9_lateOldWrapperRun_landsOnCanonicalIdentity"
-        )
-
+        tests.expectEqual(try reopened.canonicalJobID(oldID), middleID,
+                          "test9_identityAlias_persistsAcrossStoreReopen")
+        tests.expectEqual(try reopened.runs(jobID: middleID, limit: 10).map(\.jobID),
+                          [middleID, middleID],
+                          "test9_lateOldWrapperRun_landsOnCanonicalIdentity")
         try reopened.migrateJobIdentity(from: middleID, to: currentID)
-        _ = try test5_finish(
-            store: reopened,
-            jobID: oldID,
-            trigger: .scheduled,
-            startedAt: Date(timeIntervalSince1970: 30),
-            exitCode: 0
-        )
-        tests.expectEqual(
-            try reopened.canonicalJobID(oldID),
-            currentID,
-            "test9_subsequentIdentityMigration_resolvesAliasChain"
-        )
-        tests.expectEqual(
-            try reopened.managedBackupPath(jobID: oldID),
-            backupPath,
-            "test9_backupLookup_canonicalizesOldIdentity"
-        )
-        tests.expectEqual(
-            try reopened.managedJobIDs(),
-            Set([currentID]),
-            "test9_managedRows_exposeOnlyCanonicalIdentity"
-        )
-        tests.expectEqual(
-            Set(try reopened.scheduledHealthRuns().keys),
-            Set([currentID]),
-            "test9_healthLookup_exposesOnlyCanonicalIdentity"
-        )
+        _ = try test5_finish(store: reopened, jobID: oldID, trigger: .scheduled,
+                             startedAt: Date(timeIntervalSince1970: 30), exitCode: 0)
+        tests.expectEqual(try reopened.canonicalJobID(oldID), currentID,
+                          "test9_subsequentIdentityMigration_resolvesAliasChain")
+        tests.expectEqual(try reopened.managedBackupPath(jobID: oldID), backupPath,
+                          "test9_backupLookup_canonicalizesOldIdentity")
+    }
+}
 
-        try reopened.markManaged(jobID: foreignID, backupPath: "/tmp/foreign-test9-backup")
-        tests.expectThrows(
-            try reopened.migrateJobIdentity(from: currentID, to: foreignID),
-            "test9_aliasMigration_refusesManagedIdentityCollision"
+private func test10_LegacyWrapperRemoval(_ tests: TestHarness) throws {
+    let id = "launchd:com.example.test10.legacy#111111111111"
+    let unversioned = ["/Applications/Ticker.app/Contents/MacOS/ticker", "run",
+                       "--label", id, "--", "/usr/bin/true"]
+    tests.expect(LaunchdWrapper.decode(unversioned) == nil,
+                 "test10_unversionedWrapper_isNotRecognized")
+    try withTemporaryDirectory("round10-no-legacy-wrapper") { directory in
+        let plistURL = directory.appendingPathComponent("legacy.plist")
+        try writePropertyList(["Label": "com.example.test10.legacy",
+                               "ProgramArguments": unversioned], to: plistURL)
+        let adapter = LaunchdAdapter(searchDirectories: [directory]) { _, _ in
+            AdapterCommandResult(status: 1, stdout: "", stderr: "not loaded")
+        }
+        let job = try require(try adapter.discover().first, "test10 unversioned fixture")
+        tests.expect(!job.managed, "test10_unversionedInvocation_isNotManaged")
+        tests.expectEqual(job.command, unversioned, "test10_unversionedInvocation_remainsLiteral")
+        let marker = directory.appendingPathComponent("unexpected-child.txt")
+        let result = try test3A_runProcess(
+            try test3A_builtCLIPath(),
+            ["run", "--label", job.id, "--", "/bin/sh", "-c",
+             "printf unexpected > '\(marker.path)'"]
         )
+        tests.expectEqual(result.status, 2, "test10_unversionedScheduledRun_isRejected")
+        tests.expect(!FileManager.default.fileExists(atPath: marker.path),
+                     "test10_rejectedUnversionedRun_doesNotLaunchChild")
+    }
+}
+
+private func test10_ConcurrentEvidenceMigration(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round10-concurrent-evidence-migration") { directory in
+        let databaseURL = directory.appendingPathComponent("legacy.db")
+        var database: OpaquePointer?
+        guard sqlite3_open(databaseURL.path, &database) == SQLITE_OK, let database
+        else { throw FixtureError.missing("test10 evidence legacy sqlite database") }
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let setupResult = sqlite3_exec(database, """
+            CREATE TABLE runs(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              job_id TEXT NOT NULL, started_at REAL NOT NULL, finished_at REAL,
+              exit_code INTEGER, stdout_tail TEXT, stderr_tail TEXT,
+              trigger TEXT NOT NULL DEFAULT 'scheduled');
+            CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO schema_meta(key, value) VALUES('run_trigger_health_v3', '1');
+            """, nil, nil, &errorMessage)
+        let setupMessage = errorMessage.map { String(cString: $0) }
+        if let errorMessage { sqlite3_free(errorMessage) }
+        _ = sqlite3_close(database)
+        guard setupResult == SQLITE_OK else { throw FixtureError.missing(
+            setupMessage ?? "test10 evidence schema setup failed") }
+        let hookLock = NSLock()
+        let releaseHooks = DispatchSemaphore(value: 0)
+        var hookCount = 0
+        let migrationHook = {
+            hookLock.lock(); hookCount += 1
+            let bothObserved = hookCount == 2
+            hookLock.unlock()
+            if bothObserved { releaseHooks.signal(); releaseHooks.signal() }
+            _ = releaseHooks.wait(timeout: .now() + 5)
+        }
+        let resultLock = NSLock()
+        var errors: [String] = []
+        let workers = DispatchGroup()
+        for _ in 0..<2 {
+            workers.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { workers.leave() }
+                do {
+                    _ = try SQLiteRunStore(path: databaseURL.path,
+                        beforeRunsTriggerMigration: nil, beforeRunEvidenceMigration: migrationHook)
+                } catch {
+                    resultLock.lock(); errors.append(error.localizedDescription); resultLock.unlock()
+                }
+            }
+        }
+        tests.expectEqual(workers.wait(timeout: .now() + 10), .success,
+                          "test10_concurrentEvidenceMigration_bothOpenersComplete")
+        hookLock.lock(); let observedHookCount = hookCount; hookLock.unlock()
+        resultLock.lock(); let observedErrors = errors; resultLock.unlock()
+        tests.expectEqual(observedHookCount, 2,
+                          "test10_concurrentEvidenceMigration_bothObserveMissingColumns")
+        tests.expectEqual(observedErrors, [],
+                          "test10_concurrentEvidenceMigration_rechecksUnderLock")
+        let reopened = try SQLiteRunStore(path: databaseURL.path)
+        let id = "launchd:test10-evidence#222222222222"
+        let context = RunStartContext(processID: getpid(), bootSessionID: "test10-boot",
+                                      nativeExitStatusAtStart: 1, launchdRunCountAtStart: 2)
+        let runID = try reopened.beginRun(jobID: id, startedAt: Date(timeIntervalSince1970: 1),
+                                          trigger: .scheduled, context: context)
+        let run = try require(try reopened.runs(jobID: id, limit: 1).first, "test10 evidence run")
+        tests.expectEqual(run.id, runID, "test10_evidenceMigration_preservesWritableRunsTable")
+        tests.expectEqual(run.processID, getpid(), "test10_evidenceMigration_addsProcessID")
+        tests.expectEqual(run.bootSessionID, "test10-boot", "test10_evidenceMigration_addsBootID")
+        tests.expectEqual(run.nativeExitStatusAtStart, 1, "test10_evidenceMigration_addsNativeStatus")
+        tests.expectEqual(run.launchdRunCountAtStart, 2, "test10_evidenceMigration_addsRunCount")
+    }
+}
+
+private func test10_ExplicitSingularIdentityReconciliation(_ tests: TestHarness) throws {
+    let tickerPath = "/Applications/Ticker.app/Contents/MacOS/ticker"
+    try withTemporaryDirectory("round10-two-moves") { directory in
+        let firstDirectory = directory.appendingPathComponent("first", isDirectory: true)
+        let secondDirectory = directory.appendingPathComponent("second", isDirectory: true)
+        let thirdDirectory = directory.appendingPathComponent("third", isDirectory: true)
+        for item in [firstDirectory, secondDirectory, thirdDirectory] {
+            try FileManager.default.createDirectory(at: item, withIntermediateDirectories: true) }
+        let firstURL = firstDirectory.appendingPathComponent("job.plist")
+        let secondURL = secondDirectory.appendingPathComponent("job.plist")
+        let thirdURL = thirdDirectory.appendingPathComponent("job.plist")
+        try writePropertyList(["Label": "com.example.test10.twice-moved",
+                               "ProgramArguments": ["/bin/echo", "twice-moved"]], to: firstURL)
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+        let wrapper = JobWrapper(store: store,
+            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true))
+        let firstJob = try test8_discoverLaunchdJob(in: [firstDirectory],
+                                                     label: "com.example.test10.twice-moved")
+        _ = try wrapper.wrap(job: firstJob, tickerPath: tickerPath)
+        _ = try test5_finish(store: store, jobID: firstJob.id, trigger: .scheduled,
+                             startedAt: Date(timeIntervalSince1970: 1), exitCode: 0)
+        try FileManager.default.moveItem(at: firstURL, to: secondURL)
+        let secondJob = try test8_discoverLaunchdJob(in: [secondDirectory],
+                                                      label: "com.example.test10.twice-moved")
         tests.expectEqual(
-            try reopened.canonicalJobID(oldID),
-            currentID,
-            "test9_rejectedAliasCollision_doesNotHijackHistory"
+            try wrapper.recoveryState(job: secondJob),
+            .identityChanged(previousJobID: firstJob.id),
+            "test10_firstMove_isAuthenticatedThroughRealWrapperRoute"
         )
+        _ = try wrapper.reconcileIdentityChange(job: secondJob, tickerPath: tickerPath)
+        var renamedSecond = try test2A_readPropertyList(secondURL)
+        renamedSecond["Label"] = "com.example.test10.twice-moved-renamed"
+        try writePropertyList(renamedSecond, to: secondURL)
+        try FileManager.default.moveItem(at: secondURL, to: thirdURL)
+        let thirdJob = try test8_discoverLaunchdJob(in: [thirdDirectory],
+            label: "com.example.test10.twice-moved-renamed")
+        tests.expectEqual(
+            try wrapper.recoveryState(job: thirdJob),
+            .identityChanged(previousJobID: secondJob.id),
+            "test10_secondMoveAndRename_comparesIdentityThroughAliasChain"
+        )
+        _ = try wrapper.reconcileIdentityChange(job: thirdJob, tickerPath: tickerPath)
+        let args = try require(try test2A_readPropertyList(thirdURL)["ProgramArguments"]
+            as? [String], "test10 twice-moved wrapper arguments")
+        tests.expectEqual(LaunchdWrapper.decode(args)?.label, thirdJob.id,
+                          "test10_secondMove_rebindsVersionedWrapper")
+        tests.expectEqual(try store.canonicalJobID(firstJob.id), thirdJob.id,
+                          "test10_secondMove_preservesTransitiveAlias")
+        tests.expectEqual(try store.runs(jobID: thirdJob.id, limit: 10).map(\.jobID), [thirdJob.id],
+                          "test10_secondMove_preservesHistoryThroughRealWrapperRoute")
+        tests.expectEqual(
+            try wrapper.recoveryState(job: thirdJob), .wrappedConsistent,
+            "test10_secondMoveAndRename_remainsRecoverable"
+        )
+        _ = try wrapper.unwrap(job: thirdJob)
+        let restored = try test2A_readPropertyList(thirdURL)
+        tests.expectEqual(restored["Label"] as? String, "com.example.test10.twice-moved-renamed",
+                          "test10_secondMoveAndRename_unwrapPreservesCurrentLabel")
+        tests.expectEqual(restored["ProgramArguments"] as? [String], ["/bin/echo", "twice-moved"],
+                          "test10_secondMoveAndRename_unwrapRestoresOriginalCommand")
+    }
+
+    try withTemporaryDirectory("round10-ambiguous-claim") { directory in
+        let originalDirectory = directory.appendingPathComponent("original", isDirectory: true)
+        let copiesDirectory = directory.appendingPathComponent("copies", isDirectory: true)
+        try FileManager.default.createDirectory(at: originalDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: copiesDirectory, withIntermediateDirectories: true)
+        let originalURL = originalDirectory.appendingPathComponent("original.plist")
+        let firstCopyURL = copiesDirectory.appendingPathComponent("first-copy.plist")
+        let secondCopyURL = copiesDirectory.appendingPathComponent("second-copy.plist")
+        try writePropertyList(["Label": "com.example.test10.ambiguous",
+                               "ProgramArguments": ["/usr/bin/true"]], to: originalURL)
+        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+        let wrapper = JobWrapper(store: store,
+            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true))
+        let originalJob = try test8_discoverLaunchdJob(in: [originalDirectory],
+                                                        label: "com.example.test10.ambiguous")
+        _ = try wrapper.wrap(job: originalJob, tickerPath: tickerPath)
+        let wrappedData = try Data(contentsOf: originalURL)
+        try wrappedData.write(to: firstCopyURL)
+        var secondCopy = try test2A_readPropertyList(originalURL); secondCopy["Label"] = "com.example.test10.ambiguous-second"
+        try writePropertyList(secondCopy, to: secondCopyURL); let secondWrappedData = try Data(contentsOf: secondCopyURL)
+        try FileManager.default.removeItem(at: originalURL)
+        let discoveredCopies = try LaunchdAdapter(searchDirectories: [copiesDirectory]) { _, _ in
+            AdapterCommandResult(status: 1, stdout: "", stderr: "not loaded")
+        }.discover()
+        let firstCopy = try require(discoveredCopies.first {
+            $0.configPath == firstCopyURL.standardizedFileURL.path
+        }, "test10 first ambiguous claimant")
+        tests.expectEqual(
+            try wrapper.recoveryState(job: firstCopy),
+            .identityChanged(previousJobID: originalJob.id),
+            "test10_ambiguousCopies_reachExplicitReconciliationGate"
+        )
+        var reconciliationMessage = ""
+        do {
+            _ = try wrapper.reconcileIdentityChange(job: firstCopy, tickerPath: tickerPath)
+            tests.expect(false, "test10_ambiguousIdentityClaim_failsClosed")
+        } catch {
+            reconciliationMessage = error.localizedDescription
+            tests.expect(true, "test10_ambiguousIdentityClaim_failsClosed")
+        }
+        tests.expect(reconciliationMessage.contains(firstCopyURL.path)
+            && reconciliationMessage.contains(secondCopyURL.path),
+                     "test10_ambiguousIdentityClaim_namesEveryClaimant")
+        tests.expect(reconciliationMessage.contains("Keep exactly the intended plist"),
+                     "test10_ambiguousIdentityClaim_givesManualResolution")
+        tests.expectEqual(try store.canonicalJobID(originalJob.id), originalJob.id,
+                          "test10_ambiguousIdentityClaim_doesNotRetargetHistory")
+        let copiesUnchanged = try Data(contentsOf: firstCopyURL) == wrappedData
+            && Data(contentsOf: secondCopyURL) == secondWrappedData
+        tests.expect(copiesUnchanged, "test10_ambiguousIdentityClaim_doesNotRewriteCopies")
+    }
+}
+
+private func test10_RuntimeOwnershipAndDiagnostics(_ tests: TestHarness) throws {
+    let nested = """
+    gui/501/com.example.test10 = {
+        pid = 42
+        runs = 7
+        last exit code = 1
+        endpoints = {
+            pid = 999
+            runs = 999
+            last exit code = 0
+        }
+    }
+    """
+    let expected = LaunchdRuntimeSnapshot(processID: 42, lastExitStatus: ExitStatus(raw: 1),
+                                          runCount: 7)
+    tests.expectEqual(LaunchdRuntimeSnapshot.parse(nested), expected,
+                      "test10_runtimeParser_ignoresNestedDuplicateFields")
+    let probeJob = test5_makeJob(
+        id: "launchd:com.example.test10.probe#333333333333",
+        label: "com.example.test10.probe",
+        launchdDomain: .userAgent,
+        configPath: "/tmp/test10-probe.plist",
+        managed: true
+    )
+    var probeCalls = 0
+    let ownership = try LaunchdRuntimeProbe.ownership(job: probeJob, processID: 4242,
+        attempts: 3, retryDelay: 0, commandRunner: { _, _ in
+            probeCalls += 1
+            let pidLine = probeCalls == 3 ? "pid = 4242\n" : ""
+            return AdapterCommandResult(status: 0,
+                stdout: "service = {\n\(pidLine)runs = 1\nlast exit code = 0\n}\n", stderr: "")
+        })
+    guard case .owned = ownership
+    else { throw FixtureError.missing("test10 delayed pid ownership") }
+    tests.expectEqual(probeCalls, 3, "test10_serviceWithoutPID_isRetriedBeforeMismatch")
+
+    try withTemporaryDirectory("round10-command-timeout") { directory in
+        let slowCommand = directory.appendingPathComponent("slow-command")
+        try "#!/bin/sh\nexec /bin/sleep 10\n".write(to: slowCommand, atomically: true,
+                                                      encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                              ofItemAtPath: slowCommand.path)
+        let startedAt = Date()
+        do {
+            _ = try runAdapterCommand(executable: slowCommand, arguments: [], timeout: 0.1)
+            tests.expect(false, "test10_launchctlProbe_timeoutThrows")
+        } catch AdapterCommandError.timedOut {
+            tests.expect(true, "test10_launchctlProbe_timeoutThrows")
+        } catch {
+            tests.expect(false, "test10_launchctlProbe_timeoutUsesTypedError")
+        }
+        tests.expect(Date().timeIntervalSince(startedAt) < 2,
+                     "test10_launchctlProbe_timeoutIsBounded")
+    }
+
+    try withTemporaryDirectory("round10-recorder-diagnostics") { directory in
+        let compiledStorePath = test10_compiledStorePath()
+        test10_removeStore(at: compiledStorePath)
+        defer { test10_removeStore(at: compiledStorePath) }
+        let store = try SQLiteRunStore(path: compiledStorePath)
+        let tickerPath = try test3A_builtCLIPath()
+        let marker = directory.appendingPathComponent("child-launched.txt")
+        let fixture = try test10_wrappedInvocation(directory: directory,
+            label: "com.example.test10.no-pid",
+            command: ["/bin/sh", "-c", "printf launched > '\(marker.path)'"],
+            tickerPath: tickerPath, store: store)
+        let launchctl = directory.appendingPathComponent("launchctl")
+        try """
+        #!/bin/sh
+        printf 'gui/test = {\n    runs = 1\n    last exit code = 0\n}\n'
+        """.write(to: launchctl, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                              ofItemAtPath: launchctl.path)
+        let environment = [
+            "TICKER_TEST_LAUNCHCTL_PATH": launchctl.path,
+            "TICKER_TEST_LAUNCHD_DIRECTORIES": directory.path,
+        ]
+        let delayedPIDResult = try test3A_runProcess(fixture.arguments[0],
+            Array(fixture.arguments.dropFirst()), environment: environment)
+        tests.expectEqual(delayedPIDResult.status, 0, "test10_noPIDYet_stillExecutesChild")
+        tests.expect(FileManager.default.fileExists(atPath: marker.path),
+                     "test10_noPIDYet_provesChildExecuted")
+        tests.expectEqual(try store.runs(jobID: fixture.job.id, limit: 10).count, 0,
+                          "test10_noPIDYet_doesNotAttributeUnprovenRun")
+        let delayedPIDDiagnostic = try store.recorderDiagnostics().first?.message
+        tests.expect(delayedPIDDiagnostic?.contains("has not published") == true,
+                     "test10_noPIDYet_persistsDistinctRecorderDiagnostic")
+        var doctorEnvironment = environment; doctorEnvironment["TICKER_STORE_PATH"] = compiledStorePath
+        let doctor = try test3A_runProcess(tickerPath, ["doctor"], environment: doctorEnvironment)
+        tests.expect(doctor.stdout.contains("recorder-diagnostic")
+            && doctor.stdout.contains("has not published"),
+                     "test10_doctor_surfacesRecorderDiagnostic")
+
+        let forged = try test3A_runProcess(
+            tickerPath,
+            [
+                "run", "--ticker-wrapper-version", LaunchdWrapper.currentVersion,
+                "--label", fixture.job.id, "--", "/usr/bin/false",
+            ],
+            environment: environment
+        )
+        tests.expectEqual(forged.status, 1, "test10_handRunScheduledInjection_executesSuppliedChild")
+        tests.expectEqual(try store.runs(jobID: fixture.job.id, limit: 10).count, 0,
+                          "test10_handRunScheduledInjection_cannotForgeHistory")
+        let forgedDiagnostic = try store.recorderDiagnostics().first?.message
+        tests.expect(forgedDiagnostic?.contains("command does not match") == true,
+                     "test10_handRunScheduledInjection_recordsDiagnostic")
     }
 }
 
 private func test9_CopiedWrapperRuntimeOwnership(_ tests: TestHarness) throws {
     try withTemporaryDirectory("round9-wrapper-ownership") { directory in
-        let compiledStoreDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ticker-compiled-test-default", isDirectory: true)
-        let compiledStorePath = compiledStoreDirectory
-            .appendingPathComponent("ticker-\(getpid()).db")
-            .path
-        try? FileManager.default.removeItem(atPath: compiledStorePath)
-        try? FileManager.default.removeItem(atPath: compiledStorePath + "-wal")
-        try? FileManager.default.removeItem(atPath: compiledStorePath + "-shm")
-        defer {
-            try? FileManager.default.removeItem(atPath: compiledStorePath)
-            try? FileManager.default.removeItem(atPath: compiledStorePath + "-wal")
-            try? FileManager.default.removeItem(atPath: compiledStorePath + "-shm")
-        }
-
+        let compiledStorePath = test10_compiledStorePath()
+        test10_removeStore(at: compiledStorePath)
+        defer { test10_removeStore(at: compiledStorePath) }
         let tickerPath = try test3A_builtCLIPath()
-        let originalURL = directory.appendingPathComponent("owner.plist")
+        let label = "com.example.test9.owner"
+        let originalURL = directory.appendingPathComponent("\(label).plist")
         let copiedURL = directory.appendingPathComponent("copy.plist")
-        try writePropertyList([
-            "Label": "com.example.test9.owner",
-            "ProgramArguments": ["/bin/echo", "owner"],
-        ], to: originalURL)
         let store = try SQLiteRunStore(path: compiledStorePath)
-        let wrapper = JobWrapper(
-            store: store,
-            backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
-        )
-        let owner = try test8_discoverLaunchdJob(in: [directory], label: "com.example.test9.owner")
-        _ = try wrapper.wrap(job: owner, tickerPath: tickerPath)
-        let ownerArguments = try require(
-            try test2A_readPropertyList(originalURL)["ProgramArguments"] as? [String],
-            "test9 owner wrapper arguments"
-        )
-
-        let fakeLaunchctl = directory.appendingPathComponent("launchctl")
-        try """
-        #!/bin/sh
-        printf 'pid = %s\nruns = 1\nlast exit code = 0\n' "$PPID"
-        """.write(to: fakeLaunchctl, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755],
-            ofItemAtPath: fakeLaunchctl.path
-        )
-        let redirectedStorePath = directory.appendingPathComponent("redirected.db").path
+        let owner = try test10_wrappedInvocation(directory: directory, label: label,
+            command: ["/bin/echo", "owner"], tickerPath: tickerPath, store: store)
+        let fakeLaunchctl = try test10_fakeLaunchctl(in: directory)
         let environment = [
             "TICKER_TEST_LAUNCHCTL_PATH": fakeLaunchctl.path,
-            "TICKER_STORE_PATH": redirectedStorePath,
+            "TICKER_TEST_LAUNCHD_DIRECTORIES": directory.path,
         ]
-        let ownerResult = try test3A_runProcess(
-            ownerArguments[0],
-            Array(ownerArguments.dropFirst()),
-            environment: environment
-        )
+        let ownerResult = try test3A_runProcess(owner.arguments[0],
+            Array(owner.arguments.dropFirst()), environment: environment)
         tests.expectEqual(ownerResult.status, 0, "test9_ownedWrapper_executesNormally")
-        tests.expectEqual(
-            try store.runs(jobID: owner.id, limit: 10).count,
-            1,
-            "test9_ownedWrapper_recordsAfterRuntimeOwnershipProof"
-        )
-        let redirectedStore = try SQLiteRunStore(path: redirectedStorePath)
-        tests.expectEqual(
-            try redirectedStore.runs(jobID: owner.id, limit: 10).count,
-            0,
-            "test9_testScheduledWrapper_usesCompiledIsolatedDefault"
-        )
-
-        var copied = try test2A_readPropertyList(originalURL)
-        copied["Label"] = "com.example.test9.copy"
+        tests.expectEqual(try store.runs(jobID: owner.job.id, limit: 10).count, 1,
+                          "test9_ownedWrapper_recordsAfterRuntimeOwnershipProof")
+        let copied = try test2A_readPropertyList(originalURL)
         try writePropertyList(copied, to: copiedURL)
         let copiedArguments = try require(
             try test2A_readPropertyList(copiedURL)["ProgramArguments"] as? [String],
-            "test9 copied wrapper arguments"
-        )
-        try """
-        #!/bin/sh
-        printf 'pid = 1\nruns = 1\nlast exit code = 0\n'
-        """.write(to: fakeLaunchctl, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755],
-            ofItemAtPath: fakeLaunchctl.path
-        )
-        let copiedResult = try test3A_runProcess(
-            copiedArguments[0],
-            Array(copiedArguments.dropFirst()),
-            environment: environment
-        )
+            "test9 copied wrapper arguments")
+        let copiedResult = try test3A_runProcess(copiedArguments[0],
+            Array(copiedArguments.dropFirst()), environment: environment)
         tests.expectEqual(copiedResult.status, 0, "test9_copiedWrapper_stillExecutesChild")
-        tests.expect(
-            copiedResult.stderr.contains("scheduled wrapper ownership not proven"),
-            "test9_copiedWrapper_reportsOwnershipFailureClearly"
-        )
-        tests.expectEqual(
-            try store.runs(jobID: owner.id, limit: 10).count,
-            1,
-            "test9_copiedWrapper_leavesVictimHistoryUnchanged"
-        )
+        tests.expectEqual(copiedResult.stdout, "owner\n",
+                          "test10_copiedWrapper_provesChildActuallyLaunched")
+        tests.expect(copiedResult.stderr.contains("scheduled wrapper ownership not proven"),
+                     "test9_copiedWrapper_reportsOwnershipFailureClearly")
+        tests.expectEqual(try store.runs(jobID: owner.job.id, limit: 10).count, 1,
+                          "test9_copiedWrapper_leavesVictimHistoryUnchanged")
     }
 }
 
@@ -5273,6 +5251,12 @@ private func test9_InterruptedExchangeRecovery(_ tests: TestHarness) throws {
             crashedData != originalData,
             "test9_crashFixture_leavesStagedRewriteLive"
         )
+        let unrelatedTemporary = directory.appendingPathComponent("unrelated.keep.tmp")
+        let unrelatedExchange = directory.appendingPathComponent(
+            ".other.plist.ticker-exchange.keep.json"
+        )
+        try Data("unrelated temporary".utf8).write(to: unrelatedTemporary)
+        try Data("unrelated exchange".utf8).write(to: unrelatedExchange)
 
         let store = try SQLiteRunStore(path: databasePath)
         let wrapper = JobWrapper(store: store, backupDirectory: backupDirectory)
@@ -5296,13 +5280,24 @@ private func test9_InterruptedExchangeRecovery(_ tests: TestHarness) throws {
             at: directory,
             includingPropertiesForKeys: nil
         ).filter {
-            $0.lastPathComponent.contains("ticker-exchange")
-                || $0.lastPathComponent.hasSuffix(".tmp")
+            $0.lastPathComponent.hasPrefix(".crash.plist.ticker-exchange.")
+                || ($0.lastPathComponent.hasPrefix(".crash.plist.")
+                    && $0.lastPathComponent.hasSuffix(".tmp"))
         }
         tests.expectEqual(
             residue.map(\.lastPathComponent),
             [],
             "test9_recoveryScan_removesOnlyItsTransactionResidue"
+        )
+        tests.expectEqual(
+            try Data(contentsOf: unrelatedTemporary),
+            Data("unrelated temporary".utf8),
+            "test10_recoveryScan_preservesUnrelatedTemporaryFile"
+        )
+        tests.expectEqual(
+            try Data(contentsOf: unrelatedExchange),
+            Data("unrelated exchange".utf8),
+            "test10_recoveryScan_preservesUnrelatedExchangeRecord"
         )
     }
 }
@@ -5357,10 +5352,6 @@ private enum TickerTests {
             try test4B_AppExecutionAndPresentation(tests)
         }
         tests.run("round 4A backup authenticity") { try test4A_BackupAuthenticity(tests) }
-        tests.run("round 4A wrapper provenance") { try test4A_WrapperProvenance(tests) }
-        tests.run("round 4A identity storage migration") {
-            try test4A_IdentityStorageMigration(tests)
-        }
         tests.run("round 4A blocked-parent capture") { try test4A_BlockedParentCapture(tests) }
         tests.run("round 4A signal/reap stress") { try test4A_SignalReapingStress(tests) }
         tests.run("round 5 health precedence and manual isolation") {
@@ -5423,30 +5414,15 @@ private enum TickerTests {
         tests.run("round 7 manual crontab context") {
             try test7_ManualCrontabRunUsesDiscoveredContext(tests)
         }
-        tests.run("round 8 renamed wrapped-job recovery") {
-            try test8_RenamedWrappedJobRecovery(tests)
-        }
-        tests.run("round 8 moved wrapped-job recovery") {
-            try test8_MovedWrappedJobRecovery(tests)
-        }
-        tests.run("round 8 foreign wrapper rejection") {
-            try test8_ForeignWrapperStillRejected(tests)
-        }
-        tests.run("round 9 run liveness and native ordering") {
-            try test9_RunLivenessAndNativeOrdering(tests)
-        }
-        tests.run("round 9 persistent identity aliases") {
-            try test9_PersistentIdentityAliases(tests)
-        }
-        tests.run("round 9 copied wrapper runtime ownership") {
-            try test9_CopiedWrapperRuntimeOwnership(tests)
-        }
-        tests.run("round 9 metadata-only concurrent change") {
-            try test9_MetadataOnlyConcurrentChange(tests)
-        }
-        tests.run("round 9 interrupted exchange recovery") {
-            try test9_InterruptedExchangeRecovery(tests)
-        }
+        tests.run("round 9 run liveness and native ordering") { try test9_RunLivenessAndNativeOrdering(tests) }
+        tests.run("round 9 persistent identity aliases") { try test9_PersistentIdentityAliases(tests) }
+        tests.run("round 9 copied wrapper runtime ownership") { try test9_CopiedWrapperRuntimeOwnership(tests) }
+        tests.run("round 9 metadata-only concurrent change") { try test9_MetadataOnlyConcurrentChange(tests) }
+        tests.run("round 9 interrupted exchange recovery") { try test9_InterruptedExchangeRecovery(tests) }
+        tests.run("round 10 legacy wrapper removal") { try test10_LegacyWrapperRemoval(tests) }
+        tests.run("round 10 concurrent evidence migration") { try test10_ConcurrentEvidenceMigration(tests) }
+        tests.run("round 10 explicit singular identity reconciliation") { try test10_ExplicitSingularIdentityReconciliation(tests) }
+        tests.run("round 10 runtime ownership and diagnostics") { try test10_RuntimeOwnershipAndDiagnostics(tests) }
         tests.finish()
     }
 }

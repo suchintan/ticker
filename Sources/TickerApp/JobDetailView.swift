@@ -162,13 +162,6 @@ struct JobDetailView: View {
                         title: "Backup integrity check failed",
                         detail: "Ticker's backup does not match its authenticated metadata. Ticker will not rewrite or restore this plist."
                     )
-                case .wrappedBackupUnverified:
-                    DetailCallout(
-                        color: .orange,
-                        icon: "questionmark.diamond.fill",
-                        title: "Backup cannot be verified",
-                        detail: "Ticker's backup has no valid content digest. Explicit recovery is required before Ticker can modify this plist."
-                    )
                 case .ambiguousTickerInvocation:
                     DetailCallout(
                         color: .red,

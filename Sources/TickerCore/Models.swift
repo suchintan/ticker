@@ -57,6 +57,10 @@ public enum JobHealthPolicy {
         }
 
         if nativeOutcome == .failure, scheduledHistory.outcome == .success {
+            guard scheduledHistory.bootSessionID == RunExecutionEvidence.currentBootSessionID()
+            else {
+                return .failure
+            }
             guard scheduledHistory.nativeExitStatusAtStart == job.lastKnownExit?.raw else {
                 return .failure
             }

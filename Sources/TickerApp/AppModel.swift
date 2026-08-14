@@ -159,18 +159,6 @@ final class AppModel: ObservableObject {
 
             var refreshErrors = discovery.errors.map { $0.localizedDescription }
 
-            if discovery.errors.isEmpty {
-                do {
-                    _ = try self.store.migrateLegacyJobIDs(
-                        discoveredJobs: discovery.jobs,
-                        discoveryComplete: discovery.errors.isEmpty
-                    )
-                } catch {
-                    refreshErrors.append(
-                        "Could not migrate legacy job history: \(error.localizedDescription)"
-                    )
-                }
-            }
             var latestHealth: [String: Run]?
             var latestRecoveryStates: [String: JobRecoveryState] = [:]
             var latestRecoveryErrors: [String: String] = [:]
@@ -179,6 +167,13 @@ final class AppModel: ObservableObject {
                 latestHealth = try self.store.scheduledHealthRuns()
             } catch {
                 refreshErrors.append("Could not read job health: \(error.localizedDescription)")
+            }
+            do {
+                refreshErrors += try self.store.recorderDiagnostics().map {
+                    "Recorder diagnostic for \($0.claimedJobID): \($0.message)"
+                }
+            } catch {
+                refreshErrors.append("Could not read recorder diagnostics: \(error.localizedDescription)")
             }
 
             for job in discovery.jobs where job.source == .launchd && job.configPath != nil {
@@ -224,7 +219,7 @@ final class AppModel: ObservableObject {
     func isManaged(_ job: Job) -> Bool {
         switch recoveryStates[job.id] {
         case .wrappedConsistent, .identityChanged, .wrappedMissingBackup,
-             .wrappedBackupContentMismatch, .wrappedBackupUnverified:
+             .wrappedBackupContentMismatch:
             return true
         case .unwrapped, .wrappedForeignLabel, .ambiguousTickerInvocation, .staleManagedRow, .none:
             return false
@@ -248,7 +243,7 @@ final class AppModel: ObservableObject {
         }
         switch state {
         case .wrappedForeignLabel, .wrappedBackupContentMismatch,
-             .wrappedBackupUnverified, .ambiguousTickerInvocation:
+             .ambiguousTickerInvocation:
             return false
         case .unwrapped, .wrappedConsistent, .identityChanged,
              .wrappedMissingBackup, .staleManagedRow:
@@ -271,8 +266,6 @@ final class AppModel: ObservableObject {
             return "Repair history wrapper"
         case .wrappedBackupContentMismatch:
             return "Unsafe backup"
-        case .wrappedBackupUnverified:
-            return "Unverified backup"
         case .ambiguousTickerInvocation:
             return "Unverified ticker command"
         case .wrappedForeignLabel:
@@ -290,8 +283,8 @@ final class AppModel: ObservableObject {
             return "arrow.triangle.2.circlepath"
         case .wrappedMissingBackup:
             return "wrench.and.screwdriver"
-        case .wrappedBackupContentMismatch, .wrappedBackupUnverified,
-             .ambiguousTickerInvocation, .wrappedForeignLabel:
+        case .wrappedBackupContentMismatch, .ambiguousTickerInvocation,
+             .wrappedForeignLabel:
             return "exclamationmark.triangle"
         case .unwrapped, .staleManagedRow, .none:
             return "clock.arrow.2.circlepath"
@@ -421,8 +414,8 @@ final class AppModel: ObservableObject {
                     }
                     commands = try self.wrapper.wrap(job: job, tickerPath: tickerPath)
                     verb = recoveryState == .wrappedMissingBackup ? "Repaired" : "Wrapped"
-                case .wrappedBackupContentMismatch, .wrappedBackupUnverified,
-                     .ambiguousTickerInvocation, .wrappedForeignLabel:
+                case .wrappedBackupContentMismatch, .ambiguousTickerInvocation,
+                     .wrappedForeignLabel:
                     throw TickerAppError.unsafeWrapper
                 }
 
