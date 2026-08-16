@@ -180,6 +180,11 @@ class CutoverState:
 
 class CommandRunner:
     def run(self, executable: Path, arguments: Sequence[str]) -> CommandResult:
+        environment = os.environ.copy()
+        if executable == TICKER_EXECUTABLE:
+            # Administrative wrap and recovery operations must use the same
+            # canonical store as scheduled wrapper invocations.
+            environment.pop("TICKER_STORE_PATH", None)
         try:
             completed = subprocess.run(
                 [str(executable), *arguments],
@@ -188,6 +193,7 @@ class CommandRunner:
                 stderr=subprocess.PIPE,
                 text=True,
                 check=False,
+                env=environment,
             )
         except OSError as error:
             raise CutoverError(f"cannot execute {executable}: {error}") from error

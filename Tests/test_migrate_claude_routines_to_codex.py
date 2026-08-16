@@ -415,9 +415,15 @@ class CutoverFixture:
             testcase.assertFalse(os.path.lexists(routine.plist))
 
     def assert_codex_state(self, testcase: unittest.TestCase) -> None:
+        task_ids = {routine.task_id for routine in self.routines}
         testcase.assertEqual(set(self.selected_enabled().values()), {False})
         testcase.assertEqual(self.commands.loaded, {routine.label for routine in self.routines})
-        testcase.assertEqual(self.commands.wrapped, {routine.task_id for routine in self.routines})
+        testcase.assertEqual(self.commands.wrapped, task_ids)
+        testcase.assertEqual(self.commands.authenticated_backups, task_ids)
+        testcase.assertEqual(
+            {self.commands.doctor_state(routine) for routine in self.routines},
+            {"wrapped-consistent"},
+        )
         testcase.assertEqual(self.marker.read_bytes(), cutover.MARKER_PAYLOAD)
         testcase.assertFalse(self.commands.claude_running)
         for routine in self.routines:
@@ -705,6 +711,27 @@ class StaticContractTests(unittest.TestCase):
     def test_source_and_installed_runner_copies_are_identical(self) -> None:
         self.assertEqual(RUNNER.read_bytes(), INSTALLED_RUNNER.read_bytes())
 
+    def test_ticker_commands_cannot_inherit_store_redirection(self) -> None:
+        redirected = "/tmp/ticker-migration-foreign-store.db"
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.dict(
+            cutover.os.environ,
+            {"TICKER_STORE_PATH": redirected, "TICKER_MIGRATION_SENTINEL": "preserved"},
+            clear=False,
+        ), mock.patch.object(cutover.subprocess, "run", return_value=completed) as run:
+            ticker_result = cutover.CommandRunner().run(
+                cutover.TICKER_EXECUTABLE,
+                ["doctor"],
+            )
+            cutover.CommandRunner().run(cutover.CODEX_EXECUTABLE, ["--version"])
+
+        self.assertEqual(ticker_result.status, 0)
+        ticker_environment = run.call_args_list[0].kwargs["env"]
+        codex_environment = run.call_args_list[1].kwargs["env"]
+        self.assertNotIn("TICKER_STORE_PATH", ticker_environment)
+        self.assertEqual(ticker_environment["TICKER_MIGRATION_SENTINEL"], "preserved")
+        self.assertEqual(codex_environment["TICKER_STORE_PATH"], redirected)
+
     def test_obsolete_integrity_closure_structures_are_absent(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         for obsolete in (
@@ -846,6 +873,7 @@ class TransactionTests(unittest.TestCase):
     def test_success_marker_is_published_only_after_all_six_verify(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with CutoverFixture(Path(directory)) as fixture:
+                fixture.commands.claude_running = False
                 publications: list[tuple[set[str], set[str]]] = []
                 real_atomic_write = cutover.atomic_write
 
@@ -861,6 +889,7 @@ class TransactionTests(unittest.TestCase):
                 labels = {routine.label for routine in fixture.routines}
                 task_ids = {routine.task_id for routine in fixture.routines}
                 self.assertTrue(state.committed)
+                fixture.assert_codex_state(self)
                 self.assertEqual(publications, [(labels, task_ids)])
                 self.assertEqual(fixture.marker.read_bytes(), cutover.MARKER_PAYLOAD)
                 self.assertEqual(set(fixture.selected_enabled().values()), {False})
