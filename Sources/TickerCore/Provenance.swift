@@ -3,6 +3,9 @@ import Foundation
 
 public enum JobProvenance: Hashable {
     case yours
+    /// Ticker's own login item. Shown honestly, but Ticker never raises an
+    /// alert about itself: if Ticker is not running there is nobody to alert.
+    case ticker
     case app(String)
     case packageManager(String)
     case system
@@ -12,6 +15,8 @@ public enum JobProvenance: Hashable {
         switch self {
         case .yours:
             return "yours"
+        case .ticker:
+            return "ticker"
         case .app:
             return "app"
         case .packageManager:
@@ -29,6 +34,8 @@ public enum JobProvenance: Hashable {
             return "Yours"
         case .app(let name):
             return name
+        case .ticker:
+            return "Ticker"
         case .packageManager(let name):
             return name
         case .system:
@@ -46,7 +53,7 @@ public enum JobProvenance: Hashable {
         switch self {
         case .yours, .unknown:
             return true
-        case .app, .packageManager, .system:
+        case .ticker, .app, .packageManager, .system:
             return false
         }
     }
@@ -70,6 +77,8 @@ extension JobProvenance: Codable {
             self = .yours
         case "app":
             self = .app(try container.decode(String.self, forKey: .name))
+        case "ticker":
+            self = .ticker
         case "packageManager":
             self = .packageManager(try container.decode(String.self, forKey: .name))
         case "system":
@@ -93,7 +102,7 @@ extension JobProvenance: Codable {
             try container.encode(name, forKey: .name)
         case .unknown(let reason):
             try container.encode(reason, forKey: .reason)
-        case .yours, .system:
+        case .yours, .ticker, .system:
             break
         }
     }
@@ -329,6 +338,9 @@ internal final class JobProvenanceClassifier {
         "microsoft": "Microsoft",
     ]
 
+    private static let tickerLoginLabel = "com.suchintan.ticker.login"
+    private static let installedTickerExecutable = "/Applications/Ticker.app/Contents/MacOS/Ticker"
+
     // macOS can redact Authority while still returning the signature's TeamIdentifier.
     // These cryptographically bound team IDs preserve the validated authority display
     // names instead of falling through to a path guess or Unknown.
@@ -368,15 +380,39 @@ internal final class JobProvenanceClassifier {
         self.signatureRunner = signatureRunner
     }
 
+    /// True only for Ticker's exact parsed launchd identity. The effective
+    /// executable is the literal `Program`, or `ProgramArguments[0]` only when
+    /// `Program` is absent. It is intentionally separate from the logical
+    /// command because a Ticker wrapper can be unwrapped for display.
+    internal func isTickerItself(
+        launchdLabel: String?,
+        effectiveExecutable: String?
+    ) -> Bool {
+        launchdLabel == Self.tickerLoginLabel
+            && effectiveExecutable == Self.installedTickerExecutable
+    }
+
     internal func classify(
         source: JobSource,
         command: [String],
         configPath: String?,
         workingDirectory: String? = nil,
-        environment: [String: String] = [:]
+        environment: [String: String] = [:],
+        launchdLabel: String? = nil,
+        effectiveExecutable: String? = nil
     ) -> JobClassification {
         guard source == .launchd else {
             return JobClassification(provenance: .yours, attention: nil)
+        }
+
+        // Ticker's own login item. Recognised before any vendor rule so it is
+        // never filed as third-party software just because it lives in
+        // /Applications, and so it can never alert about itself.
+        if isTickerItself(
+            launchdLabel: launchdLabel,
+            effectiveExecutable: effectiveExecutable
+        ) {
+            return JobClassification(provenance: .ticker, attention: nil)
         }
 
         let program = command.first ?? ""

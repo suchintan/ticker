@@ -89,17 +89,133 @@ enum JobDisplayName {
     }
 }
 
+struct JobRunHistoryCell: Identifiable {
+    let id: Int64
+    let outcome: Outcome
+    let symbolName: String
+    let statusText: String
+    let accessibilityLabel: String
+}
+
+struct JobRunSelection: Equatable {
+    let jobID: String
+    let runID: Int64
+}
+
+struct JobRunNavigationState: Equatable {
+    private(set) var selectedJobID: String?
+    private(set) var selectedRunIDs: [String: Int64] = [:]
+
+    mutating func selectJob(_ jobID: String) {
+        selectedJobID = jobID
+        selectedRunIDs[jobID] = nil
+    }
+
+    mutating func selectRun(_ selection: JobRunSelection) {
+        selectedJobID = selection.jobID
+        selectedRunIDs[selection.jobID] = selection.runID
+    }
+
+    mutating func showJobDetails(for jobID: String) {
+        selectedRunIDs[jobID] = nil
+    }
+
+    mutating func returnToList() {
+        selectedJobID = nil
+    }
+
+    mutating func reconcileJobs(_ availableJobIDs: [String]) {
+        guard let selectedJobID else {
+            return
+        }
+        if !availableJobIDs.contains(selectedJobID) {
+            self.selectedJobID = nil
+        }
+    }
+
+    mutating func reconcileRuns(for jobID: String, with runs: [Run]) {
+        guard let selectedRunID = selectedRunIDs[jobID] else {
+            return
+        }
+        if runs.contains(where: { $0.id == selectedRunID }) {
+            return
+        }
+        selectedRunIDs[jobID] = runs.first?.id
+    }
+
+    func selectedRunID(for jobID: String) -> Int64? {
+        selectedRunIDs[jobID]
+    }
+
+    func selectedRun(for jobID: String, in runs: [Run]) -> Run? {
+        guard let selectedRunID = selectedRunID(for: jobID) else {
+            return nil
+        }
+        return runs.first { $0.id == selectedRunID }
+    }
+}
+
+enum JobRunHistoryPresentation {
+    static let maximumVisibleRuns = 5
+
+    static func cells(
+        from runs: [Run],
+        limit: Int = maximumVisibleRuns
+    ) -> [JobRunHistoryCell] {
+        guard limit > 0 else {
+            return []
+        }
+        let recentRuns = runs.prefix(limit)
+        let count = recentRuns.count
+        return recentRuns.reversed().enumerated().map { index, run in
+            let presentation = outcomePresentation(for: run.outcome)
+            let exitText = run.exitCode.map { ", exit code \($0)" } ?? ""
+            return JobRunHistoryCell(
+                id: run.id,
+                outcome: run.outcome,
+                symbolName: presentation.symbolName,
+                statusText: presentation.statusText,
+                accessibilityLabel:
+                    "Recent run \(index + 1) of \(count): \(presentation.statusText)\(exitText)"
+            )
+        }
+    }
+
+    static func selection(
+        jobID: String,
+        cell: JobRunHistoryCell
+    ) -> JobRunSelection {
+        JobRunSelection(jobID: jobID, runID: cell.id)
+    }
+
+    private static func outcomePresentation(
+        for outcome: Outcome
+    ) -> (symbolName: String, statusText: String) {
+        switch outcome {
+        case .success:
+            return ("checkmark.circle.fill", "Succeeded")
+        case .failure:
+            return ("xmark.square.fill", "Failed")
+        case .running:
+            return ("clock.fill", "Running")
+        case .unknown:
+            return ("questionmark.diamond.fill", "Unknown result")
+        }
+    }
+}
+
 struct JobListView: View {
     @ObservedObject var model: AppModel
-    @State private var selectedJobID: String?
+    @State private var navigationState = JobRunNavigationState()
     @State private var searchText = ""
     @AppStorage("ticker.otherJobsExpanded") private var otherJobsExpanded = false
+    @AppStorage("ticker.tickerJobsExpanded") private var tickerJobsExpanded = true
     @AppStorage("ticker.appsExpanded") private var appsExpanded = true
     @AppStorage("ticker.packageManagersExpanded") private var packageManagersExpanded = true
     @AppStorage("ticker.systemJobsExpanded") private var systemJobsExpanded = true
 
     private var selectedJob: Job? {
-        guard let selectedJobID else {
+        guard let selectedJobID = navigationState.selectedJobID else {
             return nil
         }
         return matchingJobs.first { $0.id == selectedJobID }
@@ -149,6 +265,10 @@ struct JobListView: View {
         })
     }
 
+    private var tickerJobs: [Job] {
+        sorted(otherJobs.filter { $0.provenance == .ticker })
+    }
+
     private var packageManagerJobs: [Job] {
         sorted(otherJobs.filter {
             if case .packageManager = $0.provenance { return true }
@@ -165,30 +285,41 @@ struct JobListView: View {
     }
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-                .navigationSplitViewColumnWidth(min: 280, ideal: 300, max: 310)
-        } detail: {
+        Group {
             if let job = selectedJob {
-                JobDetailView(model: model, job: job)
-                    .id(job.id)
+                JobDetailView(
+                    model: model,
+                    job: job,
+                    onBack: { navigationState.returnToList() },
+                    selectedRunID: runSelectionBinding(for: job.id)
+                )
+                .id(job.id)
             } else {
-                EmptyJobDetailView()
+                sidebar
             }
         }
-        .frame(width: 820, height: 600)
+        .frame(width: 298, height: 529)
         .onReceive(model.$jobs) { jobs in
-            reconcileSelection(in: visibleJobs(in: jobs))
+            navigationState.reconcileJobs(
+                visibleJobs(in: jobs).map(\.id)
+            )
+        }
+        .onReceive(model.$runsByJob) { updatedRunsByJob in
+            guard let jobID = navigationState.selectedJobID,
+                  let updatedRuns = updatedRunsByJob[jobID] else {
+                return
+            }
+            navigationState.reconcileRuns(for: jobID, with: updatedRuns)
         }
         .onChange(of: searchText) { _ in
-            reconcileSelection(in: matchingJobs)
+            navigationState.reconcileJobs(matchingJobs.map(\.id))
         }
     }
 
     private var sidebar: some View {
         VStack(spacing: 0) {
             sidebarHeader
-            List(selection: $selectedJobID) {
+            List(selection: jobSelectionBinding) {
                 if model.jobs.isEmpty {
                     emptyState
                 } else {
@@ -222,6 +353,7 @@ struct JobListView: View {
             }
             .listStyle(.sidebar)
             .searchable(text: $searchText, prompt: "Search jobs")
+            .environment(\.defaultMinListRowHeight, 32)
         }
     }
 
@@ -247,6 +379,8 @@ struct JobListView: View {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
                 Divider()
+                LoginItemMenuSection()
+                Divider()
                 Button("Quit Ticker") {
                     NSApplication.shared.terminate(nil)
                 }
@@ -256,12 +390,25 @@ struct JobListView: View {
             .menuStyle(.borderlessButton)
             .help("Ticker menu")
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
     }
 
     @ViewBuilder
     private var provenanceSubgroups: some View {
+        if !tickerJobs.isEmpty {
+            DisclosureGroup(
+                isExpanded: subgroupExpansion(
+                    $tickerJobsExpanded,
+                    hasMatches: !tickerJobs.isEmpty
+                )
+            ) {
+                jobRows(tickerJobs)
+            } label: {
+                subgroupHeader("Ticker", count: tickerJobs.count)
+            }
+        }
+
         if !appJobs.isEmpty {
             DisclosureGroup(isExpanded: subgroupExpansion($appsExpanded, hasMatches: !appJobs.isEmpty)) {
                 ForEach(appOwnerNames, id: \.self) { owner in
@@ -297,7 +444,6 @@ struct JobListView: View {
                 subgroupHeader("System", count: systemJobs.count)
             }
         }
-
     }
 
     private func jobRows(_ jobs: [Job]) -> some View {
@@ -307,8 +453,18 @@ struct JobListView: View {
                 displayName: JobDisplayName.disambiguated(for: job, among: jobs),
                 outcome: model.outcome(for: job),
                 skipStorm: model.skipStorm(for: job),
-                wrapperNeedsAttention: model.wrapperNeedsAttention(job)
+                wrapperNeedsAttention: model.wrapperNeedsAttention(job),
+                historyLoadState: model.historyLoadState(for: job),
+                runs: model.runsByJob[job.id] ?? [],
+                onOpenDetails: { navigationState.selectJob(job.id) },
+                onReloadHistory: { model.loadRuns(for: job) },
+                onSelectRun: selectRun
             )
+            .onAppear {
+                if model.historyLoadState(for: job) == .idle {
+                    model.loadRuns(for: job)
+                }
+            }
             .tag(job.id)
         }
     }
@@ -452,14 +608,33 @@ struct JobListView: View {
         return jobs.filter(matchesSearch)
     }
 
-    private func reconcileSelection(in visibleJobs: [Job]) {
-        if let selectedJobID,
-           visibleJobs.contains(where: { $0.id == selectedJobID }) {
-            return
-        }
-        selectedJobID = visibleJobs.first(where: { $0.provenance.isYours })?.id
-            ?? visibleJobs.first(where: { !$0.provenance.isConfirmedThirdParty })?.id
-            ?? visibleJobs.first?.id
+
+    private func selectRun(_ selection: JobRunSelection) {
+        navigationState.selectRun(selection)
+    }
+
+    private var jobSelectionBinding: Binding<String?> {
+        Binding(
+            get: { navigationState.selectedJobID },
+            set: { jobID in
+                if let jobID {
+                    navigationState.selectJob(jobID)
+                }
+            }
+        )
+    }
+
+    private func runSelectionBinding(for jobID: String) -> Binding<Int64?> {
+        Binding(
+            get: { navigationState.selectedRunID(for: jobID) },
+            set: { runID in
+                if let runID {
+                    navigationState.selectRun(JobRunSelection(jobID: jobID, runID: runID))
+                } else {
+                    navigationState.showJobDetails(for: jobID)
+                }
+            }
+        )
     }
 
     private func rank(_ job: Job) -> Int {
@@ -480,20 +655,28 @@ private struct JobRow: View {
     let outcome: Outcome
     let skipStorm: SkipStormSummary?
     let wrapperNeedsAttention: Bool
+    let historyLoadState: JobHistoryLoadState
+    let runs: [Run]
+    let onOpenDetails: () -> Void
+    let onReloadHistory: () -> Void
+    let onSelectRun: (JobRunSelection) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .center, spacing: 5) {
                 Text(displayName)
                     .font(.body)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Spacer(minLength: 6)
+                Spacer(minLength: 4)
                 status
+                    .fixedSize(horizontal: true, vertical: true)
+                rowMenu
             }
             HStack(spacing: 4) {
                 Text(job.schedule.humanDescription)
                     .lineLimit(1)
+                    .layoutPriority(1)
                 if let nextFire = JobNextFirePresentation.relativeText(
                     for: job.schedule,
                     nextFire: job.nextFireAt
@@ -501,19 +684,46 @@ private struct JobRow: View {
                     Text("· next \(nextFire)")
                         .lineLimit(1)
                 }
-                Spacer(minLength: 6)
+                Spacer(minLength: 3)
                 if let evidenceText {
                     Text(evidenceText)
                         .lineLimit(1)
                 }
+                RecentRunHistoryView(
+                    jobID: job.id,
+                    loadState: historyLoadState,
+                    cells: JobRunHistoryPresentation.cells(from: runs),
+                    onSelect: onSelectRun
+                )
             }
             .font(.caption)
             .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 7)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
         .contentShape(Rectangle())
         .help(job.label)
+    }
+
+    private var rowMenu: some View {
+        Menu {
+            Button(action: onOpenDetails) {
+                Label("Open Details", systemImage: "sidebar.right")
+            }
+            Button(action: onReloadHistory) {
+                Label("Reload Run History", systemImage: "arrow.clockwise")
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .frame(width: 12, height: 12)
+                .frame(width: 28, height: 24)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 28, height: 24, alignment: .center)
+        .fixedSize()
+        .help("Actions for \(displayName)")
+        .accessibilityLabel("Actions for \(displayName)")
     }
 
     @ViewBuilder
@@ -531,11 +741,19 @@ private struct JobRow: View {
         } else if let skew = job.skew, skew > 3_600 {
             AttentionBadge(title: "Late", icon: "clock.badge.exclamationmark", color: .orange)
         } else if skipStorm != nil {
-            AttentionBadge(title: "Skip storm", icon: "exclamationmark.arrow.triangle.2.circlepath", color: .orange)
+            AttentionBadge(
+                title: "Skip storm",
+                icon: "exclamationmark.arrow.triangle.2.circlepath",
+                color: .orange
+            )
         } else if job.runtimeStatusAttribution == .ambiguous {
             AttentionBadge(title: "Ambiguous", icon: "questionmark.diamond.fill", color: .orange)
         } else if wrapperNeedsAttention {
-            AttentionBadge(title: "Wrapper damaged", icon: "wrench.and.screwdriver.fill", color: .orange)
+            AttentionBadge(
+                title: "Wrapper damaged",
+                icon: "wrench.and.screwdriver.fill",
+                color: .orange
+            )
         } else if !job.enabled {
             Label("Disabled", systemImage: "pause.circle")
                 .font(.caption)
@@ -568,6 +786,87 @@ private struct JobRow: View {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
         return "\(prefix) \(formatter.localizedString(for: observedAt, relativeTo: Date()))"
+    }
+}
+
+private struct RecentRunHistoryView: View {
+    let jobID: String
+    let loadState: JobHistoryLoadState
+    let cells: [JobRunHistoryCell]
+    let onSelect: (JobRunSelection) -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            content
+        }
+        .fixedSize()
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Recent run history")
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch loadState {
+        case .idle:
+            Image(systemName: "clock")
+                .frame(width: 20, height: 20)
+                .accessibilityLabel("Run history not loaded")
+                .help("Run history not loaded")
+        case .loading:
+            ProgressView()
+                .controlSize(.mini)
+                .frame(width: 20, height: 20)
+                .accessibilityLabel("Loading run history")
+                .help("Loading run history")
+        case .failed(let message):
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .frame(width: 20, height: 20)
+                .accessibilityLabel("Run history failed to load: \(message)")
+                .help("Run history failed to load: \(message)")
+        case .loaded:
+            if cells.isEmpty {
+                Image(systemName: "minus")
+                    .frame(width: 20, height: 20)
+                    .accessibilityLabel("No recent runs")
+                    .help("No recent runs")
+            } else {
+                ForEach(cells) { cell in
+                    Button {
+                        onSelect(
+                            JobRunHistoryPresentation.selection(
+                                jobID: jobID,
+                                cell: cell
+                            )
+                        )
+                    } label: {
+                        Image(systemName: cell.symbolName)
+                            .font(.system(size: 9, weight: .bold))
+                            .symbolRenderingMode(.monochrome)
+                            .frame(width: 12, height: 12)
+                            .frame(width: 20, height: 20)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(color(for: cell.outcome))
+                    .help(cell.accessibilityLabel)
+                    .accessibilityLabel(cell.accessibilityLabel)
+                }
+            }
+        }
+    }
+
+    private func color(for outcome: Outcome) -> Color {
+        switch outcome {
+        case .success:
+            return .green
+        case .failure:
+            return .red
+        case .running:
+            return .blue
+        case .unknown:
+            return .secondary
+        }
     }
 }
 
@@ -642,5 +941,57 @@ private struct EmptyJobDetailView: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// "Open at Login" control. Reads live system state every time the menu opens so
+/// the checkmark can never disagree with reality, and reports the real reason
+/// when enabling fails — a silent failure here would leave the owner believing
+/// monitoring starts at login when it does not.
+struct LoginItemMenuSection: View {
+    private let controller = LoginItemController()
+    @State private var state: LoginItemState = .disabled
+
+    var body: some View {
+        Group {
+            Button {
+                state = state.isOn ? controller.disable() : controller.enable()
+            } label: {
+                Label(
+                    "Open at Login",
+                    systemImage: state.isOn ? "checkmark.circle.fill" : "circle"
+                )
+            }
+            .disabled(isBlocked)
+
+            if let note = explanation {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .onAppear { state = controller.installationProblem() ?? controller.state() }
+    }
+
+    private var isBlocked: Bool {
+        if case .notInstalled = state { return true }
+        return false
+    }
+
+    private var explanation: String? {
+        switch state {
+        case .enabled(let mechanism) where mechanism == .launchAgent:
+            return "Enabled via a LaunchAgent."
+        case .enabled:
+            return nil
+        case .disabled:
+            return nil
+        case .requiresApproval:
+            return "Approve Ticker in System Settings › General › Login Items."
+        case .notInstalled(_, let expected):
+            return "Run the copy in \(expected) to enable this."
+        case .failed(let reason):
+            return "Could not change this: \(reason)"
+        }
     }
 }

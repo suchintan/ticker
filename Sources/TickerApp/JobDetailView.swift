@@ -32,8 +32,9 @@ struct JobRunNowPresentation: Equatable {
 struct JobDetailView: View {
     @ObservedObject var model: AppModel
     let job: Job
+    let onBack: () -> Void
 
-    @State private var selectedRunID: Int64?
+    @Binding var selectedRunID: Int64?
     @State private var showManualRunWhy = false
     @State private var showRewriteConfirmation = false
 
@@ -53,34 +54,20 @@ struct JobDetailView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                header
-                healthSummary
-                actionableAlerts
-                primaryActions
-
-                if let message = model.actionMessages[job.id] {
-                    ActionMessageView(message: message)
-                }
-
-                history
-                output
-                configuration
-                advanced
+        VStack(spacing: 0) {
+            navigationHeader
+            Divider()
+            if let run = selectedRun {
+                selectedRunInspector(run)
+            } else {
+                jobOverview
             }
-            .padding(20)
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
-            model.loadRuns(for: job)
-        }
-        .onReceive(model.$runsByJob) { _ in
-            if let selectedRunID,
-               runs.contains(where: { $0.id == selectedRunID }) {
-                return
+            if model.historyLoadState(for: job) == .idle {
+                model.loadRuns(for: job)
             }
-            selectedRunID = runs.first?.id
         }
         .sheet(isPresented: $showRewriteConfirmation) {
             RewriteConfirmationSheet(
@@ -95,6 +82,85 @@ struct JobDetailView: View {
                 cancel: { showRewriteConfirmation = false }
             )
         }
+    }
+
+    private var navigationHeader: some View {
+        HStack(spacing: 8) {
+            Button(action: onBack) {
+                Label("Back", systemImage: "chevron.left")
+                    .frame(minHeight: 24)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Back to jobs")
+            .accessibilityLabel("Back to jobs")
+            Spacer(minLength: 4)
+            Text(displayName)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if selectedRun != nil {
+                Button {
+                    selectedRunID = nil
+                } label: {
+                    Image(systemName: "info.circle")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Show job details")
+                .accessibilityLabel("Show job details")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+    }
+
+    private var jobOverview: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                header
+                healthSummary
+                actionableAlerts
+                primaryActions
+
+                if let message = model.actionMessages[job.id] {
+                    ActionMessageView(message: message)
+                }
+
+                history
+                configuration
+                advanced
+            }
+            .padding(12)
+        }
+    }
+
+    private func selectedRunInspector(_ run: Run) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("Run inspector")
+                    .font(.headline)
+                Spacer()
+                Text(Self.dateTime(run.startedAt))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.trailing)
+            }
+
+            HStack(spacing: 10) {
+                RunOutcomeView(outcome: run.outcome)
+                Text("Exit code: \(run.exitCode.map(String.init) ?? "—")")
+                Text("Duration: \(Self.durationText(run))")
+            }
+            .font(.caption)
+            .accessibilityElement(children: .combine)
+
+            OutputSection(title: "stdout", text: run.stdoutTail)
+            OutputSection(title: "stderr", text: run.stderrTail)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var header: some View {
@@ -354,33 +420,83 @@ struct JobDetailView: View {
                     model.loadRuns(for: job)
                 } label: {
                     Image(systemName: "arrow.clockwise")
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
                 .help("Reload run history")
+                .accessibilityLabel("Reload run history")
             }
 
-            if runs.isEmpty {
-                historyEmptyState
-            } else {
-                Table(runs, selection: $selectedRunID) {
-                    TableColumn("Started") { run in
-                        Text(Self.dateTime(run.startedAt))
+            switch model.historyLoadState(for: job) {
+            case .idle:
+                Label("Run history has not loaded", systemImage: "clock")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Run history has not loaded")
+            case .loading:
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading run history…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+            case .failed(let message):
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Could not load run history", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.orange)
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Try Again") {
+                        model.loadRuns(for: job)
                     }
-                    TableColumn("Result") { run in
-                        RunOutcomeView(outcome: run.outcome)
-                    }
-                    TableColumn("Trigger") { run in
-                        Text(run.trigger == .manual ? "Manual" : "Scheduled")
-                    }
-                    TableColumn("Duration") { run in
-                        Text(Self.durationText(run))
-                    }
-                    TableColumn("Exit") { run in
-                        Text(run.exitCode.map(String.init) ?? "—")
-                            .monospaced()
+                    .controlSize(.small)
+                }
+                .accessibilityElement(children: .contain)
+            case .loaded:
+                if runs.isEmpty {
+                    historyEmptyState
+                } else {
+                    VStack(spacing: 2) {
+                        ForEach(runs) { run in
+                            Button {
+                                selectedRunID = run.id
+                            } label: {
+                                HStack(spacing: 7) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(Self.dateTime(run.startedAt))
+                                            .lineLimit(1)
+                                        Text(run.trigger == .manual ? "Manual" : "Scheduled")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer(minLength: 2)
+                                    RunOutcomeView(outcome: run.outcome)
+                                    VStack(alignment: .trailing, spacing: 2) {
+                                        Text(Self.durationText(run))
+                                        Text("Exit \(run.exitCode.map(String.init) ?? "—")")
+                                            .monospaced()
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                .font(.caption)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 5)
+                                .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help("Inspect run from \(Self.dateTime(run.startedAt))")
+                            .accessibilityLabel(
+                                "Inspect \(run.outcome.rawValue) run from \(Self.dateTime(run.startedAt))"
+                            )
+                        }
                     }
                 }
-                .frame(height: 200)
             }
         }
     }
@@ -405,29 +521,6 @@ struct JobDetailView: View {
         .padding(.vertical, 10)
     }
 
-    @ViewBuilder
-    private var output: some View {
-        if let run = selectedRun {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Selected run output")
-                    .font(.headline)
-                ScrollView([.horizontal, .vertical]) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        OutputSection(title: "stdout", text: run.stdoutTail)
-                        OutputSection(title: "stderr", text: run.stderrTail)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(10)
-                }
-                .frame(minHeight: 120, maxHeight: 220)
-                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-                )
-            }
-        }
-    }
 
     private var configuration: some View {
         DisclosureGroup("Configuration") {
@@ -747,11 +840,25 @@ private struct OutputSection: View {
             Text(title)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-            Text(displayText)
-                .font(.caption)
-                .monospaced()
-                .textSelection(.enabled)
+            ScrollView([.horizontal, .vertical]) {
+                Text(displayText)
+                    .font(.caption)
+                    .monospaced()
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(7)
+            }
+            .frame(minHeight: 86, maxHeight: 128)
+            .background(
+                Color(nsColor: .textBackgroundColor),
+                in: RoundedRectangle(cornerRadius: 5)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+            )
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var displayText: String {

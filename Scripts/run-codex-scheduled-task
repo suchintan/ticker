@@ -1,0 +1,142 @@
+#!/bin/bash
+set -eu
+
+APPROVED_WORKING_DIRECTORY=/Users/suchintan/Development/Skyvern-cloud
+CODEX=/Users/suchintan/.nvm/versions/node/v24.9.0/bin/codex
+DATE=/bin/date
+ENV_LOADER=/Users/suchintan/Development/Skyvern-cloud/dev_scripts/skills/api/load-env.sh
+CONTROLLED_PATH=/Users/suchintan/.nvm/versions/node/v24.9.0/bin:/Users/suchintan/.superset/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/suchintan/.local/bin
+
+select_task() {
+  case "$1" in
+    daily-summary)
+      PROMPT='Use $daily-summary at /Users/suchintan/.codex/skills/daily-summary with no arguments. Execute the canonical workflow once.'
+      SCHEDULED_SKILL_ROOT='/Users/suchintan/.codex/skills/daily-summary'
+      SCHEDULED_SKILL_LINK='/Users/suchintan/.codex/skills/daily-summary/SKILL.md'
+      ;;
+    daily-vitals-morning)
+      PROMPT='Use $vitals-run-all at /Users/suchintan/.codex/skills/vitals-run-all with the exact argument morning. Execute the canonical workflow once.'
+      SCHEDULED_SKILL_ROOT='/Users/suchintan/.codex/skills/vitals-run-all'
+      SCHEDULED_SKILL_LINK='/Users/suchintan/.codex/skills/vitals-run-all/SKILL.md'
+      ;;
+    linkedin-post-ideas)
+      PROMPT='Use $linkedin-post-ideas at /Users/suchintan/.codex/skills/linkedin-post-ideas with the exact integer argument 10 and exact run_context=scheduled-primary. Execute the canonical workflow once.'
+      SCHEDULED_SKILL_ROOT='/Users/suchintan/.codex/skills/linkedin-post-ideas'
+      SCHEDULED_SKILL_LINK='/Users/suchintan/.codex/skills/linkedin-post-ideas/SKILL.md'
+      ;;
+    linkedin-post-ideas-sweeper)
+      PROMPT='Use $linkedin-post-ideas at /Users/suchintan/.codex/skills/linkedin-post-ideas with the exact integer argument 10 and exact run_context=scheduled-sweeper. Execute the canonical workflow once.'
+      SCHEDULED_SKILL_ROOT='/Users/suchintan/.codex/skills/linkedin-post-ideas'
+      SCHEDULED_SKILL_LINK='/Users/suchintan/.codex/skills/linkedin-post-ideas/SKILL.md'
+      ;;
+    overdue-customer-issues-slack)
+      PROMPT='Use $overdue-customer-issues-slack at /Users/suchintan/Development/Skyvern-cloud/.agents/skills/overdue-customer-issues-slack with no arguments. Execute the canonical workflow once.'
+      SCHEDULED_SKILL_ROOT='/Users/suchintan/Development/Skyvern-cloud/.agents/skills/overdue-customer-issues-slack'
+      SCHEDULED_SKILL_LINK='/Users/suchintan/Development/Skyvern-cloud/.agents/skills/overdue-customer-issues-slack/SKILL.md'
+      ;;
+    team-progress-digest)
+      PROMPT='Use $team-progress-digest at /Users/suchintan/.codex/skills/team-progress-digest with no arguments. Execute the canonical workflow once.'
+      SCHEDULED_SKILL_ROOT='/Users/suchintan/.codex/skills/team-progress-digest'
+      SCHEDULED_SKILL_LINK='/Users/suchintan/.codex/skills/team-progress-digest/SKILL.md'
+      ;;
+    *)
+      echo "unknown scheduled task id: $1" >&2
+      exit 64
+      ;;
+  esac
+}
+
+if [ "$#" -ne 2 ]; then
+  echo "usage: run-codex-scheduled-task TASK_ID WORKING_DIRECTORY" >&2
+  exit 64
+fi
+
+TASK_ID=$1
+WORKING_DIRECTORY=$2
+if [ "$WORKING_DIRECTORY" != "$APPROVED_WORKING_DIRECTORY" ]; then
+  echo "working directory is not the approved repository: $WORKING_DIRECTORY" >&2
+  exit 72
+fi
+if [ ! -d "$WORKING_DIRECTORY" ] || [ ! -r "$WORKING_DIRECTORY" ] || [ ! -x "$WORKING_DIRECTORY" ]; then
+  echo "approved working directory is not readable and searchable: $WORKING_DIRECTORY" >&2
+  exit 72
+fi
+select_task "$TASK_ID"
+
+CAPTURED_RUN_DATE_ET="$(TZ=America/New_York "$DATE" '+%Y-%m-%d')" || exit 70
+case "$CAPTURED_RUN_DATE_ET" in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+  *)
+    echo "cannot capture the scheduled America/New_York run date" >&2
+    exit 70
+    ;;
+esac
+readonly CAPTURED_RUN_DATE_ET
+
+if [ ! -f "$ENV_LOADER" ] || [ ! -r "$ENV_LOADER" ]; then
+  echo "repository environment loader is not a readable regular file: $ENV_LOADER" >&2
+  exit 78
+fi
+if [ ! -f "$CODEX" ] || [ ! -r "$CODEX" ] || [ ! -x "$CODEX" ]; then
+  echo "Codex is not a readable executable: $CODEX" >&2
+  exit 69
+fi
+
+HOME=/Users/suchintan
+PATH=$CONTROLLED_PATH
+TZ=America/New_York
+export HOME PATH TZ
+cd "$WORKING_DIRECTORY" || exit 72
+set +x
+if . "$ENV_LOADER"; then
+  loader_status=0
+else
+  loader_status=$?
+fi
+if [ "$loader_status" -ne 0 ]; then
+  echo "repository environment load failed" >&2
+  exit 78
+fi
+
+# The positional arguments and trusted literals win over repo values.
+TASK_ID=$1
+WORKING_DIRECTORY=$2
+APPROVED_WORKING_DIRECTORY=/Users/suchintan/Development/Skyvern-cloud
+CODEX=/Users/suchintan/.nvm/versions/node/v24.9.0/bin/codex
+ENV_LOADER=/Users/suchintan/Development/Skyvern-cloud/dev_scripts/skills/api/load-env.sh
+CONTROLLED_PATH=/Users/suchintan/.nvm/versions/node/v24.9.0/bin:/Users/suchintan/.superset/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/suchintan/.local/bin
+HOME=/Users/suchintan
+TZ=America/New_York
+PATH=$CONTROLLED_PATH
+export HOME PATH TZ
+
+if [ "$WORKING_DIRECTORY" != "$APPROVED_WORKING_DIRECTORY" ]; then
+  echo "working directory is not the approved repository: $WORKING_DIRECTORY" >&2
+  exit 72
+fi
+if [ ! -d "$WORKING_DIRECTORY" ] || [ ! -r "$WORKING_DIRECTORY" ] || [ ! -x "$WORKING_DIRECTORY" ]; then
+  echo "approved working directory is not readable and searchable: $WORKING_DIRECTORY" >&2
+  exit 72
+fi
+if [ ! -f "$CODEX" ] || [ ! -r "$CODEX" ] || [ ! -x "$CODEX" ]; then
+  echo "Codex is not a readable executable: $CODEX" >&2
+  exit 69
+fi
+cd "$WORKING_DIRECTORY" || exit 72
+select_task "$TASK_ID"
+
+SCHEDULED_RUN_DATE_ET=$CAPTURED_RUN_DATE_ET
+SCHEDULED_AGENT_ENGINE=codex
+export SCHEDULED_RUN_DATE_ET SCHEDULED_AGENT_ENGINE
+export SCHEDULED_SKILL_ROOT SCHEDULED_SKILL_LINK
+export HOME PATH TZ
+
+if [ ! -f "$SCHEDULED_SKILL_LINK" ] || [ ! -r "$SCHEDULED_SKILL_LINK" ]; then
+  echo "scheduled root skill is not a readable regular file: $SCHEDULED_SKILL_LINK" >&2
+  exit 66
+fi
+
+set +e
+printf '%s\n' "$PROMPT" | "$CODEX" exec --cd "$WORKING_DIRECTORY" -
+status=$?
+exit "$status"
