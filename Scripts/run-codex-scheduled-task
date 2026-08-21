@@ -16,6 +16,7 @@ import stat
 import struct
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -1332,6 +1333,147 @@ def _open_bound_codex(binding: RuntimeBinding) -> Tuple[int, str, str]:
         raise
 
 
+def _materialize_validated_codex(binding: RuntimeBinding, descriptor: int) -> Path:
+    staging_bin = binding.home / ".local" / "bin"
+    _validate_directory_chain(
+        staging_bin,
+        binding.uid,
+        "Codex private-copy directory",
+        owner=True,
+    )
+    parent_descriptor = _open_trusted_directory_chain(
+        staging_bin,
+        binding.uid,
+        "Codex private-copy directory",
+        owner=True,
+    )
+    private_descriptor: Optional[int] = None
+    private_name: Optional[str] = None
+    try:
+        metadata = os.fstat(descriptor)
+        mode = stat.S_IMODE(metadata.st_mode)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != binding.uid
+            or mode & 0o022
+            or mode & 0o111 == 0
+        ):
+            raise ValueError("bound Codex descriptor is not a validated executable")
+        if metadata.st_size < 0:
+            raise ValueError("bound Codex descriptor size is invalid")
+
+        chunks = []
+        offset = 0
+        while offset < metadata.st_size:
+            chunk = os.pread(
+                descriptor,
+                min(1024 * 1024, metadata.st_size - offset),
+                offset,
+            )
+            if not chunk:
+                raise ValueError("bound Codex changed while being copied")
+            chunks.append(chunk)
+            offset += len(chunk)
+        payload = b"".join(chunks)
+        if binding.codex_sha256 is not None:
+            if hashlib.sha256(payload).hexdigest() != binding.codex_sha256:
+                raise ValueError("bound Codex native identity changed while being copied")
+
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        for _attempt in range(128):
+            candidate = f".ticker-codex-{uuid.uuid4().hex}"
+            try:
+                private_descriptor = os.open(
+                    candidate,
+                    flags,
+                    0o700,
+                    dir_fd=parent_descriptor,
+                )
+            except FileExistsError:
+                continue
+            private_name = candidate
+            break
+        if private_descriptor is None or private_name is None:
+            raise OSError("cannot create a unique Codex private copy")
+
+        os.fchmod(private_descriptor, 0o700)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(private_descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("Codex private-copy write made no progress")
+            offset += written
+        os.fsync(private_descriptor)
+        os.close(private_descriptor)
+        private_descriptor = None
+
+        read_descriptor: Optional[int] = None
+        try:
+            read_descriptor = os.open(
+                private_name,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+            read_metadata = os.fstat(read_descriptor)
+            read_mode = stat.S_IMODE(read_metadata.st_mode)
+            if (
+                not stat.S_ISREG(read_metadata.st_mode)
+                or read_metadata.st_uid != binding.uid
+                or read_mode != 0o700
+                or read_metadata.st_size != len(payload)
+            ):
+                raise ValueError("Codex private copy metadata changed")
+            readback = bytearray()
+            offset = 0
+            while offset < len(payload):
+                chunk = os.pread(
+                    read_descriptor,
+                    min(1024 * 1024, len(payload) - offset),
+                    offset,
+                )
+                if not chunk:
+                    raise ValueError("Codex private copy changed while being read")
+                readback.extend(chunk)
+                offset += len(chunk)
+            if bytes(readback) != payload:
+                raise ValueError("Codex private copy readback differs from validated bytes")
+        finally:
+            if read_descriptor is not None:
+                os.close(read_descriptor)
+
+        os.fsync(parent_descriptor)
+        return staging_bin / private_name
+    except BaseException as primary_error:
+        cleanup_errors: list[OSError] = []
+        if private_descriptor is not None:
+            try:
+                os.close(private_descriptor)
+            except OSError as error:
+                cleanup_errors.append(error)
+        if private_name is not None:
+            try:
+                os.unlink(private_name, dir_fd=parent_descriptor)
+            except OSError as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            cleanup_context = "; ".join(str(error) for error in cleanup_errors)
+            raise OSError(
+                "Codex materialization failed: "
+                f"{primary_error}; cleanup failed: {cleanup_context}"
+            ) from primary_error
+        raise
+    finally:
+        os.close(parent_descriptor)
+
+
 def _forwarded_child_status(
     binding: RuntimeBinding,
     prompt: str,
@@ -1373,8 +1515,12 @@ def _forwarded_child_status(
             signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
 
     child: Any = None
+    private_copy: Optional[Path] = None
     status = 69
+    execution_error: Optional[BaseException] = None
+    cleanup_error: Optional[BaseException] = None
     try:
+        private_copy = _materialize_validated_codex(binding, descriptor)
         for signum in HANDLED_SIGNALS:
             previous[signum] = signal.getsignal(signum)
             signal.signal(signum, forward)
@@ -1383,8 +1529,7 @@ def _forwarded_child_status(
             cwd=binding.repository,
             env=dict(environment),
             stdin=subprocess.PIPE,
-            executable=f"/dev/fd/{descriptor}",
-            pass_fds=(descriptor,),
+            executable=str(private_copy),
             preexec_fn=restore_child_mask if original_mask is not None else None,
         )
         child_slot[0] = child
@@ -1398,15 +1543,40 @@ def _forwarded_child_status(
             pass
         status = child.wait()
     except (OSError, ValueError) as error:
-        return _error(f"cannot execute bound Codex: {error}", 69)
+        execution_error = error
     finally:
-        if original_mask is not None:
-            signal.pthread_sigmask(signal.SIG_BLOCK, set(HANDLED_SIGNALS))
-        for signum, prior in previous.items():
-            signal.signal(signum, prior)
-        if original_mask is not None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
-        os.close(descriptor)
+        try:
+            if original_mask is not None:
+                signal.pthread_sigmask(signal.SIG_BLOCK, set(HANDLED_SIGNALS))
+            for signum, prior in previous.items():
+                signal.signal(signum, prior)
+            if original_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+        except (OSError, ValueError) as error:
+            if execution_error is None:
+                execution_error = error
+        finally:
+            if private_copy is not None:
+                try:
+                    private_copy.unlink(missing_ok=True)
+                except OSError as error:
+                    cleanup_error = error
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+
+    if cleanup_error is not None:
+        if execution_error is not None:
+            return _error(
+                f"cannot execute bound Codex: {execution_error}; "
+                f"private-copy cleanup failed: {cleanup_error}",
+                69,
+            )
+        return _error(f"private-copy cleanup failed: {cleanup_error}", 69)
+    if execution_error is not None:
+        return _error(f"cannot execute bound Codex: {execution_error}", 69)
     if status < 0:
         return 128 + (-status)
     return status

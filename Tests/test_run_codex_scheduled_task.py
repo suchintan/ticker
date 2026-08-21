@@ -11,6 +11,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1050,14 +1051,91 @@ class RunnerContractTests(unittest.TestCase):
                     self.assertEqual(result, 69)
                     popen.assert_not_called()
 
-    def test_codex_executes_the_same_validated_descriptor_after_path_swap(self) -> None:
+    def test_materialize_validated_codex_copies_exact_fd_bytes_after_path_swap(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             harness = self.make_harness(Path(directory))
             module = self.load_runner_module(harness)
             binding = self.binding_object(harness)
+            staging_home = harness.root / "staging home"
+            staging_bin = staging_home / ".local" / "bin"
+            staging_bin.mkdir(parents=True)
+            for path in (staging_home, staging_home / ".local", staging_bin):
+                path.chmod(0o700)
+            binding.home = staging_home
+
+            original = harness.codex.read_bytes()
+            source = harness.root / "bound codex source"
+            source.write_bytes(original)
+            source.chmod(0o755)
+            replacement = b"pathname replacement must not be copied\n"
+            source_fd = os.open(source, os.O_RDONLY)
+            private_paths: list[Path] = []
+            try:
+                materialize = getattr(
+                    module,
+                    "_materialize_validated_codex",
+                    None,
+                )
+                self.assertTrue(
+                    callable(materialize),
+                    "RED contract missing _materialize_validated_codex(binding, fd)",
+                )
+                assert callable(materialize)
+                os.lseek(source_fd, len(original) // 2, os.SEEK_SET)
+                source.unlink()
+                source.write_bytes(replacement)
+                source.chmod(0o755)
+                current_position = os.lseek(source_fd, 0, os.SEEK_CUR)
+
+                first = Path(materialize(binding, source_fd))
+                private_paths.append(first)
+                second = Path(materialize(binding, source_fd))
+                private_paths.append(second)
+
+                for private_copy in private_paths:
+                    self.assertEqual(private_copy.parent, staging_bin)
+                    self.assertEqual(
+                        stat.S_IMODE(private_copy.stat().st_mode),
+                        0o700,
+                    )
+                    self.assertEqual(private_copy.read_bytes(), original)
+                self.assertNotEqual(first, second)
+                self.assertEqual(
+                    os.lseek(source_fd, 0, os.SEEK_CUR),
+                    current_position,
+                )
+                self.assertEqual(source.read_bytes(), replacement)
+            finally:
+                try:
+                    os.close(source_fd)
+                except OSError:
+                    pass
+                for private_copy in private_paths:
+                    private_copy.unlink(missing_ok=True)
+
+    def test_codex_executes_private_copy_after_path_swap_and_cleans_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            module = self.load_runner_module(harness)
+            binding = self.binding_object(harness)
+            staging_home = harness.root / "staging home"
+            staging_bin = staging_home / ".local" / "bin"
+            staging_bin.mkdir(parents=True)
+            for path in (staging_home, staging_home / ".local", staging_bin):
+                path.chmod(0o700)
+            binding.home = staging_home
+
+            original = harness.codex.read_bytes()
             replacement = harness.root / "replacement-codex"
-            replacement.write_text("#!/bin/sh\nexit 97\n", encoding="utf-8")
+            replacement_bytes = b"#!/bin/sh\nexit 97\n"
+            replacement.write_bytes(replacement_bytes)
             replacement.chmod(0o755)
+            source_fd = os.open(harness.codex, os.O_RDONLY)
+            private_paths: list[Path] = []
             events: list[str] = []
 
             class Child:
@@ -1067,50 +1145,380 @@ class RunnerContractTests(unittest.TestCase):
                     events.append("wait")
                     return 0
 
+            expected_arguments = [
+                str(binding.codex),
+                "exec",
+                "--model",
+                "gpt-5.6-sol",
+                "--cd",
+                str(binding.repository),
+                "-c",
+                'model_reasoning_effort="xhigh"',
+                "-",
+            ]
+            environment = {
+                "HOME": str(binding.home),
+                "PATH": harness.controlled_path,
+                "TZ": "America/New_York",
+            }
+
             def fake_popen(arguments: list[str], **kwargs: object) -> Child:
                 events.append("popen")
-                os.replace(replacement, harness.codex)
-                self.assertEqual(
-                    arguments,
-                    [
-                        str(binding.codex),
-                        "exec",
-                        "--model",
-                        "gpt-5.6-sol",
-                        "--cd",
-                        str(binding.repository),
-                        "-c",
-                        'model_reasoning_effort="xhigh"',
-                        "-",
-                    ],
-                )
+                self.assertEqual(arguments, expected_arguments)
+                self.assertEqual(kwargs["cwd"], binding.repository)
+                self.assertEqual(kwargs["env"], environment)
+                self.assertEqual(kwargs["stdin"], subprocess.PIPE)
+                self.assertNotIn("pass_fds", kwargs)
                 executable = kwargs.get("executable")
                 self.assertIsInstance(executable, str)
                 assert isinstance(executable, str)
-                self.assertRegex(executable, r"^/dev/fd/\d+$")
-                descriptor = int(executable.rsplit("/", 1)[-1])
-                self.assertIn(descriptor, tuple(kwargs.get("pass_fds", ())))
+                private_copy = Path(executable)
+                private_paths.append(private_copy)
+                self.assertEqual(private_copy.parent, staging_bin)
+                self.assertEqual(
+                    stat.S_IMODE(private_copy.stat().st_mode),
+                    0o700,
+                )
+                self.assertEqual(private_copy.read_bytes(), original)
+                os.replace(replacement, binding.codex)
+                self.assertEqual(private_copy.read_bytes(), original)
                 return Child()
 
             forward = getattr(module, "_forwarded_child_status", None)
             self.assertIsNotNone(
                 forward,
-                "RED contract missing descriptor runner seam",
+                "RED contract missing private-copy runner seam",
             )
             assert forward is not None
-            with mock.patch.object(module.subprocess, "Popen", side_effect=fake_popen):
-                status = forward(
-                    binding,
-                    "prompt",
-                    {
-                        "HOME": str(harness.home),
-                        "PATH": harness.controlled_path,
-                        "TZ": "America/New_York",
-                    },
-                )
-            self.assertEqual(status, 0)
-            self.assertEqual(events, ["popen", "wait"])
+            try:
+                with mock.patch.object(
+                    module,
+                    "_open_bound_codex",
+                    return_value=(
+                        source_fd,
+                        str(binding.codex_macho_arch),
+                        str(binding.codex_sha256),
+                    ),
+                ), mock.patch.object(
+                    module.subprocess,
+                    "Popen",
+                    side_effect=fake_popen,
+                ):
+                    status = forward(binding, "prompt", environment)
+                self.assertEqual(status, 0)
+                self.assertEqual(events, ["popen", "wait"])
+                self.assertEqual(binding.codex.read_bytes(), replacement_bytes)
+                self.assertTrue(private_paths)
+                self.assertFalse(private_paths[0].exists())
+                with self.assertRaises(OSError):
+                    os.fstat(source_fd)
+            finally:
+                try:
+                    os.close(source_fd)
+                except OSError:
+                    pass
 
+
+    def test_codex_spawn_failure_cleans_private_copy_and_closes_validated_fd(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            module = self.load_runner_module(harness)
+            binding = self.binding_object(harness)
+            private_copy = harness.root / "private codex"
+            private_copy.write_bytes(b"validated private copy\n")
+            private_copy.chmod(0o700)
+            source_fd = os.open(harness.codex, os.O_RDONLY)
+            environment = {
+                "HOME": str(harness.home),
+                "PATH": harness.controlled_path,
+                "TZ": "America/New_York",
+            }
+            expected_arguments = [
+                str(binding.codex),
+                "exec",
+                "--model",
+                "gpt-5.6-sol",
+                "--cd",
+                str(binding.repository),
+                "-c",
+                'model_reasoning_effort="xhigh"',
+                "-",
+            ]
+
+            def fake_popen(arguments: list[str], **kwargs: object) -> object:
+                self.assertEqual(arguments, expected_arguments)
+                self.assertEqual(kwargs["cwd"], binding.repository)
+                self.assertEqual(kwargs["env"], environment)
+                self.assertEqual(kwargs["stdin"], subprocess.PIPE)
+                self.assertEqual(kwargs["executable"], str(private_copy))
+                self.assertNotIn("pass_fds", kwargs)
+                self.assertTrue(private_copy.exists())
+                raise OSError("simulated Codex spawn failure")
+
+            forward = getattr(module, "_forwarded_child_status", None)
+            self.assertIsNotNone(forward)
+            assert forward is not None
+            try:
+                with mock.patch.object(
+                    module,
+                    "_open_bound_codex",
+                    return_value=(
+                        source_fd,
+                        binding.codex_macho_arch,
+                        binding.codex_sha256,
+                    ),
+                ), mock.patch.object(
+                    module,
+                    "_materialize_validated_codex",
+                    return_value=private_copy,
+                    create=True,
+                ), mock.patch.object(
+                    module.subprocess,
+                    "Popen",
+                    side_effect=fake_popen,
+                ), mock.patch.object(
+                    module,
+                    "_error",
+                    return_value=69,
+                ) as error:
+                    status = forward(binding, "prompt", environment)
+                self.assertEqual(status, 69)
+                error.assert_called_once()
+                self.assertIn("cannot execute", error.call_args.args[0])
+                self.assertFalse(private_copy.exists())
+                with self.assertRaises(OSError):
+                    os.fstat(source_fd)
+            finally:
+                try:
+                    os.close(source_fd)
+                except OSError:
+                    pass
+
+    def test_codex_cleanup_failure_returns_nonzero_and_closes_validated_fd(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            module = self.load_runner_module(harness)
+            binding = self.binding_object(harness)
+            private_copy = harness.root / "private codex"
+            private_copy.write_bytes(b"validated private copy\n")
+            private_copy.chmod(0o700)
+            source_fd = os.open(harness.codex, os.O_RDONLY)
+            environment = {
+                "HOME": str(harness.home),
+                "PATH": harness.controlled_path,
+                "TZ": "America/New_York",
+            }
+
+            class Child:
+                stdin = io.BytesIO()
+
+                def wait(self) -> int:
+                    return 0
+
+            def fake_popen(_arguments: list[str], **kwargs: object) -> Child:
+                self.assertEqual(kwargs["executable"], str(private_copy))
+                self.assertNotIn("pass_fds", kwargs)
+                self.assertTrue(private_copy.exists())
+                return Child()
+
+            def fail_unlink(path: Path, *, missing_ok: bool = False) -> None:
+                self.assertEqual(path, private_copy)
+                self.assertTrue(missing_ok)
+                raise OSError("simulated private-copy cleanup failure")
+
+            forward = getattr(module, "_forwarded_child_status", None)
+            self.assertIsNotNone(forward)
+            assert forward is not None
+            try:
+                with mock.patch.object(
+                    module,
+                    "_open_bound_codex",
+                    return_value=(
+                        source_fd,
+                        binding.codex_macho_arch,
+                        binding.codex_sha256,
+                    ),
+                ), mock.patch.object(
+                    module,
+                    "_materialize_validated_codex",
+                    return_value=private_copy,
+                    create=True,
+                ), mock.patch.object(
+                    module.subprocess,
+                    "Popen",
+                    side_effect=fake_popen,
+                ) as popen, mock.patch.object(
+                    Path,
+                    "unlink",
+                    autospec=True,
+                    side_effect=fail_unlink,
+                ) as unlink, mock.patch.object(
+                    module,
+                    "_error",
+                    return_value=69,
+                ) as error:
+                    status = forward(binding, "prompt", environment)
+                self.assertNotEqual(status, 0)
+                error.assert_called_once()
+                self.assertIn("cleanup failed", error.call_args.args[0].lower())
+                popen.assert_called_once()
+                unlink.assert_called_once_with(private_copy, missing_ok=True)
+                self.assertTrue(private_copy.exists())
+                with self.assertRaises(OSError):
+                    os.fstat(source_fd)
+            finally:
+                try:
+                    os.close(source_fd)
+                except OSError:
+                    pass
+
+    def test_codex_materialization_and_internal_cleanup_failure_returns_combined_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            module = self.load_runner_module(harness)
+            binding = self.binding_object(harness)
+            staging_home = harness.root / "staging home"
+            staging_bin = staging_home / ".local" / "bin"
+            staging_bin.mkdir(parents=True)
+            for path in (staging_home, staging_home / ".local", staging_bin):
+                path.chmod(0o700)
+            binding.home = staging_home
+
+            source_fd = os.open(harness.codex, os.O_RDONLY)
+            environment = {
+                "HOME": str(binding.home),
+                "PATH": harness.controlled_path,
+                "TZ": "America/New_York",
+            }
+            private_descriptors: list[int] = []
+            closed_descriptors: list[int] = []
+            real_close = os.close
+
+            def fail_fchmod(descriptor: int, _mode: int) -> None:
+                private_descriptors.append(descriptor)
+                raise OSError("simulated materialization failure")
+
+            def fail_unlink(path: str, *, dir_fd: int | None = None) -> None:
+                self.assertTrue(path.startswith(".ticker-codex-"))
+                self.assertIsNotNone(dir_fd)
+                raise OSError("simulated internal unlink failure")
+
+            def track_close(descriptor: int) -> None:
+                closed_descriptors.append(descriptor)
+                real_close(descriptor)
+
+            forward = getattr(module, "_forwarded_child_status", None)
+            self.assertIsNotNone(forward)
+            assert forward is not None
+            try:
+                with mock.patch.object(
+                    module,
+                    "_open_bound_codex",
+                    return_value=(
+                        source_fd,
+                        binding.codex_macho_arch,
+                        binding.codex_sha256,
+                    ),
+                ), mock.patch.object(
+                    module.os,
+                    "fchmod",
+                    side_effect=fail_fchmod,
+                ), mock.patch.object(
+                    module.os,
+                    "unlink",
+                    side_effect=fail_unlink,
+                ) as unlink, mock.patch.object(
+                    module.os,
+                    "close",
+                    side_effect=track_close,
+                ), mock.patch.object(
+                    module.subprocess,
+                    "Popen",
+                ) as popen, mock.patch.object(
+                    module,
+                    "_error",
+                    return_value=69,
+                ) as error:
+                    status = forward(binding, "prompt", environment)
+
+                self.assertEqual(status, 69)
+                error.assert_called_once()
+                diagnostic = error.call_args.args[0]
+                self.assertIn("simulated materialization failure", diagnostic)
+                self.assertIn("simulated internal unlink failure", diagnostic)
+                self.assertIn("cleanup failed", diagnostic.lower())
+                unlink.assert_called_once()
+                popen.assert_not_called()
+                self.assertEqual(len(private_descriptors), 1)
+                self.assertIn(private_descriptors[0], closed_descriptors)
+                self.assertIn(source_fd, closed_descriptors)
+                with self.assertRaises(OSError):
+                    os.fstat(source_fd)
+            finally:
+                try:
+                    os.close(source_fd)
+                except OSError:
+                    pass
+
+
+    def test_unsafe_staging_parent_blocks_spawn_and_closes_validated_fd(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            module = self.load_runner_module(harness)
+            binding = self.binding_object(harness)
+            staging_home = harness.root / "staging home"
+            staging_bin = staging_home / ".local" / "bin"
+            staging_bin.mkdir(parents=True)
+            for path in (staging_home, staging_home / ".local", staging_bin):
+                path.chmod(0o700)
+            staging_bin.chmod(0o777)
+            binding.home = staging_home
+            source_fd = os.open(harness.codex, os.O_RDONLY)
+            environment = {
+                "HOME": str(staging_home),
+                "PATH": harness.controlled_path,
+                "TZ": "America/New_York",
+            }
+            forward = getattr(module, "_forwarded_child_status", None)
+            self.assertIsNotNone(forward)
+            assert forward is not None
+            try:
+                with mock.patch.object(
+                    module,
+                    "_open_bound_codex",
+                    return_value=(
+                        source_fd,
+                        binding.codex_macho_arch,
+                        binding.codex_sha256,
+                    ),
+                ), mock.patch.object(
+                    module.subprocess,
+                    "Popen",
+                ) as popen, mock.patch.object(
+                    module,
+                    "_error",
+                    return_value=69,
+                ) as error:
+                    status = forward(binding, "prompt", environment)
+                self.assertNotEqual(status, 0)
+                error.assert_called_once()
+                popen.assert_not_called()
+                self.assertEqual(tuple(staging_bin.iterdir()), ())
+                with self.assertRaises(OSError):
+                    os.fstat(source_fd)
+            finally:
+                try:
+                    os.close(source_fd)
+                except OSError:
+                    pass
 
     def test_all_six_tasks_pin_model_and_reasoning_effort_without_spawning_codex(
         self,
