@@ -930,9 +930,19 @@ def _validate_codex_home(binding: RuntimeBinding) -> None:
         os.close(descriptor)
 
 
-def _resolve_bound_skill_root(root: Path, uid: int) -> Path:
+def _resolve_bound_skill_root(
+    root: Path,
+    uid: int,
+    expected_root: Optional[Path] = None,
+) -> Path:
+    try:
+        canonical_parent = root.parent.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("scheduled skill root parent is missing") from error
+    if canonical_parent != root.parent and expected_root is None:
+        raise ValueError("scheduled skill root parent must not contain symlinks")
     parent = _open_trusted_directory_chain(
-        root.parent,
+        canonical_parent,
         uid,
         "scheduled skill root parent",
         owner=False,
@@ -948,22 +958,24 @@ def _resolve_bound_skill_root(root: Path, uid: int) -> Path:
             return root
         except OSError as error:
             raise ValueError("scheduled skill root is not trustworthy") from error
-        if not stat.S_ISLNK(metadata.st_mode):
-            return root
-        if metadata.st_uid != uid:
-            raise ValueError("scheduled skill root symlink is not owned by the current user")
-        try:
-            target_text = os.readlink(root.name, dir_fd=parent)
-        except OSError as error:
-            raise ValueError("scheduled skill root symlink cannot be read") from error
-        target = Path(target_text)
-        if not target.is_absolute():
-            target = root.parent / target
-        try:
-            canonical = target.resolve(strict=True)
-        except (OSError, RuntimeError) as error:
-            raise ValueError("scheduled skill root symlink target is missing") from error
-        if canonical == root or not canonical.is_dir():
+        is_symlink = stat.S_ISLNK(metadata.st_mode)
+        if is_symlink:
+            if metadata.st_uid != uid:
+                raise ValueError("scheduled skill root symlink is not owned by the current user")
+            try:
+                target_text = os.readlink(root.name, dir_fd=parent)
+            except OSError as error:
+                raise ValueError("scheduled skill root symlink cannot be read") from error
+            target = Path(target_text)
+            if not target.is_absolute():
+                target = canonical_parent / target
+            try:
+                canonical = target.resolve(strict=True)
+            except (OSError, RuntimeError) as error:
+                raise ValueError("scheduled skill root symlink target is missing") from error
+        else:
+            canonical = canonical_parent / root.name
+        if (is_symlink and canonical == root) or not canonical.is_dir():
             raise ValueError("scheduled skill root symlink target is invalid")
         target_descriptor = _open_trusted_directory_chain(
             canonical,
@@ -982,11 +994,17 @@ def _task_contract(task_id: str, binding: RuntimeBinding) -> Tuple[str, Path, Pa
     if task is None:
         raise KeyError(task_id)
     skill_name, project_relative, invocation = task
+    bound_root: Optional[Path] = None
     if binding.binding_version >= RUNTIME_BINDING_VERSION:
         try:
-            root = binding.skill_roots[task_id]
+            bound_root = binding.skill_roots[task_id]
         except KeyError as error:
             raise ValueError("scheduled skill root is missing") from error
+        root = (
+            bound_root
+            if project_relative
+            else binding.codex_home / "skills" / skill_name
+        )
     else:
         root = (
             binding.repository / ".agents" / "skills" / skill_name
@@ -995,7 +1013,9 @@ def _task_contract(task_id: str, binding: RuntimeBinding) -> Tuple[str, Path, Pa
         )
     if not root.is_absolute() or CONTROL_CHARACTER_RE.search(str(root)) or ":" in str(root):
         raise ValueError("scheduled skill root is invalid")
-    root = _resolve_bound_skill_root(root, binding.uid)
+    canonical_root = _resolve_bound_skill_root(root, binding.uid, bound_root)
+    if bound_root is not None and canonical_root != bound_root:
+        raise ValueError("scheduled skill root does not match the bound canonical target")
     link = root / "SKILL.md"
     prompt = f"Use ${skill_name} at {root} {invocation}. Execute the canonical workflow once."
     return prompt, root, link

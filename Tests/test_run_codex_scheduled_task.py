@@ -88,10 +88,12 @@ def expected_task_contract(
     codex_home: Path | None = None,
 ) -> tuple[str, Path]:
     task = TASKS[task_id]
-    if skill_roots is not None:
-        skill_root = skill_roots[task_id]
-    elif task.project_relative:
-        skill_root = working_directory / ".agents" / "skills" / task.skill_name
+    if task.project_relative:
+        skill_root = (
+            skill_roots[task_id]
+            if skill_roots is not None
+            else working_directory / ".agents" / "skills" / task.skill_name
+        )
     else:
         skill_root = (
             home / ".codex" if codex_home is None else codex_home
@@ -288,27 +290,28 @@ class RunnerContractTests(unittest.TestCase):
             )
             for task_id in TASKS
         }
-        omitted_skill = None
-        if omit_task_root is not None:
-            _, omitted_skill = expected_task_contract(
-                omit_task_root,
-                home,
-                working_directory,
-                skill_roots,
-                codex_home=codex_home,
-            )
+        omitted_skill = (
+            None
+            if omit_task_root is None
+            else skill_roots[omit_task_root] / "SKILL.md"
+        )
         for task_id in TASKS:
-            _, skill_path = expected_task_contract(
-                task_id,
-                home,
-                working_directory,
-                skill_roots,
-                codex_home=codex_home,
-            )
+            skill_path = skill_roots[task_id] / "SKILL.md"
             if skill_path == omitted_skill:
                 continue
             skill_path.parent.mkdir(parents=True, exist_ok=True)
             skill_path.write_text("live skill\n", encoding="utf-8")
+        installed_skills = codex_home / "skills"
+        installed_skills.mkdir(mode=0o700)
+        for task_id, task in TASKS.items():
+            if task.project_relative:
+                continue
+            installed_root = installed_skills / task.skill_name
+            if not os.path.lexists(installed_root):
+                installed_root.symlink_to(
+                    skill_roots[task_id],
+                    target_is_directory=True,
+                )
 
         machine = platform.machine().lower()
         if machine in {"arm64", "aarch64"}:
@@ -507,6 +510,41 @@ class RunnerContractTests(unittest.TestCase):
                 )
             self.assertEqual(result, 0)
             child.assert_called_once()
+
+    def test_v3_personal_task_exports_codex_skill_link_with_bound_canonical_target(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            module = self.load_runner_module(harness)
+            binding = self.binding_object(harness)
+            installed_root = (
+                harness.codex_home / "skills" / "linkedin-post-ideas"
+            )
+
+            prompt, root, link = module._task_contract(
+                "linkedin-post-ideas",
+                binding,
+            )
+
+            self.assertEqual(root, installed_root)
+            self.assertEqual(link, installed_root / "SKILL.md")
+            self.assertIn(f"at {installed_root}", prompt)
+
+
+            external_skills = harness.root / "installed skill links"
+            installed_root.parent.rename(external_skills)
+            installed_root.parent.symlink_to(
+                external_skills,
+                target_is_directory=True,
+            )
+            linked_prompt, linked_root, linked_file = module._task_contract(
+                "linkedin-post-ideas",
+                binding,
+            )
+            self.assertEqual(linked_root, installed_root)
+            self.assertEqual(linked_file, installed_root / "SKILL.md")
+            self.assertIn(f"at {installed_root}", linked_prompt)
 
     def test_bound_home_requires_current_passwd_home(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1926,6 +1964,9 @@ class RunnerContractTests(unittest.TestCase):
             bound_root = harness.root / "bound canonical skill"
             bound_root.mkdir()
             (bound_root / "SKILL.md").write_text("bound skill\n", encoding="utf-8")
+            installed_root = harness.codex_home / "skills" / "daily-summary"
+            installed_root.unlink()
+            installed_root.symlink_to(bound_root, target_is_directory=True)
             binding = dict(harness.binding)
             skill_roots = dict(binding["skill_roots"])
             skill_roots["daily-summary"] = str(bound_root)
@@ -1939,12 +1980,12 @@ class RunnerContractTests(unittest.TestCase):
                 line.split("=", 1)
                 for line in harness.environment.read_text(encoding="utf-8").splitlines()
             )
-            self.assertEqual(environment["SCHEDULED_SKILL_ROOT"], str(bound_root))
+            self.assertEqual(environment["SCHEDULED_SKILL_ROOT"], str(installed_root))
             self.assertEqual(
                 environment["SCHEDULED_SKILL_LINK"],
-                str(bound_root / "SKILL.md"),
+                str(installed_root / "SKILL.md"),
             )
-            self.assertIn(str(bound_root), harness.stdin.read_text(encoding="utf-8"))
+            self.assertIn(str(installed_root), harness.stdin.read_text(encoding="utf-8"))
 
             for artifact in (
                 harness.events,
@@ -1999,9 +2040,9 @@ class RunnerContractTests(unittest.TestCase):
                 )
                 (canonical_root / "SKILL.md").chmod(0o600)
                 link_parent = harness.codex_home / "skills"
-                link_parent.mkdir()
                 link_parent.chmod(0o700)
                 root_link = link_parent / "daily-summary"
+                root_link.unlink()
                 root_link.symlink_to(canonical_root, target_is_directory=True)
                 if case == "writable-parent":
                     link_parent.chmod(0o777)
@@ -2019,7 +2060,7 @@ class RunnerContractTests(unittest.TestCase):
 
                 binding = dict(harness.binding)
                 skill_roots = dict(binding["skill_roots"])
-                skill_roots["daily-summary"] = str(root_link)
+                skill_roots["daily-summary"] = str(canonical_root)
                 binding["skill_roots"] = skill_roots
                 harness.runner.write_bytes(
                     render_test_runner(RUNNER.read_bytes(), binding)
@@ -2037,14 +2078,14 @@ class RunnerContractTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         environment["SCHEDULED_SKILL_ROOT"],
-                        str(canonical_root),
+                        str(root_link),
                     )
                     self.assertEqual(
                         environment["SCHEDULED_SKILL_LINK"],
-                        str(canonical_root / "SKILL.md"),
+                        str(root_link / "SKILL.md"),
                     )
                     self.assertIn(
-                        str(canonical_root),
+                        str(root_link),
                         harness.stdin.read_text(encoding="utf-8"),
                     )
                 else:
@@ -2267,7 +2308,7 @@ class RunnerContractTests(unittest.TestCase):
 
             for directory_name in ("skills", "rules", "policy"):
                 surface = harness.codex_home / directory_name
-                surface.mkdir()
+                surface.mkdir(exist_ok=True)
                 surface.chmod(0o700)
                 assert_rejected(
                     f"writable Codex {directory_name} surface",
@@ -2470,11 +2511,8 @@ class RunnerContractTests(unittest.TestCase):
                 omit_task_root="daily-summary",
             )
             result = self.invoke(harness, "daily-summary")
-            self.assertEqual(result.returncode, 66)
-            self.assertIn(
-                "scheduled root skill is not a readable regular file",
-                result.stderr,
-            )
+            self.assertEqual(result.returncode, 78)
+            self.assertIn("symlink target is missing", result.stderr)
             self.assertFalse(harness.stdin.exists())
 
     def test_codex_failure_status_is_preserved(self) -> None:
