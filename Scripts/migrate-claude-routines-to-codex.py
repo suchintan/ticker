@@ -45,7 +45,7 @@ class CutoverSignal(BaseException):
 
 
 RUNTIME_BINDING_PREFIX = b"# TICKER-RUNTIME-V1 "
-RUNTIME_BINDING_VERSION = 2
+RUNTIME_BINDING_VERSION = 3
 RUNTIME_MODEL = "gpt-5.6-sol"
 _CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f]")
 _NATIVE_MACHO_MAGICS = {
@@ -202,35 +202,42 @@ def open_trusted_directory_chain(path: Path, uid: int, description: str) -> int:
         | getattr(os, "O_NOFOLLOW", 0)
     )
     descriptor: Optional[int] = None
+    child: Optional[int] = None
+    previous: Optional[int] = None
     try:
         descriptor = os.open(path.anchor or os.sep, flags)
         _validate_open_directory(descriptor, uid, description)
         current = Path(path.anchor)
         for component in path.parts[1:]:
             child = os.open(component, flags, dir_fd=descriptor)
-            try:
-                _validate_open_directory(
-                    child,
-                    uid,
-                    f"{description} component {current / component}",
-                )
-            except BaseException:
-                os.close(child)
-                raise
-            os.close(descriptor)
+            _validate_open_directory(
+                child,
+                uid,
+                f"{description} component {current / component}",
+            )
+            previous = descriptor
             descriptor = child
+            child = None
+            os.close(previous)
+            previous = None
             current /= component
         if descriptor is None:
             raise CutoverError(f"cannot open {description}")
-        return descriptor
-    except CutoverError:
-        if descriptor is not None:
-            os.close(descriptor)
-        raise
+        result = descriptor
+        descriptor = None
+        return result
     except OSError as error:
-        if descriptor is not None:
-            os.close(descriptor)
         raise CutoverError(f"cannot open {description}: {path}") from error
+    finally:
+        seen: set[int] = set()
+        for open_descriptor in (child, previous, descriptor):
+            if open_descriptor is None or open_descriptor in seen:
+                continue
+            seen.add(open_descriptor)
+            try:
+                os.close(open_descriptor)
+            except OSError:
+                pass
 
 
 def open_trusted_regular_at(
@@ -306,6 +313,8 @@ class RuntimeBinding:
     codex_macho_arch: Optional[str]
     codex_managed_package_root: Optional[Path]
     codex_managed_package_version: Optional[str]
+    codex_code_mode_host: Optional[Path]
+    codex_code_mode_host_sha256: Optional[str]
     codex_managed_by: str
 
     def as_dict(self) -> Dict[str, object]:
@@ -324,6 +333,10 @@ class RuntimeBinding:
             },
             "codex_sha256": self.codex_sha256,
             "codex_macho_arch": self.codex_macho_arch,
+            "codex_code_mode_host": (
+                None if self.codex_code_mode_host is None else str(self.codex_code_mode_host)
+            ),
+            "codex_code_mode_host_sha256": self.codex_code_mode_host_sha256,
             "codex_managed_package_root": (
                 None
                 if self.codex_managed_package_root is None
@@ -365,13 +378,19 @@ class RuntimeBinding:
             "codex_managed_package_version",
             "codex_managed_by",
         }
+        v3_keys = v2_keys | {
+            "codex_code_mode_host",
+            "codex_code_mode_host_sha256",
+        }
         legacy_v2_keys = v2_keys - {"codex_home"}
         if set(value) == legacy_keys:
             version = 1
         elif (
             set(value) in (legacy_v2_keys, v2_keys)
-            and value.get("binding_version") == RUNTIME_BINDING_VERSION
+            and value.get("binding_version") == 2
         ):
+            version = 2
+        elif set(value) == v3_keys and value.get("binding_version") == RUNTIME_BINDING_VERSION:
             version = RUNTIME_BINDING_VERSION
         else:
             raise CutoverError("runtime binding keys are invalid")
@@ -429,6 +448,8 @@ class RuntimeBinding:
             skill_roots: Mapping[str, Path] = {}
             digest = None
             arch = None
+            code_mode_host = None
+            code_mode_host_digest = None
         else:
             if manager == "npm":
                 if (
@@ -462,6 +483,25 @@ class RuntimeBinding:
             arch = value["codex_macho_arch"]
             if arch not in {"arm64", "x86_64"}:
                 raise CutoverError("runtime binding Codex architecture is invalid")
+            if version >= 3:
+                raw_code_mode_host = value["codex_code_mode_host"]
+                if not isinstance(raw_code_mode_host, str):
+                    raise CutoverError("runtime binding Codex code-mode host is invalid")
+                code_mode_host = _validate_absolute_path_text(
+                    raw_code_mode_host,
+                    "runtime binding Codex code-mode host",
+                )
+                code_mode_host_digest = value["codex_code_mode_host_sha256"]
+                if (
+                    not isinstance(code_mode_host_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", code_mode_host_digest) is None
+                ):
+                    raise CutoverError(
+                        "runtime binding Codex code-mode host digest is invalid"
+                    )
+            else:
+                code_mode_host = None
+                code_mode_host_digest = None
             if manager == "direct" and (package_root is not None or package_version is not None):
                 raise CutoverError("direct runtime binding cannot contain package metadata")
             if manager == "npm" and (package_root is None or package_version is None):
@@ -480,6 +520,8 @@ class RuntimeBinding:
             skill_roots=skill_roots,
             codex_sha256=digest,
             codex_macho_arch=arch,
+            codex_code_mode_host=code_mode_host,
+            codex_code_mode_host_sha256=code_mode_host_digest,
             codex_managed_package_root=package_root,
             codex_managed_package_version=package_version,
             codex_managed_by=manager,
@@ -601,6 +643,8 @@ class NativeCodexResolution:
     package_version: Optional[str]
     arch: str
     sha256: str
+    code_mode_host: Path
+    code_mode_host_sha256: str
 
     @property
     def native_codex(self) -> Path:
@@ -775,17 +819,14 @@ def inspect_native_codex(path: Path, expected_arch: Optional[str] = None) -> Nat
     arch = _host_native_arch() if expected_arch is None else expected_arch
     if arch not in {"arm64", "x86_64"}:
         raise CutoverError("Codex native architecture is invalid")
-    _validate_trusted_directory_path(candidate.parent, os.getuid(), "Codex native parent")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     parent_descriptor: Optional[int] = None
     descriptor: Optional[int] = None
     try:
-        parent_descriptor = os.open(
+        parent_descriptor = open_trusted_directory_chain(
             candidate.parent,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.getuid(),
+            "Codex native parent",
         )
         descriptor = os.open(candidate.name, flags, dir_fd=parent_descriptor)
     except OSError as error:
@@ -870,7 +911,7 @@ def _platform_package_details() -> Tuple[str, str, str, str, str]:
 
 def _validate_package_topology(
     package_root: Path,
-) -> Tuple[Path, str, NativeCodexIdentity]:
+) -> Tuple[Path, Path, str, NativeCodexIdentity, NativeCodexIdentity]:
     _validate_trusted_directory_path(
         package_root,
         os.getuid(),
@@ -880,7 +921,13 @@ def _validate_package_topology(
     package_json = package_root / "package.json"
     root_metadata = _read_json_metadata(package_json, "Codex package metadata")
     version = root_metadata.get("version")
-    if root_metadata.get("name") != "@openai/codex" or not isinstance(version, str) or not version:
+    if (
+        root_metadata.get("name") != "@openai/codex"
+        or not isinstance(version, str)
+        or not version
+        or _CONTROL_CHARACTER_RE.search(version)
+        or ":" in version
+    ):
         raise CutoverError("Codex package metadata identity is invalid")
     bin_metadata = root_metadata.get("bin")
     if not isinstance(bin_metadata, dict) or bin_metadata.get("codex") != "bin/codex.js":
@@ -935,7 +982,9 @@ def _validate_package_topology(
     )
     _validate_trusted_directory_path(native.parent, os.getuid(), "Codex native vendor path")
     identity = inspect_native_codex(native, _host_native_arch())
-    return native, version, identity
+    code_mode_host = native.with_name("codex-code-mode-host")
+    code_mode_identity = inspect_native_codex(code_mode_host, identity.arch)
+    return native, code_mode_host, version, identity, code_mode_identity
 
 
 def resolve_native_codex(environment: Mapping[str, str]) -> NativeCodexResolution:
@@ -956,6 +1005,10 @@ def resolve_native_codex(environment: Mapping[str, str]) -> NativeCodexResolutio
     target = _validate_absolute_path_text(selected, supplied[0])
     if supplied[0] == "CODEX_NATIVE_PATH":
         identity = inspect_native_codex(target, _host_native_arch())
+        code_mode_identity = inspect_native_codex(
+            identity.path.with_name("codex-code-mode-host"),
+            identity.arch,
+        )
         return NativeCodexResolution(
             path=identity.path,
             package_root=None,
@@ -963,8 +1016,12 @@ def resolve_native_codex(environment: Mapping[str, str]) -> NativeCodexResolutio
             package_version=None,
             arch=identity.arch,
             sha256=identity.sha256,
+            code_mode_host=code_mode_identity.path,
+            code_mode_host_sha256=code_mode_identity.sha256,
         )
-    native, version, identity = _validate_package_topology(target)
+    native, code_mode_host, version, identity, code_mode_identity = (
+        _validate_package_topology(target)
+    )
     return NativeCodexResolution(
         path=native,
         package_root=target,
@@ -972,6 +1029,8 @@ def resolve_native_codex(environment: Mapping[str, str]) -> NativeCodexResolutio
         package_version=version,
         arch=identity.arch,
         sha256=identity.sha256,
+        code_mode_host=code_mode_host,
+        code_mode_host_sha256=code_mode_identity.sha256,
     )
 
 
@@ -2397,6 +2456,12 @@ def prepare_codex_compensation() -> None:
     _validate_codex_home(binding.codex_home)
     _validate_bound_path(binding.path, binding.uid)
     validate_skill_roots(tuple(routine.root for routine in ROUTINES))
+    if binding.binding_version >= 2:
+        expected_skill_roots = {
+            routine.task_id: routine.root.canonical_root for routine in ROUTINES
+        }
+        if binding.skill_roots != expected_skill_roots:
+            raise CutoverError("runtime binding skill roots changed")
     try:
         if binding.python.resolve(strict=True) != Path(sys.executable).resolve(strict=True):
             raise CutoverError("runtime binding Python interpreter changed")
@@ -2422,12 +2487,24 @@ def prepare_codex_compensation() -> None:
         if environment != binding_environment:
             raise CutoverError("stored launchd controls do not match runtime binding")
     identity = inspect_native_codex(binding.codex, binding.codex_macho_arch)
-    if binding.binding_version >= RUNTIME_BINDING_VERSION:
+    if binding.binding_version >= 2:
         if identity.sha256 != binding.codex_sha256 or identity.arch != binding.codex_macho_arch:
             raise CutoverError("bound Codex native identity changed")
+        code_mode_identity: Optional[NativeCodexIdentity] = None
+        if binding.binding_version >= RUNTIME_BINDING_VERSION:
+            if binding.codex_code_mode_host is None:
+                raise CutoverError("bound Codex code-mode host is missing")
+            code_mode_identity = inspect_native_codex(
+                binding.codex_code_mode_host,
+                binding.codex_macho_arch,
+            )
+            if code_mode_identity.sha256 != binding.codex_code_mode_host_sha256:
+                raise CutoverError("bound Codex code-mode host identity changed")
         if binding.codex_managed_by == "npm":
-            native, version, package_identity = _validate_package_topology(
-                binding.codex_managed_package_root
+            if binding.codex_managed_package_root is None:
+                raise CutoverError("npm Codex binding has no package root")
+            native, code_mode_host, version, package_identity, package_host_identity = (
+                _validate_package_topology(binding.codex_managed_package_root)
             )
             if (
                 native != binding.codex
@@ -2435,13 +2512,19 @@ def prepare_codex_compensation() -> None:
                 or package_identity.sha256 != identity.sha256
             ):
                 raise CutoverError("bound Codex package provenance changed")
+            if binding.binding_version >= RUNTIME_BINDING_VERSION and (
+                code_mode_identity is None
+                or code_mode_host != binding.codex_code_mode_host
+                or package_host_identity.sha256 != code_mode_identity.sha256
+            ):
+                raise CutoverError("bound Codex package provenance changed")
         elif binding.codex_managed_package_root is not None:
             raise CutoverError("direct Codex binding contains package provenance")
     elif binding.codex_managed_by == "npm":
         if binding.codex_managed_package_root is None:
             raise CutoverError("legacy npm binding has no package root")
-        native, _version, _package_identity = _validate_package_topology(
-            binding.codex_managed_package_root
+        native, _host, _version, _package_identity, _host_identity = (
+            _validate_package_topology(binding.codex_managed_package_root)
         )
         if native != binding.codex:
             raise CutoverError("legacy Codex package provenance changed")
@@ -2876,6 +2959,10 @@ def _runtime_binding_for_runner() -> RuntimeBinding:
     _validate_bound_path(environment["PATH"], os.getuid())
     validate_skill_roots(tuple(routine.root for routine in ROUTINES))
     identity = inspect_native_codex(CODEX_EXECUTABLE, _host_native_arch())
+    code_mode_identity = inspect_native_codex(
+        CODEX_EXECUTABLE.with_name("codex-code-mode-host"),
+        identity.arch,
+    )
     managed_by = CODEX_MANAGED_BY or "direct"
     if managed_by not in {"direct", "npm"}:
         raise CutoverError("Codex manager identity is invalid")
@@ -2884,11 +2971,15 @@ def _runtime_binding_for_runner() -> RuntimeBinding:
     if managed_by == "npm":
         if package_root is None:
             raise CutoverError("npm Codex runtime has no package root")
-        native, version, package_identity = _validate_package_topology(package_root)
+        native, code_mode_host, version, package_identity, package_host_identity = (
+            _validate_package_topology(package_root)
+        )
         if (
             native != CODEX_EXECUTABLE
+            or code_mode_host != code_mode_identity.path
             or version != package_version
             or package_identity.sha256 != identity.sha256
+            or package_host_identity.sha256 != code_mode_identity.sha256
         ):
             raise CutoverError("npm Codex runtime provenance changed")
     elif package_root is not None or package_version is not None:
@@ -2908,6 +2999,8 @@ def _runtime_binding_for_runner() -> RuntimeBinding:
         },
         codex_sha256=identity.sha256,
         codex_macho_arch=identity.arch,
+        codex_code_mode_host=code_mode_identity.path,
+        codex_code_mode_host_sha256=code_mode_identity.sha256,
         codex_managed_package_root=package_root,
         codex_managed_package_version=package_version,
         codex_managed_by=managed_by,

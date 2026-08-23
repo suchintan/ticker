@@ -492,11 +492,14 @@ class CutoverFixture:
         self.runner_installed = self.home / ".local" / "bin" / "run-codex-scheduled-task"
         self.ticker = root / "bin" / "ticker"
         self.codex = root / "bin" / "codex"
+        self.code_mode_host = self.codex.with_name("codex-code-mode-host")
         self.ticker.parent.mkdir(parents=True)
         self.ticker.write_bytes(b"#!/bin/sh\nexit 0\n")
         self.ticker.chmod(0o755)
         self.codex.write_bytes(synthetic_host_native())
         self.codex.chmod(0o755)
+        self.code_mode_host.write_bytes(synthetic_host_native())
+        self.code_mode_host.chmod(0o755)
         self.launchd_environment = {
             "HOME": str(self.home),
             "PATH": cutover.build_controlled_path(self.home, self.codex),
@@ -617,12 +620,15 @@ class CutoverFixture:
         executable.parent.mkdir(parents=True)
         executable.write_bytes(synthetic_host_native())
         executable.chmod(0o755)
+        code_mode_host = executable.with_name("codex-code-mode-host")
+        code_mode_host.write_bytes(synthetic_host_native())
+        code_mode_host.chmod(0o755)
         return executable
 
     def binding_payload(self, *, codex: Path | None = None) -> dict[str, object]:
         selected_codex = self.codex if codex is None else codex
         return {
-            "binding_version": 2,
+            "binding_version": 3,
             "uid": os.getuid(),
             "home": str(self.home),
             "repository": str(self.working_directory),
@@ -637,6 +643,12 @@ class CutoverFixture:
             },
             "codex_sha256": native_digest(selected_codex),
             "codex_macho_arch": host_native_arch(),
+            "codex_code_mode_host": str(
+                selected_codex.with_name("codex-code-mode-host")
+            ),
+            "codex_code_mode_host_sha256": native_digest(
+                selected_codex.with_name("codex-code-mode-host")
+            ),
             "codex_managed_by": "direct",
             "codex_managed_package_root": None,
             "codex_managed_package_version": None,
@@ -1188,6 +1200,7 @@ class StaticContractTests(unittest.TestCase):
                 / "bin"
                 / "codex"
             )
+            code_mode_host = native.with_name("codex-code-mode-host")
             js_entrypoint = package_root / "bin" / "codex.js"
             native.parent.mkdir(parents=True)
             js_entrypoint.parent.mkdir(parents=True)
@@ -1233,6 +1246,8 @@ class StaticContractTests(unittest.TestCase):
             js_entrypoint.chmod(0o755)
             native.write_bytes(synthetic_host_macho())
             native.chmod(0o755)
+            code_mode_host.write_bytes(synthetic_host_macho())
+            code_mode_host.chmod(0o755)
 
             resolver = getattr(cutover, "resolve_native_codex", None)
             self.assertIsNotNone(
@@ -1262,12 +1277,60 @@ class StaticContractTests(unittest.TestCase):
             direct = resolve({"CODEX_NATIVE_PATH": str(native)})
             self.assertEqual(resolved_path(direct), native)
             self.assertEqual(getattr(direct, "managed_by", "direct"), "direct")
+            self.assertEqual(
+                getattr(direct, "code_mode_host", None),
+                code_mode_host,
+            )
+            self.assertEqual(
+                getattr(direct, "code_mode_host_sha256", None),
+                hashlib.sha256(code_mode_host.read_bytes()).hexdigest(),
+            )
 
             npm = resolve({"CODEX_PACKAGE_ROOT": str(package_root)})
             self.assertEqual(resolved_path(npm), native)
             self.assertEqual(getattr(npm, "managed_by", None), "npm")
             self.assertEqual(getattr(npm, "package_root", package_root), package_root)
             self.assertEqual(getattr(npm, "package_version", None), package_version)
+            self.assertEqual(
+                getattr(npm, "code_mode_host", None),
+                code_mode_host,
+            )
+            self.assertEqual(
+                getattr(npm, "code_mode_host_sha256", None),
+                hashlib.sha256(code_mode_host.read_bytes()).hexdigest(),
+            )
+
+            root_metadata_path = package_root / "package.json"
+            platform_metadata_path = platform_package / "package.json"
+            canonical_root_metadata = root_metadata_path.read_bytes()
+            canonical_platform_metadata = platform_metadata_path.read_bytes()
+            for malformed_version in ("0.147.0:poison", "0.147.0\npoison"):
+                with self.subTest(malformed_version=repr(malformed_version)):
+                    root_value = json.loads(canonical_root_metadata)
+                    platform_value = json.loads(canonical_platform_metadata)
+                    root_value["version"] = malformed_version
+                    root_value["optionalDependencies"][platform_dependency_key] = (
+                        f"npm:@openai/codex@{malformed_version}-{platform_suffix}"
+                    )
+                    platform_value["version"] = (
+                        f"{malformed_version}-{platform_suffix}"
+                    )
+                    root_metadata_path.write_text(
+                        json.dumps(root_value),
+                        encoding="utf-8",
+                    )
+                    platform_metadata_path.write_text(
+                        json.dumps(platform_value),
+                        encoding="utf-8",
+                    )
+                    try:
+                        with self.assertRaises(cutover.CutoverError):
+                            resolve({"CODEX_PACKAGE_ROOT": str(package_root)})
+                    finally:
+                        root_metadata_path.write_bytes(canonical_root_metadata)
+                        platform_metadata_path.write_bytes(
+                            canonical_platform_metadata
+                        )
 
             def assert_topology_rejected() -> None:
                 with self.assertRaises(cutover.CutoverError):
@@ -1710,17 +1773,22 @@ class StaticContractTests(unittest.TestCase):
                 self.assertNotIn(b"SUPERSET_AGENT_ID", installed)
                 self.assertNotIn(b"--enable hooks", installed)
 
-    def test_v2_binding_persists_digest_architecture_and_source_identity(self) -> None:
+    def test_v3_binding_persists_native_identities_and_source_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with CutoverFixture(Path(directory)) as fixture:
                 fixture.install_bound_runner()
                 binding = cutover.read_runtime_binding(fixture.runner_installed)
-                self.assertEqual(binding.binding_version, 2)
+                self.assertEqual(binding.binding_version, 3)
                 self.assertEqual(Path(str(binding.codex_home)), fixture.codex_home)
 
                 self.assertRegex(binding.codex_sha256, r"^[0-9a-f]{64}$")
                 self.assertEqual(binding.codex_sha256, native_digest(fixture.codex))
                 self.assertEqual(binding.codex_macho_arch, host_native_arch())
+                self.assertEqual(binding.codex_code_mode_host, fixture.code_mode_host)
+                self.assertEqual(
+                    binding.codex_code_mode_host_sha256,
+                    native_digest(fixture.code_mode_host),
+                )
                 self.assertEqual(binding.codex_managed_by, "direct")
                 self.assertIsNone(binding.codex_managed_package_root)
                 self.assertIsNone(binding.codex_managed_package_version)
@@ -2248,7 +2316,7 @@ class StaticContractTests(unittest.TestCase):
                     assert refresh is not None
                     refresh(fixture.routines_tuple, command_runner=fixture.commands)
                 binding = cutover.read_runtime_binding(fixture.runner_installed)
-                self.assertEqual(binding.binding_version, 2)
+                self.assertEqual(binding.binding_version, 3)
                 self.assertEqual(binding.uid, os.getuid())
                 self.assertEqual(binding.home, fixture.home)
                 self.assertEqual(binding.repository, fixture.working_directory)
@@ -2400,7 +2468,7 @@ class StaticContractTests(unittest.TestCase):
                     {"wrapped-consistent"},
                 )
 
-    def test_legacy_v1_binding_rolls_back_and_refresh_upgrades_to_v2(self) -> None:
+    def test_legacy_v1_binding_rolls_back_and_refresh_upgrades_to_v3(self) -> None:
         def legacy_binding(fixture: CutoverFixture) -> dict[str, object]:
             return {
                 "uid": os.getuid(),
@@ -2486,7 +2554,7 @@ class StaticContractTests(unittest.TestCase):
                 ):
                     refresh(fixture.routines_tuple, command_runner=fixture.commands)
                 binding = cutover.read_runtime_binding(fixture.runner_installed)
-                self.assertEqual(binding.binding_version, 2)
+                self.assertEqual(binding.binding_version, 3)
                 self.assertRegex(binding.codex_sha256, r"^[0-9a-f]{64}$")
                 self.assertEqual(binding.codex_macho_arch, host_native_arch())
                 self.assertEqual(fixture.marker.read_bytes(), marker_before)
@@ -2513,7 +2581,10 @@ class StaticContractTests(unittest.TestCase):
     ) -> None:
         def legacy_v2_binding(fixture: CutoverFixture) -> dict[str, object]:
             payload = fixture.binding_payload()
+            payload["binding_version"] = 2
             payload.pop("codex_home")
+            payload.pop("codex_code_mode_host")
+            payload.pop("codex_code_mode_host_sha256")
             return payload
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2587,6 +2658,46 @@ class StaticContractTests(unittest.TestCase):
                     binding_line[len(b"# TICKER-RUNTIME-V1 ") :].decode("utf-8")
                 )
                 self.assertEqual(payload["codex_home"], str(fixture.codex_home))
+
+    def test_v2_native_digest_drift_fails_before_refresh_for_direct_and_npm(
+        self,
+    ) -> None:
+        for manager in ("direct", "npm"):
+            with self.subTest(manager=manager), tempfile.TemporaryDirectory() as directory:
+                with CutoverFixture(Path(directory)) as fixture:
+                    payload = fixture.binding_payload()
+                    payload["binding_version"] = 2
+                    payload.pop("codex_code_mode_host")
+                    payload.pop("codex_code_mode_host_sha256")
+                    payload["codex_managed_by"] = manager
+                    if manager == "npm":
+                        payload["codex_managed_package_root"] = str(
+                            fixture.root / "npm package"
+                        )
+                        payload["codex_managed_package_version"] = "0.147.0"
+                    fixture.runner_installed.write_bytes(
+                        bind_generated_runner(
+                            fixture.runner_source.read_bytes(),
+                            payload,
+                        )
+                    )
+                    fixture.runner_installed.chmod(0o755)
+                    installed_before = fixture.runner_installed.read_bytes()
+                    fixture.codex.write_bytes(
+                        fixture.codex.read_bytes() + b"valid-native-digest-drift"
+                    )
+                    fixture.codex.chmod(0o755)
+
+                    with self.assertRaisesRegex(
+                        cutover.CutoverError,
+                        "bound Codex native identity changed",
+                    ):
+                        cutover.prepare_codex_compensation()
+
+                    self.assertEqual(
+                        fixture.runner_installed.read_bytes(),
+                        installed_before,
+                    )
 
     def test_gitignore_blocks_local_env_files_and_allows_examples(self) -> None:
         for candidate in (".env", "nested/.env.local"):
@@ -4466,7 +4577,7 @@ class TransactionTests(unittest.TestCase):
                 self.assertEqual(fixture.marker.read_bytes(), cutover.MARKER_PAYLOAD)
                 self.assertEqual(set(fixture.selected_enabled().values()), {False})
                 binding = cutover.read_runtime_binding(fixture.runner_installed)
-                self.assertEqual(binding.binding_version, 2)
+                self.assertEqual(binding.binding_version, 3)
                 self.assertEqual(binding.uid, os.getuid())
                 self.assertEqual(binding.home, fixture.home)
                 self.assertEqual(binding.repository, fixture.working_directory)
@@ -4476,6 +4587,11 @@ class TransactionTests(unittest.TestCase):
                 self.assertEqual(binding.model, "gpt-5.6-sol")
                 self.assertEqual(binding.codex_sha256, native_digest(fixture.codex))
                 self.assertEqual(binding.codex_macho_arch, host_native_arch())
+                self.assertEqual(binding.codex_code_mode_host, fixture.code_mode_host)
+                self.assertEqual(
+                    binding.codex_code_mode_host_sha256,
+                    native_digest(fixture.code_mode_host),
+                )
                 self.assertEqual(binding.codex_managed_package_root, None)
                 self.assertEqual(binding.codex_managed_package_version, None)
                 self.assertEqual(binding.codex_managed_by, "direct")

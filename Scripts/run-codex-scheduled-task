@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 
 RUNTIME_BINDING_PREFIX = b"# TICKER-RUNTIME-V1 "
-RUNTIME_BINDING_VERSION = 2
+RUNTIME_BINDING_VERSION = 3
 RUNTIME_MODEL = "gpt-5.6-sol"
 RUNTIME_REASONING_EFFORT = "xhigh"
 TRUSTED_TZ = "America/New_York"
@@ -134,6 +134,8 @@ class RuntimeBinding:
     codex_macho_arch: Optional[str]
     codex_managed_package_root: Optional[Path]
     codex_managed_package_version: Optional[str]
+    codex_code_mode_host: Optional[Path]
+    codex_code_mode_host_sha256: Optional[str]
     codex_managed_by: str
 
     @classmethod
@@ -168,13 +170,19 @@ class RuntimeBinding:
             "codex_managed_package_version",
             "codex_managed_by",
         }
+        v3_keys = v2_keys | {
+            "codex_code_mode_host",
+            "codex_code_mode_host_sha256",
+        }
         legacy_v2_keys = v2_keys - {"codex_home"}
         if set(value) == legacy_keys:
             version = 1
         elif (
             set(value) in (legacy_v2_keys, v2_keys)
-            and value.get("binding_version") == RUNTIME_BINDING_VERSION
+            and value.get("binding_version") == 2
         ):
+            version = 2
+        elif set(value) == v3_keys and value.get("binding_version") == RUNTIME_BINDING_VERSION:
             version = RUNTIME_BINDING_VERSION
         else:
             raise ValueError("runtime binding keys are invalid")
@@ -228,6 +236,8 @@ class RuntimeBinding:
             digest = None
             arch = None
             package_version = None
+            code_mode_host = None
+            code_mode_host_digest = None
         else:
             raw_roots = value["skill_roots"]
             if not isinstance(raw_roots, dict) or set(raw_roots) != set(TASK_IDS):
@@ -248,8 +258,37 @@ class RuntimeBinding:
             arch = value["codex_macho_arch"]
             if arch not in {"arm64", "x86_64"}:
                 raise ValueError("runtime binding Codex architecture is invalid")
+            if version >= 3:
+                raw_code_mode_host = value["codex_code_mode_host"]
+                if (
+                    not isinstance(raw_code_mode_host, str)
+                    or not raw_code_mode_host
+                    or CONTROL_CHARACTER_RE.search(raw_code_mode_host)
+                    or ":" in raw_code_mode_host
+                    or not Path(raw_code_mode_host).is_absolute()
+                ):
+                    raise ValueError(
+                        "runtime binding Codex code-mode host must be an absolute path"
+                    )
+                code_mode_host = Path(raw_code_mode_host)
+                code_mode_host_digest = value["codex_code_mode_host_sha256"]
+                if (
+                    not isinstance(code_mode_host_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", code_mode_host_digest) is None
+                ):
+                    raise ValueError(
+                        "runtime binding Codex code-mode host digest is invalid"
+                    )
+            else:
+                code_mode_host = None
+                code_mode_host_digest = None
             if manager == "npm":
-                if not isinstance(package_version, str) or not package_version:
+                if (
+                    not isinstance(package_version, str)
+                    or not package_version
+                    or CONTROL_CHARACTER_RE.search(package_version)
+                    or ":" in package_version
+                ):
                     raise ValueError("runtime binding package version is invalid")
             elif package_root is not None or package_version is not None:
                 raise ValueError("direct runtime binding contains package metadata")
@@ -266,6 +305,8 @@ class RuntimeBinding:
             skill_roots=skill_roots,
             codex_sha256=digest,
             codex_macho_arch=arch,
+            codex_code_mode_host=code_mode_host,
+            codex_code_mode_host_sha256=code_mode_host_digest,
             codex_managed_package_root=package_root,
             codex_managed_package_version=package_version,
             codex_managed_by=manager,
@@ -355,6 +396,8 @@ def _open_trusted_directory_chain(
         | getattr(os, "O_NOFOLLOW", 0)
     )
     descriptor: Optional[int] = None
+    child: Optional[int] = None
+    previous: Optional[int] = None
     try:
         descriptor = os.open(path.anchor or os.sep, flags)
         _validate_open_directory(
@@ -366,30 +409,35 @@ def _open_trusted_directory_chain(
         current = Path(path.anchor)
         for component in path.parts[1:]:
             child = os.open(component, flags, dir_fd=descriptor)
-            try:
-                current /= component
-                _validate_open_directory(
-                    child,
-                    uid,
-                    f"{description} component {current}",
-                    owner=owner and current == path,
-                )
-            except BaseException:
-                os.close(child)
-                raise
-            os.close(descriptor)
+            current /= component
+            _validate_open_directory(
+                child,
+                uid,
+                f"{description} component {current}",
+                owner=owner and current == path,
+            )
+            previous = descriptor
             descriptor = child
+            child = None
+            os.close(previous)
+            previous = None
         if descriptor is None:
             raise ValueError(f"cannot open {description}")
-        return descriptor
-    except ValueError:
-        if descriptor is not None:
-            os.close(descriptor)
-        raise
+        result = descriptor
+        descriptor = None
+        return result
     except OSError as error:
-        if descriptor is not None:
-            os.close(descriptor)
         raise ValueError(f"cannot open {description}") from error
+    finally:
+        seen: set[int] = set()
+        for open_descriptor in (child, previous, descriptor):
+            if open_descriptor is None or open_descriptor in seen:
+                continue
+            seen.add(open_descriptor)
+            try:
+                os.close(open_descriptor)
+            except OSError:
+                pass
 
 
 def _validate_regular_at(
@@ -1230,13 +1278,21 @@ def _package_details() -> Tuple[str, str]:
 def _validate_package_identity(
     package_root: Path,
     bound_codex: Path,
+    bound_code_mode_host: Path,
     expected_digest: Optional[str],
+    expected_code_mode_host_digest: Optional[str],
     expected_version: Optional[str] = None,
 ) -> None:
     _validate_directory_chain(package_root, os.getuid(), "Codex package root", owner=True)
     root_metadata = _read_package_metadata(package_root / "package.json", "Codex package metadata")
     version = root_metadata.get("version")
-    if root_metadata.get("name") != "@openai/codex" or not isinstance(version, str) or not version:
+    if (
+        root_metadata.get("name") != "@openai/codex"
+        or not isinstance(version, str)
+        or not version
+        or CONTROL_CHARACTER_RE.search(version)
+        or ":" in version
+    ):
         raise ValueError("Codex package metadata identity is invalid")
     if expected_version is not None and version != expected_version:
         raise ValueError("Codex package version changed")
@@ -1284,26 +1340,30 @@ def _validate_package_identity(
     if stat.S_IMODE(entrypoint.stat().st_mode) & 0o111 == 0:
         raise ValueError("Codex package entrypoint is not executable")
     native = platform_package / "vendor" / vendor_target / "bin" / "codex"
+    code_mode_host = native.with_name("codex-code-mode-host")
     _validate_directory_chain(native.parent, os.getuid(), "Codex native vendor path", owner=False)
-    if native != bound_codex:
-        raise ValueError("bound Codex path is outside the official package topology")
-    if expected_digest is None:
-        raise ValueError("npm Codex binding has no digest")
+    if native != bound_codex or code_mode_host != bound_code_mode_host:
+        raise ValueError("bound Codex paths are outside the official package topology")
+    if expected_digest is None or expected_code_mode_host_digest is None:
+        raise ValueError("npm Codex binding has incomplete native digests")
 
-def _open_bound_codex(binding: RuntimeBinding) -> Tuple[int, str, str]:
-    if not binding.codex.is_absolute():
-        raise ValueError("bound Codex path is not absolute")
-    _validate_directory_chain(binding.codex.parent, os.getuid(), "bound Codex parent", owner=False)
-    parent = os.open(
-        binding.codex.parent,
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
+def _open_bound_native(
+    path: Path,
+    binding: RuntimeBinding,
+    expected_digest: Optional[str],
+    description: str,
+) -> Tuple[int, str, str]:
+    if not path.is_absolute():
+        raise ValueError(f"{description} path is not absolute")
+    parent = _open_trusted_directory_chain(
+        path.parent,
+        binding.uid,
+        f"{description} parent",
+        owner=False,
     )
     try:
         descriptor = os.open(
-            binding.codex.name,
+            path.name,
             os.O_RDONLY
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0),
@@ -1312,28 +1372,160 @@ def _open_bound_codex(binding: RuntimeBinding) -> Tuple[int, str, str]:
     finally:
         os.close(parent)
     try:
-        payload, arch, digest = _native_bytes_and_identity(descriptor)
-        if binding.binding_version >= RUNTIME_BINDING_VERSION:
-            if digest != binding.codex_sha256 or arch != binding.codex_macho_arch:
-                raise ValueError("bound Codex native identity changed")
-            if binding.codex_managed_by == "npm":
-                if binding.codex_managed_package_root is None:
-                    raise ValueError("npm Codex binding has no package root")
-                _validate_package_identity(
-                    binding.codex_managed_package_root,
-                    binding.codex,
-                    binding.codex_sha256,
-                    binding.codex_managed_package_version,
-                )
-            elif binding.codex_managed_package_root is not None:
-                raise ValueError("direct Codex binding contains package metadata")
+        _payload, arch, digest = _native_bytes_and_identity(descriptor)
+        if expected_digest is None or digest != expected_digest:
+            raise ValueError(f"{description} identity changed")
+        if arch != binding.codex_macho_arch:
+            raise ValueError(f"{description} architecture changed")
         return descriptor, arch, digest
     except BaseException:
         os.close(descriptor)
         raise
 
 
-def _materialize_validated_codex(binding: RuntimeBinding, descriptor: int) -> Path:
+def _open_bound_codex(binding: RuntimeBinding) -> Tuple[int, int, str, str]:
+    if (
+        binding.binding_version < RUNTIME_BINDING_VERSION
+        or binding.codex_code_mode_host is None
+    ):
+        raise ValueError("runtime binding lacks the Codex code-mode host identity")
+    descriptor, arch, digest = _open_bound_native(
+        binding.codex,
+        binding,
+        binding.codex_sha256,
+        "bound Codex",
+    )
+    code_mode_descriptor: Optional[int] = None
+    try:
+        code_mode_descriptor, code_mode_arch, _code_mode_digest = _open_bound_native(
+            binding.codex_code_mode_host,
+            binding,
+            binding.codex_code_mode_host_sha256,
+            "bound Codex code-mode host",
+        )
+        if code_mode_arch != arch:
+            raise ValueError("Codex native executables have different architectures")
+        if binding.codex_managed_by == "npm":
+            if binding.codex_managed_package_root is None:
+                raise ValueError("npm Codex binding has no package root")
+            _validate_package_identity(
+                binding.codex_managed_package_root,
+                binding.codex,
+                binding.codex_code_mode_host,
+                binding.codex_sha256,
+                binding.codex_code_mode_host_sha256,
+                binding.codex_managed_package_version,
+            )
+        elif binding.codex_managed_package_root is not None:
+            raise ValueError("direct Codex binding contains package metadata")
+        return descriptor, code_mode_descriptor, arch, digest
+    except BaseException:
+        os.close(descriptor)
+        if code_mode_descriptor is not None:
+            os.close(code_mode_descriptor)
+        raise
+
+
+def _read_validated_executable(
+    descriptor: int,
+    binding: RuntimeBinding,
+    expected_digest: Optional[str],
+    description: str,
+) -> bytes:
+    metadata = os.fstat(descriptor)
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != binding.uid
+        or mode & 0o022
+        or mode & 0o111 == 0
+        or metadata.st_size < 0
+    ):
+        raise ValueError(f"{description} descriptor is not a validated executable")
+    payload = bytearray()
+    offset = 0
+    while offset < metadata.st_size:
+        chunk = os.pread(
+            descriptor,
+            min(1024 * 1024, metadata.st_size - offset),
+            offset,
+        )
+        if not chunk:
+            raise ValueError(f"{description} changed while being copied")
+        payload.extend(chunk)
+        offset += len(chunk)
+    if expected_digest is None or hashlib.sha256(payload).hexdigest() != expected_digest:
+        raise ValueError(f"{description} identity changed while being copied")
+    return bytes(payload)
+
+
+def _write_private_executable(
+    directory_descriptor: int,
+    name: str,
+    payload: bytes,
+    binding: RuntimeBinding,
+) -> None:
+    descriptor = os.open(
+        name,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o700,
+        dir_fd=directory_descriptor,
+    )
+    try:
+        os.fchmod(descriptor, 0o700)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError(f"{name} private-copy write made no progress")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+    read_descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_descriptor,
+    )
+    try:
+        metadata = os.fstat(read_descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != binding.uid
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_size != len(payload)
+        ):
+            raise ValueError(f"{name} private copy metadata changed")
+        readback = bytearray()
+        offset = 0
+        while offset < len(payload):
+            chunk = os.pread(
+                read_descriptor,
+                min(1024 * 1024, len(payload) - offset),
+                offset,
+            )
+            if not chunk:
+                raise ValueError(f"{name} private copy changed while being read")
+            readback.extend(chunk)
+            offset += len(chunk)
+        if bytes(readback) != payload:
+            raise ValueError(f"{name} private copy differs from validated bytes")
+    finally:
+        os.close(read_descriptor)
+
+
+def _materialize_validated_codex(
+    binding: RuntimeBinding,
+    descriptor: int,
+    code_mode_descriptor: int,
+) -> Path:
     staging_bin = binding.home / ".local" / "bin"
     _validate_directory_chain(
         staging_bin,
@@ -1341,126 +1533,82 @@ def _materialize_validated_codex(binding: RuntimeBinding, descriptor: int) -> Pa
         "Codex private-copy directory",
         owner=True,
     )
+    codex_payload = _read_validated_executable(
+        descriptor,
+        binding,
+        binding.codex_sha256,
+        "bound Codex",
+    )
+    host_payload = _read_validated_executable(
+        code_mode_descriptor,
+        binding,
+        binding.codex_code_mode_host_sha256,
+        "bound Codex code-mode host",
+    )
     parent_descriptor = _open_trusted_directory_chain(
         staging_bin,
         binding.uid,
         "Codex private-copy directory",
         owner=True,
     )
-    private_descriptor: Optional[int] = None
-    private_name: Optional[str] = None
+    private_directory_descriptor: Optional[int] = None
+    private_directory_name: Optional[str] = None
     try:
-        metadata = os.fstat(descriptor)
-        mode = stat.S_IMODE(metadata.st_mode)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != binding.uid
-            or mode & 0o022
-            or mode & 0o111 == 0
-        ):
-            raise ValueError("bound Codex descriptor is not a validated executable")
-        if metadata.st_size < 0:
-            raise ValueError("bound Codex descriptor size is invalid")
-
-        chunks = []
-        offset = 0
-        while offset < metadata.st_size:
-            chunk = os.pread(
-                descriptor,
-                min(1024 * 1024, metadata.st_size - offset),
-                offset,
-            )
-            if not chunk:
-                raise ValueError("bound Codex changed while being copied")
-            chunks.append(chunk)
-            offset += len(chunk)
-        payload = b"".join(chunks)
-        if binding.codex_sha256 is not None:
-            if hashlib.sha256(payload).hexdigest() != binding.codex_sha256:
-                raise ValueError("bound Codex native identity changed while being copied")
-
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
         for _attempt in range(128):
             candidate = f".ticker-codex-{uuid.uuid4().hex}"
             try:
-                private_descriptor = os.open(
-                    candidate,
-                    flags,
-                    0o700,
-                    dir_fd=parent_descriptor,
-                )
+                os.mkdir(candidate, 0o700, dir_fd=parent_descriptor)
             except FileExistsError:
                 continue
-            private_name = candidate
+            private_directory_name = candidate
             break
-        if private_descriptor is None or private_name is None:
-            raise OSError("cannot create a unique Codex private copy")
-
-        os.fchmod(private_descriptor, 0o700)
-        offset = 0
-        while offset < len(payload):
-            written = os.write(private_descriptor, payload[offset:])
-            if written <= 0:
-                raise OSError("Codex private-copy write made no progress")
-            offset += written
-        os.fsync(private_descriptor)
-        os.close(private_descriptor)
-        private_descriptor = None
-
-        read_descriptor: Optional[int] = None
-        try:
-            read_descriptor = os.open(
-                private_name,
-                os.O_RDONLY
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=parent_descriptor,
-            )
-            read_metadata = os.fstat(read_descriptor)
-            read_mode = stat.S_IMODE(read_metadata.st_mode)
-            if (
-                not stat.S_ISREG(read_metadata.st_mode)
-                or read_metadata.st_uid != binding.uid
-                or read_mode != 0o700
-                or read_metadata.st_size != len(payload)
-            ):
-                raise ValueError("Codex private copy metadata changed")
-            readback = bytearray()
-            offset = 0
-            while offset < len(payload):
-                chunk = os.pread(
-                    read_descriptor,
-                    min(1024 * 1024, len(payload) - offset),
-                    offset,
-                )
-                if not chunk:
-                    raise ValueError("Codex private copy changed while being read")
-                readback.extend(chunk)
-                offset += len(chunk)
-            if bytes(readback) != payload:
-                raise ValueError("Codex private copy readback differs from validated bytes")
-        finally:
-            if read_descriptor is not None:
-                os.close(read_descriptor)
-
+        if private_directory_name is None:
+            raise OSError("cannot create a unique Codex private bundle")
+        private_directory_descriptor = os.open(
+            private_directory_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        private_metadata = os.fstat(private_directory_descriptor)
+        if (
+            not stat.S_ISDIR(private_metadata.st_mode)
+            or private_metadata.st_uid != binding.uid
+            or stat.S_IMODE(private_metadata.st_mode) != 0o700
+        ):
+            raise ValueError("Codex private bundle metadata changed")
+        _write_private_executable(
+            private_directory_descriptor,
+            "codex-code-mode-host",
+            host_payload,
+            binding,
+        )
+        _write_private_executable(
+            private_directory_descriptor,
+            "codex",
+            codex_payload,
+            binding,
+        )
+        os.fsync(private_directory_descriptor)
         os.fsync(parent_descriptor)
-        return staging_bin / private_name
+        return staging_bin / private_directory_name / "codex"
     except BaseException as primary_error:
         cleanup_errors: list[OSError] = []
-        if private_descriptor is not None:
+        if private_directory_descriptor is not None:
+            for name in ("codex", "codex-code-mode-host"):
+                try:
+                    os.unlink(name, dir_fd=private_directory_descriptor)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    cleanup_errors.append(error)
+        if private_directory_name is not None:
             try:
-                os.close(private_descriptor)
-            except OSError as error:
-                cleanup_errors.append(error)
-        if private_name is not None:
-            try:
-                os.unlink(private_name, dir_fd=parent_descriptor)
+                os.rmdir(private_directory_name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
             except OSError as error:
                 cleanup_errors.append(error)
         if cleanup_errors:
@@ -1471,7 +1619,27 @@ def _materialize_validated_codex(binding: RuntimeBinding, descriptor: int) -> Pa
             ) from primary_error
         raise
     finally:
+        if private_directory_descriptor is not None:
+            os.close(private_directory_descriptor)
         os.close(parent_descriptor)
+
+
+def _remove_private_codex_bundle(private_codex: Path) -> None:
+    errors: list[OSError] = []
+    for path in (
+        private_codex,
+        private_codex.with_name("codex-code-mode-host"),
+    ):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            errors.append(error)
+    try:
+        private_codex.parent.rmdir()
+    except OSError as error:
+        errors.append(error)
+    if errors:
+        raise OSError("; ".join(str(error) for error in errors))
 
 
 def _forwarded_child_status(
@@ -1491,7 +1659,7 @@ def _forwarded_child_status(
         "-",
     ]
     try:
-        descriptor, _arch, _digest = _open_bound_codex(binding)
+        descriptor, code_mode_descriptor, _arch, _digest = _open_bound_codex(binding)
     except (OSError, ValueError) as error:
         return _error(f"cannot validate bound Codex: {error}", 69)
 
@@ -1520,7 +1688,11 @@ def _forwarded_child_status(
     execution_error: Optional[BaseException] = None
     cleanup_error: Optional[BaseException] = None
     try:
-        private_copy = _materialize_validated_codex(binding, descriptor)
+        private_copy = _materialize_validated_codex(
+            binding,
+            descriptor,
+            code_mode_descriptor,
+        )
         for signum in HANDLED_SIGNALS:
             previous[signum] = signal.getsignal(signum)
             signal.signal(signum, forward)
@@ -1558,14 +1730,15 @@ def _forwarded_child_status(
         finally:
             if private_copy is not None:
                 try:
-                    private_copy.unlink(missing_ok=True)
+                    _remove_private_codex_bundle(private_copy)
                 except OSError as error:
                     cleanup_error = error
-            try:
-                os.close(descriptor)
-            except OSError as error:
-                if cleanup_error is None:
-                    cleanup_error = error
+            for native_descriptor in (descriptor, code_mode_descriptor):
+                try:
+                    os.close(native_descriptor)
+                except OSError as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
 
     if cleanup_error is not None:
         if execution_error is not None:

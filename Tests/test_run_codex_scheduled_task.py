@@ -142,6 +142,7 @@ class RunnerHarness:
     working_directory: Path
     skill_roots: dict[str, Path]
     codex: Path
+    code_mode_host: Path
     controlled_path: str
     rogue_path: str
     loader: Path
@@ -210,7 +211,9 @@ class RunnerContractTests(unittest.TestCase):
         native_directory = root / "native codex"
         native_directory.mkdir()
         codex_path = native_directory / "codex"
+        code_mode_host = native_directory / "codex-code-mode-host"
         self.compile_native_codex(codex_path, codex_status)
+        self.compile_native_codex(code_mode_host, 0)
         controlled_path = f"{native_directory}:/usr/bin"
 
         rogue_directory = root / "rogue path"
@@ -315,7 +318,7 @@ class RunnerContractTests(unittest.TestCase):
         else:
             self.skipTest(f"unsupported host architecture: {machine}")
         binding = {
-            "binding_version": 2,
+            "binding_version": 3,
             "uid": os.getuid(),
             "home": str(home),
             "repository": str(working_directory),
@@ -327,6 +330,10 @@ class RunnerContractTests(unittest.TestCase):
             "skill_roots": {task_id: str(path) for task_id, path in skill_roots.items()},
             "codex_sha256": hashlib.sha256(codex_path.read_bytes()).hexdigest(),
             "codex_macho_arch": codex_arch,
+            "codex_code_mode_host": str(code_mode_host),
+            "codex_code_mode_host_sha256": hashlib.sha256(
+                code_mode_host.read_bytes()
+            ).hexdigest(),
             "codex_managed_package_root": None,
             "codex_managed_package_version": None,
             "codex_managed_by": "direct",
@@ -344,6 +351,7 @@ class RunnerContractTests(unittest.TestCase):
             working_directory=working_directory,
             skill_roots=skill_roots,
             codex=codex_path,
+            code_mode_host=code_mode_host,
             controlled_path=controlled_path,
             rogue_path=rogue_path,
             loader=loader_path,
@@ -412,13 +420,14 @@ class RunnerContractTests(unittest.TestCase):
 
     def binding_object(self, harness: RunnerHarness) -> SimpleNamespace:
         return SimpleNamespace(
-            binding_version=2,
+            binding_version=3,
             uid=os.getuid(),
             home=harness.home,
             codex_home=harness.codex_home,
             repository=harness.working_directory,
             python=Path(sys.executable),
             codex=harness.codex,
+            codex_code_mode_host=harness.code_mode_host,
             path=harness.controlled_path,
             model="gpt-5.6-sol",
             skill_roots={
@@ -427,6 +436,9 @@ class RunnerContractTests(unittest.TestCase):
             },
             codex_sha256=harness.binding["codex_sha256"],
             codex_macho_arch=harness.binding["codex_macho_arch"],
+            codex_code_mode_host_sha256=harness.binding[
+                "codex_code_mode_host_sha256"
+            ],
             codex_managed_package_root=None,
             codex_managed_package_version=None,
             codex_managed_by="direct",
@@ -762,6 +774,7 @@ class RunnerContractTests(unittest.TestCase):
                 / "bin"
                 / "codex"
             )
+            code_mode_host = native.with_name("codex-code-mode-host")
             entrypoint = package_root / "bin" / "codex.js"
             helper = package_root / "bin" / "codex-helper.js"
             native.parent.mkdir(parents=True)
@@ -796,12 +809,17 @@ class RunnerContractTests(unittest.TestCase):
             entrypoint.write_text("#!/usr/bin/env node\n", encoding="utf-8")
             helper.write_text("#!/usr/bin/env node\n", encoding="utf-8")
             native.write_bytes(harness.codex.read_bytes())
-            for executable in (entrypoint, helper, native):
+            code_mode_host.write_bytes(harness.code_mode_host.read_bytes())
+            for executable in (entrypoint, helper, native, code_mode_host):
                 executable.chmod(0o755)
 
             binding = self.binding_object(harness)
             binding.codex = native
             binding.codex_sha256 = hashlib.sha256(native.read_bytes()).hexdigest()
+            binding.codex_code_mode_host = code_mode_host
+            binding.codex_code_mode_host_sha256 = hashlib.sha256(
+                code_mode_host.read_bytes()
+            ).hexdigest()
             binding.codex_managed_package_root = package_root
             binding.codex_managed_package_version = package_version
             binding.codex_managed_by = "npm"
@@ -810,7 +828,10 @@ class RunnerContractTests(unittest.TestCase):
                 module._validate_package_identity(
                     package_root,
                     binding.codex,
+                    binding.codex_code_mode_host,
                     binding.codex_sha256,
+                    binding.codex_code_mode_host_sha256,
+                    package_version,
                 )
             )
 
@@ -1051,7 +1072,7 @@ class RunnerContractTests(unittest.TestCase):
                     self.assertEqual(result, 69)
                     popen.assert_not_called()
 
-    def test_materialize_validated_codex_copies_exact_fd_bytes_after_path_swap(
+    def test_materialize_validated_codex_copies_command_host_into_private_bundle(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1065,12 +1086,18 @@ class RunnerContractTests(unittest.TestCase):
                 path.chmod(0o700)
             binding.home = staging_home
 
-            original = harness.codex.read_bytes()
-            source = harness.root / "bound codex source"
-            source.write_bytes(original)
-            source.chmod(0o755)
+            codex_bytes = harness.codex.read_bytes()
+            host_bytes = b"validated code-mode host bytes\n"
+            binding.codex_code_mode_host_sha256 = hashlib.sha256(host_bytes).hexdigest()
+            codex_source = harness.root / "bound codex source"
+            host_source = harness.root / "bound code-mode host source"
+            codex_source.write_bytes(codex_bytes)
+            host_source.write_bytes(host_bytes)
+            codex_source.chmod(0o755)
+            host_source.chmod(0o755)
             replacement = b"pathname replacement must not be copied\n"
-            source_fd = os.open(source, os.O_RDONLY)
+            codex_fd = os.open(codex_source, os.O_RDONLY)
+            host_fd = os.open(host_source, os.O_RDONLY)
             private_paths: list[Path] = []
             try:
                 materialize = getattr(
@@ -1080,40 +1107,53 @@ class RunnerContractTests(unittest.TestCase):
                 )
                 self.assertTrue(
                     callable(materialize),
-                    "RED contract missing _materialize_validated_codex(binding, fd)",
+                    "RED contract missing _materialize_validated_codex(binding, codex_fd, host_fd)",
                 )
                 assert callable(materialize)
-                os.lseek(source_fd, len(original) // 2, os.SEEK_SET)
-                source.unlink()
-                source.write_bytes(replacement)
-                source.chmod(0o755)
-                current_position = os.lseek(source_fd, 0, os.SEEK_CUR)
+                os.lseek(codex_fd, len(codex_bytes) // 2, os.SEEK_SET)
+                codex_source.unlink()
+                codex_source.write_bytes(replacement)
+                codex_source.chmod(0o755)
+                codex_position = os.lseek(codex_fd, 0, os.SEEK_CUR)
+                host_position = os.lseek(host_fd, 0, os.SEEK_CUR)
 
-                first = Path(materialize(binding, source_fd))
+                first = Path(materialize(binding, codex_fd, host_fd))
                 private_paths.append(first)
-                second = Path(materialize(binding, source_fd))
+                second = Path(materialize(binding, codex_fd, host_fd))
                 private_paths.append(second)
 
-                for private_copy in private_paths:
-                    self.assertEqual(private_copy.parent, staging_bin)
+                for private_codex in private_paths:
+                    private_host = private_codex.with_name("codex-code-mode-host")
+                    self.assertEqual(private_codex.name, "codex")
+                    self.assertEqual(private_codex.parent.parent, staging_bin)
                     self.assertEqual(
-                        stat.S_IMODE(private_copy.stat().st_mode),
+                        stat.S_IMODE(private_codex.parent.stat().st_mode),
                         0o700,
                     )
-                    self.assertEqual(private_copy.read_bytes(), original)
-                self.assertNotEqual(first, second)
-                self.assertEqual(
-                    os.lseek(source_fd, 0, os.SEEK_CUR),
-                    current_position,
-                )
-                self.assertEqual(source.read_bytes(), replacement)
+                    self.assertEqual(
+                        stat.S_IMODE(private_codex.stat().st_mode),
+                        0o700,
+                    )
+                    self.assertEqual(
+                        stat.S_IMODE(private_host.stat().st_mode),
+                        0o700,
+                    )
+                    self.assertEqual(private_codex.read_bytes(), codex_bytes)
+                    self.assertEqual(private_host.read_bytes(), host_bytes)
+                self.assertNotEqual(first.parent, second.parent)
+                self.assertEqual(os.lseek(codex_fd, 0, os.SEEK_CUR), codex_position)
+                self.assertEqual(os.lseek(host_fd, 0, os.SEEK_CUR), host_position)
+                self.assertEqual(codex_source.read_bytes(), replacement)
             finally:
-                try:
-                    os.close(source_fd)
-                except OSError:
-                    pass
-                for private_copy in private_paths:
-                    private_copy.unlink(missing_ok=True)
+                for descriptor in (codex_fd, host_fd):
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                for private_codex in private_paths:
+                    private_codex.with_name("codex-code-mode-host").unlink(missing_ok=True)
+                    private_codex.unlink(missing_ok=True)
+                    private_codex.parent.rmdir()
 
     def test_codex_executes_private_copy_after_path_swap_and_cleans_it(
         self,
@@ -1135,6 +1175,7 @@ class RunnerContractTests(unittest.TestCase):
             replacement.write_bytes(replacement_bytes)
             replacement.chmod(0o755)
             source_fd = os.open(harness.codex, os.O_RDONLY)
+            code_mode_fd = os.open(harness.code_mode_host, os.O_RDONLY)
             private_paths: list[Path] = []
             events: list[str] = []
 
@@ -1174,12 +1215,22 @@ class RunnerContractTests(unittest.TestCase):
                 assert isinstance(executable, str)
                 private_copy = Path(executable)
                 private_paths.append(private_copy)
-                self.assertEqual(private_copy.parent, staging_bin)
+                self.assertEqual(private_copy.name, "codex")
+                self.assertEqual(private_copy.parent.parent, staging_bin)
+                self.assertEqual(
+                    stat.S_IMODE(private_copy.parent.stat().st_mode),
+                    0o700,
+                )
                 self.assertEqual(
                     stat.S_IMODE(private_copy.stat().st_mode),
                     0o700,
                 )
                 self.assertEqual(private_copy.read_bytes(), original)
+                private_host = private_copy.with_name("codex-code-mode-host")
+                self.assertEqual(
+                    private_host.read_bytes(),
+                    harness.code_mode_host.read_bytes(),
+                )
                 os.replace(replacement, binding.codex)
                 self.assertEqual(private_copy.read_bytes(), original)
                 return Child()
@@ -1196,6 +1247,7 @@ class RunnerContractTests(unittest.TestCase):
                     "_open_bound_codex",
                     return_value=(
                         source_fd,
+                        code_mode_fd,
                         str(binding.codex_macho_arch),
                         str(binding.codex_sha256),
                     ),
@@ -1210,13 +1262,17 @@ class RunnerContractTests(unittest.TestCase):
                 self.assertEqual(binding.codex.read_bytes(), replacement_bytes)
                 self.assertTrue(private_paths)
                 self.assertFalse(private_paths[0].exists())
+                self.assertFalse(private_paths[0].parent.exists())
                 with self.assertRaises(OSError):
                     os.fstat(source_fd)
+                with self.assertRaises(OSError):
+                    os.fstat(code_mode_fd)
             finally:
-                try:
-                    os.close(source_fd)
-                except OSError:
-                    pass
+                for descriptor in (source_fd, code_mode_fd):
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
 
 
     def test_codex_spawn_failure_cleans_private_copy_and_closes_validated_fd(
@@ -1226,10 +1282,16 @@ class RunnerContractTests(unittest.TestCase):
             harness = self.make_harness(Path(directory))
             module = self.load_runner_module(harness)
             binding = self.binding_object(harness)
-            private_copy = harness.root / "private codex"
+            private_directory = harness.root / "private bundle"
+            private_directory.mkdir(mode=0o700)
+            private_copy = private_directory / "codex"
+            private_host = private_directory / "codex-code-mode-host"
             private_copy.write_bytes(b"validated private copy\n")
+            private_host.write_bytes(b"validated private host\n")
             private_copy.chmod(0o700)
+            private_host.chmod(0o700)
             source_fd = os.open(harness.codex, os.O_RDONLY)
+            code_mode_fd = os.open(harness.code_mode_host, os.O_RDONLY)
             environment = {
                 "HOME": str(harness.home),
                 "PATH": harness.controlled_path,
@@ -1266,6 +1328,7 @@ class RunnerContractTests(unittest.TestCase):
                     "_open_bound_codex",
                     return_value=(
                         source_fd,
+                        code_mode_fd,
                         binding.codex_macho_arch,
                         binding.codex_sha256,
                     ),
@@ -1288,13 +1351,17 @@ class RunnerContractTests(unittest.TestCase):
                 error.assert_called_once()
                 self.assertIn("cannot execute", error.call_args.args[0])
                 self.assertFalse(private_copy.exists())
+                self.assertFalse(private_directory.exists())
                 with self.assertRaises(OSError):
                     os.fstat(source_fd)
+                with self.assertRaises(OSError):
+                    os.fstat(code_mode_fd)
             finally:
-                try:
-                    os.close(source_fd)
-                except OSError:
-                    pass
+                for descriptor in (source_fd, code_mode_fd):
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
 
     def test_codex_cleanup_failure_returns_nonzero_and_closes_validated_fd(
         self,
@@ -1303,10 +1370,16 @@ class RunnerContractTests(unittest.TestCase):
             harness = self.make_harness(Path(directory))
             module = self.load_runner_module(harness)
             binding = self.binding_object(harness)
-            private_copy = harness.root / "private codex"
+            private_directory = harness.root / "private bundle"
+            private_directory.mkdir(mode=0o700)
+            private_copy = private_directory / "codex"
+            private_host = private_directory / "codex-code-mode-host"
             private_copy.write_bytes(b"validated private copy\n")
+            private_host.write_bytes(b"validated private host\n")
             private_copy.chmod(0o700)
+            private_host.chmod(0o700)
             source_fd = os.open(harness.codex, os.O_RDONLY)
+            code_mode_fd = os.open(harness.code_mode_host, os.O_RDONLY)
             environment = {
                 "HOME": str(harness.home),
                 "PATH": harness.controlled_path,
@@ -1325,9 +1398,8 @@ class RunnerContractTests(unittest.TestCase):
                 self.assertTrue(private_copy.exists())
                 return Child()
 
-            def fail_unlink(path: Path, *, missing_ok: bool = False) -> None:
+            def fail_cleanup(path: Path) -> None:
                 self.assertEqual(path, private_copy)
-                self.assertTrue(missing_ok)
                 raise OSError("simulated private-copy cleanup failure")
 
             forward = getattr(module, "_forwarded_child_status", None)
@@ -1339,6 +1411,7 @@ class RunnerContractTests(unittest.TestCase):
                     "_open_bound_codex",
                     return_value=(
                         source_fd,
+                        code_mode_fd,
                         binding.codex_macho_arch,
                         binding.codex_sha256,
                     ),
@@ -1352,11 +1425,10 @@ class RunnerContractTests(unittest.TestCase):
                     "Popen",
                     side_effect=fake_popen,
                 ) as popen, mock.patch.object(
-                    Path,
-                    "unlink",
-                    autospec=True,
-                    side_effect=fail_unlink,
-                ) as unlink, mock.patch.object(
+                    module,
+                    "_remove_private_codex_bundle",
+                    side_effect=fail_cleanup,
+                ) as cleanup, mock.patch.object(
                     module,
                     "_error",
                     return_value=69,
@@ -1366,15 +1438,18 @@ class RunnerContractTests(unittest.TestCase):
                 error.assert_called_once()
                 self.assertIn("cleanup failed", error.call_args.args[0].lower())
                 popen.assert_called_once()
-                unlink.assert_called_once_with(private_copy, missing_ok=True)
+                cleanup.assert_called_once_with(private_copy)
                 self.assertTrue(private_copy.exists())
                 with self.assertRaises(OSError):
                     os.fstat(source_fd)
+                with self.assertRaises(OSError):
+                    os.fstat(code_mode_fd)
             finally:
-                try:
-                    os.close(source_fd)
-                except OSError:
-                    pass
+                for descriptor in (source_fd, code_mode_fd):
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
 
     def test_codex_materialization_and_internal_cleanup_failure_returns_combined_error(
         self,
@@ -1391,6 +1466,7 @@ class RunnerContractTests(unittest.TestCase):
             binding.home = staging_home
 
             source_fd = os.open(harness.codex, os.O_RDONLY)
+            code_mode_fd = os.open(harness.code_mode_host, os.O_RDONLY)
             environment = {
                 "HOME": str(binding.home),
                 "PATH": harness.controlled_path,
@@ -1405,7 +1481,7 @@ class RunnerContractTests(unittest.TestCase):
                 raise OSError("simulated materialization failure")
 
             def fail_unlink(path: str, *, dir_fd: int | None = None) -> None:
-                self.assertTrue(path.startswith(".ticker-codex-"))
+                self.assertIn(path, {"codex", "codex-code-mode-host"})
                 self.assertIsNotNone(dir_fd)
                 raise OSError("simulated internal unlink failure")
 
@@ -1422,6 +1498,7 @@ class RunnerContractTests(unittest.TestCase):
                     "_open_bound_codex",
                     return_value=(
                         source_fd,
+                        code_mode_fd,
                         binding.codex_macho_arch,
                         binding.codex_sha256,
                     ),
@@ -1453,18 +1530,22 @@ class RunnerContractTests(unittest.TestCase):
                 self.assertIn("simulated materialization failure", diagnostic)
                 self.assertIn("simulated internal unlink failure", diagnostic)
                 self.assertIn("cleanup failed", diagnostic.lower())
-                unlink.assert_called_once()
+                self.assertGreaterEqual(unlink.call_count, 1)
                 popen.assert_not_called()
                 self.assertEqual(len(private_descriptors), 1)
                 self.assertIn(private_descriptors[0], closed_descriptors)
                 self.assertIn(source_fd, closed_descriptors)
+                self.assertIn(code_mode_fd, closed_descriptors)
                 with self.assertRaises(OSError):
                     os.fstat(source_fd)
+                with self.assertRaises(OSError):
+                    os.fstat(code_mode_fd)
             finally:
-                try:
-                    os.close(source_fd)
-                except OSError:
-                    pass
+                for descriptor in (source_fd, code_mode_fd):
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
 
 
     def test_unsafe_staging_parent_blocks_spawn_and_closes_validated_fd(
@@ -1482,6 +1563,7 @@ class RunnerContractTests(unittest.TestCase):
             staging_bin.chmod(0o777)
             binding.home = staging_home
             source_fd = os.open(harness.codex, os.O_RDONLY)
+            code_mode_fd = os.open(harness.code_mode_host, os.O_RDONLY)
             environment = {
                 "HOME": str(staging_home),
                 "PATH": harness.controlled_path,
@@ -1496,6 +1578,7 @@ class RunnerContractTests(unittest.TestCase):
                     "_open_bound_codex",
                     return_value=(
                         source_fd,
+                        code_mode_fd,
                         binding.codex_macho_arch,
                         binding.codex_sha256,
                     ),
@@ -1514,11 +1597,14 @@ class RunnerContractTests(unittest.TestCase):
                 self.assertEqual(tuple(staging_bin.iterdir()), ())
                 with self.assertRaises(OSError):
                     os.fstat(source_fd)
+                with self.assertRaises(OSError):
+                    os.fstat(code_mode_fd)
             finally:
-                try:
-                    os.close(source_fd)
-                except OSError:
-                    pass
+                for descriptor in (source_fd, code_mode_fd):
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
 
     def test_all_six_tasks_pin_model_and_reasoning_effort_without_spawning_codex(
         self,
@@ -1832,7 +1918,7 @@ class RunnerContractTests(unittest.TestCase):
             self.assertFalse(harness.rogue_events.exists())
 
 
-    def test_v2_binding_uses_exact_bound_skill_root_and_missing_task_fails_before_spawn(
+    def test_v3_binding_uses_exact_bound_skill_root_and_missing_task_fails_before_spawn(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1878,7 +1964,27 @@ class RunnerContractTests(unittest.TestCase):
             self.assertFalse(harness.events.exists())
             self.assertFalse(harness.stdin.exists())
 
-    def test_legacy_v2_symlink_skill_root_resolves_safely_before_spawn(self) -> None:
+    def test_v2_binding_without_code_mode_host_identity_fails_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            binding = dict(harness.binding)
+            binding["binding_version"] = 2
+            binding.pop("codex_code_mode_host")
+            binding.pop("codex_code_mode_host_sha256")
+            harness.runner.write_bytes(render_test_runner(RUNNER.read_bytes(), binding))
+            harness.runner.chmod(0o755)
+
+            result = self.invoke(harness, "overdue-customer-issues-slack")
+
+            self.assertEqual(result.returncode, 69, result.stderr)
+            self.assertIn(
+                "runtime binding lacks the Codex code-mode host identity",
+                result.stderr,
+            )
+            self.assertFalse(harness.events.exists())
+            self.assertFalse(harness.stdin.exists())
+
+    def test_v3_symlink_skill_root_resolves_safely_before_spawn(self) -> None:
         for case in ("safe", "writable-parent", "wrong-target"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 harness = self.make_harness(Path(directory))
