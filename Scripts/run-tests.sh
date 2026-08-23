@@ -9,6 +9,9 @@ trap 'rm -rf "${BUILD_DIR}"' EXIT
 
 cd "${REPO_ROOT}"
 
+/usr/bin/python3 -m unittest discover -s Tests -p 'test_run_codex_scheduled_task.py'
+/usr/bin/python3 -m unittest discover -s Tests -p 'test_migrate_claude_routines_to_codex.py'
+
 swiftc -target arm64-apple-macosx13.0 -parse-as-library \
     -module-cache-path "${MODULE_CACHE_DIR}" \
     -D TICKER_TESTING \

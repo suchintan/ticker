@@ -388,6 +388,8 @@ private struct TickerCLI {
             try unwrap(arguments: remaining)
         case "doctor":
             try doctor(arguments: remaining)
+        case "login-item":
+            try loginItem(arguments: remaining)
         default:
             throw CLIError.usage("Unknown command '\(command)'. Run 'ticker --help' for usage.")
         }
@@ -462,7 +464,7 @@ private struct TickerCLI {
         var childEnvironment: [String: String]?
         var childWorkingDirectory: String?
         var wrapperRuntimeSnapshot: LaunchdRuntimeSnapshot?
-        var recordingAuthorized = true
+        var scheduledRun: (store: SQLiteRunStore, id: Int64)?
 
         if trigger == .manual {
             guard !wrapperVersionSeen else {
@@ -489,10 +491,12 @@ private struct TickerCLI {
             childEnvironment = SchedulerEnvironment.effectiveEnvironment(for: job)
             childWorkingDirectory = job.cwd
         } else {
+            var authorizedStore: SQLiteRunStore?
             do {
                 let store = try SQLiteRunStore(
                     path: configuredStorePath(scheduledWrapperInvocation: true)
                 )
+                authorizedStore = store
                 let launchdJobs = try LaunchdAdapter().discover()
                 let job = try LaunchdInvocationIdentity.resolve(
                     claimedJobID: jobID,
@@ -512,26 +516,57 @@ private struct TickerCLI {
                 switch status {
                 case .owned(let snapshot):
                     wrapperRuntimeSnapshot = snapshot
-                    do {
-                        try store.clearRecorderDiagnostic(claimedJobID: jobID)
-                    } catch {
-                        writeStandardError(
-                            "ticker: could not clear resolved recorder diagnostic: "
-                                + "\(error.localizedDescription)\n"
-                        )
-                    }
                 case .serviceNotPublished:
                     throw LaunchdRuntimeProbeError(
                         message: "launchd service exists but has not published this wrapper pid yet"
                     )
                 }
             } catch {
-                recordingAuthorized = false
-                let message = "scheduled wrapper ownership not proven for \(jobID); "
-                    + "executing without recording history: \(error.localizedDescription)"
-                writeStandardError("ticker: \(message)\n")
-                try? SQLiteRunStore(path: configuredStorePath(scheduledWrapperInvocation: true))
-                    .recordRecorderDiagnostic(claimedJobID: jobID, message: message)
+                let message = "scheduled wrapper authorization failed for \(jobID); "
+                    + "child was not executed: \(error.localizedDescription)"
+                if let authorizedStore {
+                    try? authorizedStore.recordRecorderDiagnostic(
+                        claimedJobID: jobID,
+                        message: message
+                    )
+                }
+                throw CLIError.operation(message)
+            }
+
+            guard let authorizedStore, let wrapperRuntimeSnapshot else {
+                throw CLIError.operation(
+                    "scheduled wrapper authorization failed for \(jobID); child was not executed"
+                )
+            }
+            do {
+                let runID = try authorizedStore.beginRun(
+                    jobID: jobID,
+                    startedAt: Date(),
+                    trigger: trigger,
+                    context: RunStartContext(
+                        processID: getpid(),
+                        bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+                        nativeExitStatusAtStart: wrapperRuntimeSnapshot.lastExitStatus?.raw,
+                        launchdRunCountAtStart: wrapperRuntimeSnapshot.runCount
+                    )
+                )
+                scheduledRun = (authorizedStore, runID)
+                do {
+                    try authorizedStore.clearRecorderDiagnostic(claimedJobID: jobID)
+                } catch {
+                    writeStandardError(
+                        "ticker: could not clear resolved recorder diagnostic: "
+                            + "\(error.localizedDescription)\n"
+                    )
+                }
+            } catch {
+                let message = "scheduled durable run-start failed for \(jobID); "
+                    + "child was not executed: \(error.localizedDescription)"
+                try? authorizedStore.recordRecorderDiagnostic(
+                    claimedJobID: jobID,
+                    message: message
+                )
+                throw CLIError.operation(message)
             }
         }
 
@@ -541,9 +576,7 @@ private struct TickerCLI {
             originalArgv0: originalArgv0,
             tailBytes: tailBytes,
             trigger: trigger,
-            scheduledWrapperInvocation: trigger == .scheduled,
-            recordingAuthorized: recordingAuthorized,
-            wrapperRuntimeSnapshot: wrapperRuntimeSnapshot,
+            scheduledRun: scheduledRun,
             environment: childEnvironment,
             currentDirectory: childWorkingDirectory
         )
@@ -555,37 +588,32 @@ private struct TickerCLI {
         originalArgv0: String?,
         tailBytes: Int,
         trigger: RunTrigger,
-        scheduledWrapperInvocation: Bool,
-        recordingAuthorized: Bool,
-        wrapperRuntimeSnapshot: LaunchdRuntimeSnapshot?,
+        scheduledRun: (store: SQLiteRunStore, id: Int64)?,
         environment: [String: String]?,
         currentDirectory: String?
     ) -> Never {
         let startedAt = Date()
-        var store: SQLiteRunStore?
-        var runID: Int64?
+        var store = scheduledRun?.store
+        var runID = scheduledRun?.id
 
-        if recordingAuthorized {
+        if trigger == .scheduled, scheduledRun == nil {
+            writeStandardError(
+                "ticker: scheduled durable run-start is missing for \(jobID); "
+                    + "child was not executed\n"
+            )
+            Darwin.exit(1)
+        }
+
+        if trigger == .manual {
             do {
-                let openedStore = try SQLiteRunStore(
-                    path: configuredStorePath(
-                        scheduledWrapperInvocation: scheduledWrapperInvocation
-                    )
-                )
+                let openedStore = try SQLiteRunStore(path: configuredStorePath())
                 store = openedStore
                 do {
                     runID = try openedStore.beginRun(
                         jobID: jobID,
                         startedAt: startedAt,
                         trigger: trigger,
-                        context: wrapperRuntimeSnapshot.map {
-                            RunStartContext(
-                                processID: getpid(),
-                                bootSessionID: RunExecutionEvidence.currentBootSessionID(),
-                                nativeExitStatusAtStart: $0.lastExitStatus?.raw,
-                                launchdRunCountAtStart: $0.runCount
-                            )
-                        }
+                        context: nil
                     )
                 } catch {
                     writeStandardError("ticker: could not record run start: \(error.localizedDescription)\n")
@@ -609,14 +637,19 @@ private struct TickerCLI {
             let messageData = Data(message.utf8)
             stderrTail.append(messageData)
             FileHandle.standardError.write(messageData)
-            finishRun(
+            let finalization = finishRun(
                 store: store,
                 runID: runID,
                 exitCode: 127,
                 stdoutTail: stdoutTail.string(),
                 stderrTail: stderrTail.string()
             )
-            Darwin.exit(127)
+            Darwin.exit(exitCodeAfterFinalization(
+                childExitCode: 127,
+                trigger: trigger,
+                jobID: jobID,
+                result: finalization
+            ))
         }
 
         let stdoutPipe = Pipe()
@@ -640,14 +673,19 @@ private struct TickerCLI {
             let messageData = Data(message.utf8)
             stderrTail.append(messageData)
             FileHandle.standardError.write(messageData)
-            finishRun(
+            let finalization = finishRun(
                 store: store,
                 runID: runID,
                 exitCode: 127,
                 stdoutTail: stdoutTail.string(),
                 stderrTail: stderrTail.string()
             )
-            Darwin.exit(127)
+            Darwin.exit(exitCodeAfterFinalization(
+                childExitCode: 127,
+                trigger: trigger,
+                jobID: jobID,
+                result: finalization
+            ))
         }
 
         try? stdoutPipe.fileHandleForWriting.close()
@@ -692,14 +730,19 @@ private struct TickerCLI {
         stderrForwarder.flush(timeout: postExitForwardTimeout)
 
         let exitCode = childExitCode(rawStatus)
-        finishRun(
+        let finalization = finishRun(
             store: store,
             runID: runID,
             exitCode: exitCode,
             stdoutTail: stdoutTail.string(),
             stderrTail: stderrTail.string()
         )
-        Darwin.exit(exitCode)
+        Darwin.exit(exitCodeAfterFinalization(
+            childExitCode: exitCode,
+            trigger: trigger,
+            jobID: jobID,
+            result: finalization
+        ))
     }
 
     private func list(arguments: [String]) throws {
@@ -1199,15 +1242,35 @@ private func drain(pipe: Pipe, forwarder: OutputForwarder, tail: TailBuffer) {
     }
 }
 
+// sysexits EX_IOERR: the child succeeded, but Ticker could not persist its result.
+private let scheduledRunFinalizationFailureExitCode: Int32 = 74
+
+private enum RunFinalizationResult {
+    case recorded
+    case unavailable
+    case failed(Error)
+
+    var failureDescription: String {
+        switch self {
+        case .recorded:
+            return ""
+        case .unavailable:
+            return "the durable run-start record is unavailable"
+        case .failed(let error):
+            return error.localizedDescription
+        }
+    }
+}
+
 private func finishRun(
     store: SQLiteRunStore?,
     runID: Int64?,
     exitCode: Int32,
     stdoutTail: String,
     stderrTail: String
-) {
+) -> RunFinalizationResult {
     guard let store = store, let runID = runID else {
-        return
+        return .unavailable
     }
     do {
         try store.finishRun(
@@ -1217,9 +1280,43 @@ private func finishRun(
             stderrTail: stderrTail,
             finishedAt: Date()
         )
+        return .recorded
     } catch {
-        writeStandardError("ticker: could not record run finish: \(error.localizedDescription)\n")
+        return .failed(error)
     }
+}
+
+private func exitCodeAfterFinalization(
+    childExitCode: Int32,
+    trigger: RunTrigger,
+    jobID: String,
+    result: RunFinalizationResult
+) -> Int32 {
+    if case .recorded = result {
+        return childExitCode
+    }
+    if trigger == .manual, case .unavailable = result {
+        return childExitCode
+    }
+    if trigger == .manual {
+        writeStandardError(
+            "ticker: could not record run finish: \(result.failureDescription)\n"
+        )
+        return childExitCode
+    }
+    if childExitCode != 0 {
+        writeStandardError(
+            "ticker: scheduled durable run-finish failed for \(jobID); "
+                + "preserving child exit \(childExitCode): \(result.failureDescription)\n"
+        )
+        return childExitCode
+    }
+    writeStandardError(
+        "ticker: scheduled durable run-finish failed for \(jobID); child exited 0; "
+            + "wrapper exiting \(scheduledRunFinalizationFailureExitCode): "
+            + "\(result.failureDescription)\n"
+    )
+    return scheduledRunFinalizationFailureExitCode
 }
 
 private func resolveExecutable(
@@ -1280,6 +1377,30 @@ private func writeStandardError(_ message: String) {
     FileHandle.standardError.write(Data(message.utf8))
 }
 
+private func runningExecutablePath() -> String {
+    var capacity = UInt32(PATH_MAX)
+    while capacity > 0 {
+        var buffer = [CChar](repeating: 0, count: Int(capacity))
+        var requiredCapacity = capacity
+        let status = buffer.withUnsafeMutableBufferPointer { pointer in
+            _NSGetExecutablePath(pointer.baseAddress, &requiredCapacity)
+        }
+        if status == 0 {
+            return String(cString: buffer)
+        }
+        guard requiredCapacity > capacity else { break }
+        capacity = requiredCapacity
+    }
+
+    return resolveExecutable(
+        CommandLine.arguments[0],
+        environment: ProcessInfo.processInfo.environment,
+        currentDirectory: FileManager.default.currentDirectoryPath
+    ) ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent(CommandLine.arguments[0])
+        .standardizedFileURL.path
+}
+
 do {
     try TickerCLI().run(arguments: Array(CommandLine.arguments.dropFirst()))
 } catch let error as CLIError {
@@ -1292,4 +1413,99 @@ do {
 } catch {
     writeStandardError("ticker: \(error.localizedDescription)\n")
     Darwin.exit(1)
+}
+
+/// `ticker login-item [status|enable|disable]`
+///
+/// Shares one implementation with the app's "Open at Login" menu toggle, so the
+/// CLI and the GUI can never disagree about whether Ticker starts at login.
+private func makeLoginItemController(bundlePath: String) -> LoginItemController {
+    #if TICKER_TESTING
+    let environment = ProcessInfo.processInfo.environment
+    if let testHome = environment["TICKER_TEST_LOGIN_ITEM_HOME"],
+       !testHome.isEmpty {
+        let testServiceState: LoginItemServiceState
+        switch environment["TICKER_TEST_LOGIN_ITEM_SERVICE_STATE"] {
+        case "enabled":
+            testServiceState = .enabled
+        case "requires-approval":
+            testServiceState = .requiresApproval
+        case "indeterminate":
+            testServiceState = .indeterminate
+        default:
+            testServiceState = .disabled
+        }
+        return LoginItemController(
+            bundlePath: bundlePath,
+            homeDirectory: URL(fileURLWithPath: testHome, isDirectory: true),
+            launchctl: { arguments in
+                if arguments.first == "print" {
+                    if environment["TICKER_TEST_LOGIN_ITEM_AGENT_STATE"] == "live" {
+                        return LoginItemCommandResult(
+                            status: 0,
+                            stdout: """
+                            gui/\(getuid())/com.suchintan.ticker.login = {
+                                state = running
+                                program = /Applications/Ticker.app/Contents/MacOS/Ticker
+                            }
+                            """
+                        )
+                    }
+                    return LoginItemCommandResult(
+                        status: 113,
+                        stderr: "Could not find service"
+                    )
+                }
+                return LoginItemCommandResult(status: -1, stderr: "unexpected test mutation")
+            },
+            serviceState: { testServiceState },
+            registerService: {},
+            unregisterService: {}
+        )
+    }
+    #endif
+    return LoginItemController(bundlePath: bundlePath)
+}
+
+private func loginItem(arguments: [String]) throws {
+    guard arguments.count <= 1 else {
+        throw CLIError.usage("login-item accepts no arguments or exactly one of status, enable, or disable")
+    }
+    let action = arguments.first ?? "status"
+    guard ["status", "enable", "disable"].contains(action) else {
+        throw CLIError.usage("login-item accepts no arguments or exactly one of status, enable, or disable")
+    }
+
+    let controller = makeLoginItemController(
+        bundlePath: LoginItemController.bundlePath(
+            enclosingHelperExecutableAt: runningExecutablePath()
+        )
+    )
+
+    let state: LoginItemState
+    switch action {
+    case "enable":
+        state = controller.enable()
+    case "disable":
+        state = controller.disable()
+    default:
+        state = controller.state()
+    }
+
+    switch state {
+    case .enabled(let mechanism):
+        print("enabled via \(mechanism.rawValue)")
+    case .disabled:
+        print("disabled")
+    case .requiresApproval:
+        print("requires approval — approve Ticker in System Settings › General › Login Items")
+    case .notInstalled(let running, let expected):
+        print("not installed: running from \(running), expected \(expected)")
+        if action != "status" {
+            throw CLIError.operation("could not change the login item")
+        }
+    case .failed(let reason):
+        print("failed: \(reason)")
+        throw CLIError.operation("could not change the login item")
+    }
 }

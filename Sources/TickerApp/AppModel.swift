@@ -56,6 +56,51 @@ struct SkipStormSummary: Hashable {
     }
 }
 
+enum JobHistoryLoadEvent: Equatable {
+    case requested
+    case succeeded
+    case failed(String)
+}
+
+enum JobHistoryLoadState: Equatable {
+    case idle
+    case loading
+    case loaded
+    case failed(String)
+
+    func reducing(_ event: JobHistoryLoadEvent) -> JobHistoryLoadState {
+        switch event {
+        case .requested:
+            return .loading
+        case .succeeded:
+            return .loaded
+        case .failed(let message):
+            return .failed(message)
+        }
+    }
+}
+
+struct JobHistoryLoadGenerationCoordinator {
+    private var latestGenerationByJobID: [String: Int] = [:]
+
+    mutating func begin(for jobID: String) -> Int {
+        let generation = (latestGenerationByJobID[jobID] ?? 0) + 1
+        latestGenerationByJobID[jobID] = generation
+        return generation
+    }
+
+    func eventIfCurrent(
+        _ event: JobHistoryLoadEvent,
+        for jobID: String,
+        generation: Int
+    ) -> JobHistoryLoadEvent? {
+        guard latestGenerationByJobID[jobID] == generation else {
+            return nil
+        }
+        return event
+    }
+}
+
 @MainActor
 final class AppBootstrap: ObservableObject {
     @Published private(set) var model: AppModel?
@@ -107,6 +152,7 @@ final class AppModel: ObservableObject {
     @Published var errors: [String] = []
     @Published private(set) var skipStorms: [String: SkipStormSummary] = [:]
     @Published private(set) var runsByJob: [String: [Run]] = [:]
+    @Published private(set) var historyLoadStates: [String: JobHistoryLoadState] = [:]
     @Published private(set) var recoveryStates: [String: JobRecoveryState] = [:]
     @Published private(set) var recoveryStateErrors: [String: String] = [:]
     @Published private(set) var actionMessages: [String: String] = [:]
@@ -118,6 +164,7 @@ final class AppModel: ObservableObject {
     private var refreshInProgress = false
     private var refreshPending = false
     private var runningProcesses: [String: Process] = [:]
+    private var historyLoadGenerations = JobHistoryLoadGenerationCoordinator()
     private var refreshTimer: Timer?
 
     init(
@@ -170,6 +217,7 @@ final class AppModel: ObservableObject {
             return
         }
         refreshInProgress = true
+        let historyJobIDs = Set(historyLoadStates.keys)
         workQueue.async { [weak self] in
             guard let self = self else {
                 return
@@ -219,6 +267,9 @@ final class AppModel: ObservableObject {
             let publishedHealth = latestHealth
             let publishedRecoveryStates = latestRecoveryStates
             let publishedRecoveryErrors = latestRecoveryErrors
+            let historyJobs = discovery.jobs
+                .filter { historyJobIDs.contains($0.id) }
+                .sorted { $0.id < $1.id }
             DispatchQueue.main.async {
                 self.jobs = discovery.jobs
                 self.skipStorms = summaries
@@ -230,6 +281,9 @@ final class AppModel: ObservableObject {
                 self.errors = publishedErrors
                 self.refreshInProgress = false
                 self.lastRefresh = Date()
+                for job in historyJobs {
+                    self.loadRuns(for: job)
+                }
                 if self.refreshPending {
                     self.refreshPending = false
                     self.refresh()
@@ -355,8 +409,14 @@ final class AppModel: ObservableObject {
         skipStorms[job.id]
     }
 
+    func historyLoadState(for job: Job) -> JobHistoryLoadState {
+        historyLoadStates[job.id] ?? .idle
+    }
+
     func loadRuns(for job: Job) {
         let jobID = job.id
+        let generation = historyLoadGenerations.begin(for: jobID)
+        historyLoadStates[jobID] = historyLoadState(for: job).reducing(.requested)
         workQueue.async { [weak self] in
             guard let self = self else {
                 return
@@ -364,11 +424,30 @@ final class AppModel: ObservableObject {
             do {
                 let runs = try self.store.runs(jobID: jobID, limit: 20)
                 DispatchQueue.main.async {
+                    guard let event = self.historyLoadGenerations.eventIfCurrent(
+                        .succeeded,
+                        for: jobID,
+                        generation: generation
+                    ) else {
+                        return
+                    }
                     self.runsByJob[jobID] = runs
+                    self.historyLoadStates[jobID] = self.historyLoadStates[jobID, default: .idle]
+                        .reducing(event)
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self.appendError("Could not load history for \(job.label): \(error.localizedDescription)")
+                    let message = error.localizedDescription
+                    guard let event = self.historyLoadGenerations.eventIfCurrent(
+                        .failed(message),
+                        for: jobID,
+                        generation: generation
+                    ) else {
+                        return
+                    }
+                    self.historyLoadStates[jobID] = self.historyLoadStates[jobID, default: .idle]
+                        .reducing(event)
+                    self.appendError("Could not load history for \(job.label): \(message)")
                 }
             }
         }

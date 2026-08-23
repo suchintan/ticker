@@ -1,0 +1,1811 @@
+#!/usr/bin/env python3
+"""Run one trusted Ticker scheduled task through the bound native Codex binary."""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime as dt
+import hashlib
+import json
+import os
+import platform
+import pwd
+import re
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
+
+
+RUNTIME_BINDING_PREFIX = b"# TICKER-RUNTIME-V1 "
+RUNTIME_BINDING_VERSION = 3
+RUNTIME_MODEL = "gpt-5.6-sol"
+RUNTIME_REASONING_EFFORT = "xhigh"
+TRUSTED_TZ = "America/New_York"
+CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f]")
+KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+MANAGER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+MACHO_MAGICS = {
+    b"\xfe\xed\xfa\xce",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+}
+ELF_MAGIC = b"\x7fELF"
+TASK_IDS = (
+    "daily-summary",
+    "daily-vitals-morning",
+    "linkedin-post-ideas",
+    "linkedin-post-ideas-sweeper",
+    "overdue-customer-issues-slack",
+    "team-progress-digest",
+)
+APPROVED_ENVIRONMENT_NAMES = frozenset(
+    {
+        "FATHOM_API_KEY",
+        "SLACK_USER_TOKEN",
+        "SLACK_BOT_TOKEN",
+        "SLACK_APP_TOKEN",
+        "LINEAR_API_KEY",
+        "HUBSPOT_ACCESS_TOKEN",
+        "PYLON_API_KEY",
+        "NOTION_API_KEY",
+        "DD_API_KEY",
+        "DD_APP_KEY",
+        "GOOGLE_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET",
+        "GOOGLE_REFRESH_TOKEN",
+        "SKYVERN_API_KEY",
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "PANGRAM_API_KEY",
+        "USER",
+        "USER_EMAIL",
+        "SLACK_FORCE_BOT",
+        "REPO_VALUE",
+        "DOTENV_DOUBLE",
+        "DOTENV_SINGLE",
+        "DOTENV_ESCAPED",
+        "DOTENV_COMMAND",
+    }
+)
+ENVIRONMENT_ALIASES = frozenset({"CINDER_SLACK_BOT_TOKEN", "CINDER_SLACK_APP_TOKEN"})
+HANDLED_SIGNALS = tuple(
+    getattr(signal, name)
+    for name in ("SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM")
+    if hasattr(signal, name)
+)
+
+
+TASKS: Mapping[str, Tuple[str, bool, str]] = {
+    "daily-summary": (
+        "daily-summary",
+        False,
+        "with no arguments",
+    ),
+    "daily-vitals-morning": (
+        "vitals-run-all",
+        False,
+        "with the exact argument morning",
+    ),
+    "linkedin-post-ideas": (
+        "linkedin-post-ideas",
+        False,
+        "with the exact integer argument 10 and exact run_context=scheduled-primary",
+    ),
+    "linkedin-post-ideas-sweeper": (
+        "linkedin-post-ideas",
+        False,
+        "with the exact integer argument 10 and exact run_context=scheduled-sweeper",
+    ),
+    "overdue-customer-issues-slack": (
+        "overdue-customer-issues-slack",
+        True,
+        "with no arguments",
+    ),
+    "team-progress-digest": (
+        "team-progress-digest",
+        False,
+        "with no arguments",
+    ),
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class RuntimeBinding:
+    binding_version: int
+    uid: int
+    home: Path
+    repository: Path
+    python: Path
+    codex: Path
+    codex_home: Path
+    path: str
+    model: str
+    skill_roots: Mapping[str, Path]
+    codex_sha256: Optional[str]
+    codex_macho_arch: Optional[str]
+    codex_managed_package_root: Optional[Path]
+    codex_managed_package_version: Optional[str]
+    codex_code_mode_host: Optional[Path]
+    codex_code_mode_host_sha256: Optional[str]
+    codex_managed_by: str
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> "RuntimeBinding":
+        if not isinstance(value, dict):
+            raise ValueError("runtime binding keys are invalid")
+        legacy_keys = {
+            "uid",
+            "home",
+            "repository",
+            "python",
+            "codex",
+            "path",
+            "model",
+            "codex_managed_package_root",
+            "codex_managed_by",
+        }
+        v2_keys = {
+            "binding_version",
+            "uid",
+            "home",
+            "repository",
+            "python",
+            "codex",
+            "codex_home",
+            "path",
+            "model",
+            "skill_roots",
+            "codex_sha256",
+            "codex_macho_arch",
+            "codex_managed_package_root",
+            "codex_managed_package_version",
+            "codex_managed_by",
+        }
+        v3_keys = v2_keys | {
+            "codex_code_mode_host",
+            "codex_code_mode_host_sha256",
+        }
+        legacy_v2_keys = v2_keys - {"codex_home"}
+        if set(value) == legacy_keys:
+            version = 1
+        elif (
+            set(value) in (legacy_v2_keys, v2_keys)
+            and value.get("binding_version") == 2
+        ):
+            version = 2
+        elif set(value) == v3_keys and value.get("binding_version") == RUNTIME_BINDING_VERSION:
+            version = RUNTIME_BINDING_VERSION
+        else:
+            raise ValueError("runtime binding keys are invalid")
+        uid = value["uid"]
+        if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
+            raise ValueError("runtime binding uid is invalid")
+        paths: Dict[str, Path] = {}
+        for key in ("home", "repository", "python", "codex"):
+            raw = value[key]
+            if not isinstance(raw, str) or not raw or CONTROL_CHARACTER_RE.search(raw):
+                raise ValueError(f"runtime binding {key} is invalid")
+            if ":" in raw or not Path(raw).is_absolute():
+                raise ValueError(f"runtime binding {key} must be an absolute path")
+            paths[key] = Path(raw)
+        if version == 1 or "codex_home" not in value:
+            codex_home = paths["home"] / ".codex"
+        else:
+            raw_codex_home = value["codex_home"]
+            if (
+                not isinstance(raw_codex_home, str)
+                or not raw_codex_home
+                or CONTROL_CHARACTER_RE.search(raw_codex_home)
+                or ":" in raw_codex_home
+                or not Path(raw_codex_home).is_absolute()
+            ):
+                raise ValueError("runtime binding codex_home must be an absolute path")
+            codex_home = Path(raw_codex_home)
+        path_value = value["path"]
+        if not isinstance(path_value, str) or not path_value or CONTROL_CHARACTER_RE.search(path_value):
+            raise ValueError("runtime binding PATH is invalid")
+        components = path_value.split(":")
+        if any(not component or not Path(component).is_absolute() for component in components):
+            raise ValueError("runtime binding PATH must contain absolute components")
+        if value["model"] != RUNTIME_MODEL:
+            raise ValueError("runtime binding model is invalid")
+        manager = value["codex_managed_by"]
+        if manager not in {"direct", "npm"}:
+            raise ValueError("runtime binding manager is invalid")
+        raw_package_root = value["codex_managed_package_root"]
+        if raw_package_root is None:
+            package_root = None
+        elif isinstance(raw_package_root, str) and raw_package_root and ":" not in raw_package_root:
+            package_root = Path(raw_package_root)
+            if not package_root.is_absolute():
+                raise ValueError("runtime binding package root must be absolute")
+        else:
+            raise ValueError("runtime binding package root is invalid")
+        package_version = value.get("codex_managed_package_version")
+        if version == 1:
+            skill_roots: Mapping[str, Path] = {}
+            digest = None
+            arch = None
+            package_version = None
+            code_mode_host = None
+            code_mode_host_digest = None
+        else:
+            raw_roots = value["skill_roots"]
+            if not isinstance(raw_roots, dict) or set(raw_roots) != set(TASK_IDS):
+                raise ValueError("runtime binding skill roots are invalid")
+            roots: Dict[str, Path] = {}
+            for task_id in TASK_IDS:
+                raw_root = raw_roots[task_id]
+                if not isinstance(raw_root, str) or not raw_root or ":" in raw_root:
+                    raise ValueError(f"runtime binding skill root is invalid: {task_id}")
+                root = Path(raw_root)
+                if not root.is_absolute():
+                    raise ValueError(f"runtime binding skill root is not absolute: {task_id}")
+                roots[task_id] = root
+            skill_roots = roots
+            digest = value["codex_sha256"]
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise ValueError("runtime binding Codex digest is invalid")
+            arch = value["codex_macho_arch"]
+            if arch not in {"arm64", "x86_64"}:
+                raise ValueError("runtime binding Codex architecture is invalid")
+            if version >= 3:
+                raw_code_mode_host = value["codex_code_mode_host"]
+                if (
+                    not isinstance(raw_code_mode_host, str)
+                    or not raw_code_mode_host
+                    or CONTROL_CHARACTER_RE.search(raw_code_mode_host)
+                    or ":" in raw_code_mode_host
+                    or not Path(raw_code_mode_host).is_absolute()
+                ):
+                    raise ValueError(
+                        "runtime binding Codex code-mode host must be an absolute path"
+                    )
+                code_mode_host = Path(raw_code_mode_host)
+                code_mode_host_digest = value["codex_code_mode_host_sha256"]
+                if (
+                    not isinstance(code_mode_host_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", code_mode_host_digest) is None
+                ):
+                    raise ValueError(
+                        "runtime binding Codex code-mode host digest is invalid"
+                    )
+            else:
+                code_mode_host = None
+                code_mode_host_digest = None
+            if manager == "npm":
+                if (
+                    not isinstance(package_version, str)
+                    or not package_version
+                    or CONTROL_CHARACTER_RE.search(package_version)
+                    or ":" in package_version
+                ):
+                    raise ValueError("runtime binding package version is invalid")
+            elif package_root is not None or package_version is not None:
+                raise ValueError("direct runtime binding contains package metadata")
+        return cls(
+            binding_version=version,
+            uid=uid,
+            home=paths["home"],
+            codex_home=codex_home,
+            repository=paths["repository"],
+            python=paths["python"],
+            codex=paths["codex"],
+            path=path_value,
+            model=value["model"],
+            skill_roots=skill_roots,
+            codex_sha256=digest,
+            codex_macho_arch=arch,
+            codex_code_mode_host=code_mode_host,
+            codex_code_mode_host_sha256=code_mode_host_digest,
+            codex_managed_package_root=package_root,
+            codex_managed_package_version=package_version,
+            codex_managed_by=manager,
+        )
+
+
+def _error(message: str, status: int) -> int:
+    print(message, file=sys.stderr)
+    return status
+
+
+def _validate_directory_chain(path: Path, uid: int, description: str, *, owner: bool) -> None:
+    if not path.is_absolute() or not path.exists():
+        raise ValueError(f"{description} is missing")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{description} is not trustworthy") from error
+    if resolved != path or not path.is_dir():
+        raise ValueError(f"{description} must be a direct directory")
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        metadata = current.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"{description} contains an unsafe boundary")
+        mode = stat.S_IMODE(metadata.st_mode)
+        if mode & 0o022 and (
+            metadata.st_uid != 0 or not mode & stat.S_ISVTX
+        ):
+            raise ValueError(f"{description} contains a writable boundary")
+        if metadata.st_uid not in (uid, 0):
+            raise ValueError(f"{description} contains an unexpected owner")
+    final = path.stat()
+    if owner and final.st_uid != uid:
+        raise ValueError(f"{description} is not owned by the current user")
+
+
+def _validate_open_directory(
+    descriptor: int,
+    uid: int,
+    description: str,
+    *,
+    owner: bool,
+) -> None:
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        raise ValueError(f"cannot inspect {description}") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"{description} is not a directory")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if mode & 0o022 and (
+        metadata.st_uid != 0 or not mode & stat.S_ISVTX
+    ):
+        raise ValueError(f"{description} contains a writable boundary")
+    if metadata.st_uid not in (uid, 0):
+        raise ValueError(f"{description} contains an unexpected owner")
+    if owner and metadata.st_uid != uid:
+        raise ValueError(f"{description} is not owned by the current user")
+
+
+def _open_trusted_directory_chain(
+    path: Path,
+    uid: int,
+    description: str,
+    *,
+    owner: bool,
+) -> int:
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or CONTROL_CHARACTER_RE.search(str(path))
+        or ":" in str(path)
+    ):
+        raise ValueError(f"{description} is not an absolute path")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{description} is missing") from error
+    if resolved != path:
+        raise ValueError(f"{description} must not contain symlinks")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor: Optional[int] = None
+    child: Optional[int] = None
+    previous: Optional[int] = None
+    try:
+        descriptor = os.open(path.anchor or os.sep, flags)
+        _validate_open_directory(
+            descriptor,
+            uid,
+            description,
+            owner=owner and path == Path(path.anchor),
+        )
+        current = Path(path.anchor)
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            current /= component
+            _validate_open_directory(
+                child,
+                uid,
+                f"{description} component {current}",
+                owner=owner and current == path,
+            )
+            previous = descriptor
+            descriptor = child
+            child = None
+            os.close(previous)
+            previous = None
+        if descriptor is None:
+            raise ValueError(f"cannot open {description}")
+        result = descriptor
+        descriptor = None
+        return result
+    except OSError as error:
+        raise ValueError(f"cannot open {description}") from error
+    finally:
+        seen: set[int] = set()
+        for open_descriptor in (child, previous, descriptor):
+            if open_descriptor is None or open_descriptor in seen:
+                continue
+            seen.add(open_descriptor)
+            try:
+                os.close(open_descriptor)
+            except OSError:
+                pass
+
+
+def _validate_regular_at(
+    parent_descriptor: int,
+    name: str,
+    uid: int,
+    description: str,
+    *,
+    auth: bool,
+    required: bool = False,
+) -> None:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        if required:
+            raise ValueError(f"{description} is missing")
+        return
+    except OSError as error:
+        raise ValueError(f"{description} is not trustworthy") from error
+    try:
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError as error:
+            raise ValueError(f"cannot inspect {description}") from error
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != uid:
+            raise ValueError(f"{description} is not trustworthy")
+        mode = stat.S_IMODE(metadata.st_mode)
+        if mode & 0o022:
+            raise ValueError(f"{description} is not trustworthy")
+        if auth and (mode & 0o077 or mode & 0o7000 or mode & 0o111):
+            raise ValueError(f"{description} is not trustworthy")
+    finally:
+        os.close(descriptor)
+
+
+def _validate_codex_regular_target(
+    path: Path,
+    uid: int,
+    description: str,
+    *,
+    auth: bool,
+) -> None:
+    parent = _open_trusted_directory_chain(
+        path.parent,
+        uid,
+        f"{description} parent",
+        owner=False,
+    )
+    try:
+        _validate_regular_at(
+            parent,
+            path.name,
+            uid,
+            description,
+            auth=auth,
+            required=True,
+        )
+    finally:
+        os.close(parent)
+
+
+def _validate_codex_surface_entry(
+    parent_descriptor: int,
+    parent_path: Path,
+    name: str,
+    uid: int,
+    description: str,
+    *,
+    directory: bool,
+) -> Optional[Path]:
+    if CONTROL_CHARACTER_RE.search(name) or ":" in name:
+        raise ValueError(f"{description} has an unsafe name")
+    try:
+        metadata = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ValueError(f"{description} is not trustworthy") from error
+    if stat.S_ISLNK(metadata.st_mode):
+        if metadata.st_uid != uid:
+            raise ValueError(f"{description} symlink is not owned by the current user")
+        try:
+            target_text = os.readlink(name, dir_fd=parent_descriptor)
+        except OSError as error:
+            raise ValueError(f"{description} symlink cannot be read") from error
+        target = Path(target_text)
+        if not target.is_absolute():
+            target = parent_path / target
+        try:
+            canonical = target.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ValueError(f"{description} symlink target is missing") from error
+        if canonical == parent_path / name:
+            raise ValueError(f"{description} symlink target is invalid")
+    else:
+        canonical = parent_path / name
+        if metadata.st_uid != uid or stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise ValueError(f"{description} is not trustworthy")
+    if directory:
+        if not canonical.is_dir():
+            raise ValueError(f"{description} is not a directory")
+        target_descriptor = _open_trusted_directory_chain(
+            canonical,
+            uid,
+            description,
+            owner=True,
+        )
+        os.close(target_descriptor)
+    else:
+        if not canonical.is_file():
+            raise ValueError(f"{description} is not a regular file")
+        _validate_codex_regular_target(
+            canonical,
+            uid,
+            description,
+            auth=False,
+        )
+    return canonical
+
+
+def _validate_codex_surface_tree(
+    path: Path,
+    uid: int,
+    description: str,
+    visited: Optional[set[Path]] = None,
+) -> None:
+    seen = set() if visited is None else visited
+    canonical = path.resolve(strict=True)
+    if canonical in seen:
+        return
+    seen.add(canonical)
+    descriptor = _open_trusted_directory_chain(
+        canonical,
+        uid,
+        description,
+        owner=True,
+    )
+    try:
+        try:
+            names = os.listdir(descriptor)
+        except OSError as error:
+            raise ValueError(f"{description} entries cannot be listed") from error
+        for name in names:
+            if CONTROL_CHARACTER_RE.search(name) or ":" in name:
+                raise ValueError(f"{description} has an unsafe entry name")
+            entry_description = f"{description} entry {canonical / name}"
+            try:
+                metadata = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise ValueError(f"{entry_description} is not trustworthy") from error
+            if stat.S_ISLNK(metadata.st_mode):
+                if metadata.st_uid != uid:
+                    raise ValueError(
+                        f"{entry_description} symlink is not owned by the current user"
+                    )
+                try:
+                    target_text = os.readlink(name, dir_fd=descriptor)
+                except OSError as error:
+                    raise ValueError(f"{entry_description} symlink cannot be read") from error
+                target = Path(target_text)
+                if not target.is_absolute():
+                    target = canonical / target
+                try:
+                    resolved = target.resolve(strict=True)
+                except (OSError, RuntimeError) as error:
+                    raise ValueError(f"{entry_description} symlink target is missing") from error
+                if resolved == canonical / name:
+                    raise ValueError(f"{entry_description} symlink target is invalid")
+                if resolved.is_dir():
+                    target_descriptor = _open_trusted_directory_chain(
+                        resolved,
+                        uid,
+                        entry_description,
+                        owner=True,
+                    )
+                    os.close(target_descriptor)
+                    _validate_codex_surface_tree(
+                        resolved,
+                        uid,
+                        entry_description,
+                        seen,
+                    )
+                elif resolved.is_file():
+                    _validate_codex_regular_target(
+                        resolved,
+                        uid,
+                        entry_description,
+                        auth=False,
+                    )
+                else:
+                    raise ValueError(f"{entry_description} has an invalid target")
+            elif stat.S_ISDIR(metadata.st_mode):
+                if metadata.st_uid != uid or stat.S_IMODE(metadata.st_mode) & 0o022:
+                    raise ValueError(f"{entry_description} is not trustworthy")
+                child = canonical / name
+                child_descriptor = _open_trusted_directory_chain(
+                    child,
+                    uid,
+                    entry_description,
+                    owner=True,
+                )
+                os.close(child_descriptor)
+                _validate_codex_surface_tree(child, uid, entry_description, seen)
+            elif stat.S_ISREG(metadata.st_mode):
+                if metadata.st_uid != uid or stat.S_IMODE(metadata.st_mode) & 0o022:
+                    raise ValueError(f"{entry_description} is not trustworthy")
+                _validate_regular_at(
+                    descriptor,
+                    name,
+                    uid,
+                    entry_description,
+                    auth=False,
+                    required=True,
+                )
+            else:
+                raise ValueError(f"{entry_description} has an invalid type")
+    finally:
+        os.close(descriptor)
+
+
+def _validate_regular(path: Path, uid: int, description: str) -> Path:
+    try:
+        canonical = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{description} does not resolve") from error
+    metadata = canonical.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"{description} is not a regular file")
+    if metadata.st_uid != uid:
+        raise ValueError(f"{description} is not owned by the current user")
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise ValueError(f"{description} is group or other writable")
+    if not os.access(canonical, os.R_OK | os.X_OK):
+        raise ValueError(f"{description} is not readable and executable")
+    _validate_directory_chain(canonical.parent, uid, f"{description} parent", owner=False)
+    return canonical
+
+def _validate_readable_file(path: Path, uid: int, description: str) -> Path:
+    try:
+        canonical = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{description} is not a readable regular file") from error
+    metadata = canonical.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != uid:
+        raise ValueError(f"{description} is not a readable regular file")
+    if stat.S_IMODE(metadata.st_mode) & 0o022 or not os.access(canonical, os.R_OK):
+        raise ValueError(f"{description} is not a readable regular file")
+    _validate_directory_chain(canonical.parent, uid, f"{description} parent", owner=False)
+    return canonical
+
+
+
+def _read_dotenv(path: Path, uid: int) -> Dict[str, str]:
+    parent = path.parent
+    _validate_directory_chain(parent, uid, "repository", owner=True)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    parent_descriptor: Optional[int] = None
+    descriptor: Optional[int] = None
+    try:
+        parent_descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+    except OSError as error:
+        raise ValueError("repository environment data is not readable") from error
+    finally:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+    try:
+        if descriptor is None:
+            raise ValueError("repository environment data descriptor is missing")
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != uid:
+            raise ValueError("repository environment data is not a regular file")
+        mode = stat.S_IMODE(metadata.st_mode)
+        if mode & 0o077:
+            raise ValueError("repository environment data must be owner-only")
+        chunks = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError("repository environment data changed while being read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        try:
+            text = b"".join(chunks).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("repository environment data is not UTF-8") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return _parse_dotenv(text)
+
+
+def _strip_unquoted_comment(value: str) -> str:
+    for index, character in enumerate(value):
+        if character == "#" and (index == 0 or value[index - 1].isspace()):
+            return value[:index].rstrip()
+    return value.rstrip()
+
+
+def _parse_value(value: str) -> Optional[str]:
+    value = value.lstrip()
+    if not value:
+        return ""
+    if value[0] == "'":
+        end = value.find("'", 1)
+        trailing = value[end + 1 :].strip() if end >= 0 else ""
+        if end < 0 or (trailing and not trailing.startswith("#")):
+            return None
+        return value[1:end]
+    if value[0] == '"':
+        chars = []
+        index = 1
+        while index < len(value):
+            character = value[index]
+            if character == '"':
+                trailing = value[index + 1 :].strip()
+                if trailing and not trailing.startswith("#"):
+                    return None
+                return "".join(chars)
+            if character == "\\" and index + 1 < len(value):
+                index += 1
+                escaped = value[index]
+                chars.append({"n": "\n", "r": "\r", "t": "\t"}.get(escaped, escaped))
+            else:
+                chars.append(character)
+            index += 1
+        return None
+    return _strip_unquoted_comment(value)
+
+
+def _parse_dotenv(text: str) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, separator, value = line.partition("=")
+        key = key.strip()
+        if not separator or not KEY_RE.fullmatch(key):
+            continue
+        parsed = _parse_value(value)
+        if parsed is not None:
+            values[key] = parsed
+    if "SLACK_BOT_TOKEN" not in values and "CINDER_SLACK_BOT_TOKEN" in values:
+        values["SLACK_BOT_TOKEN"] = values["CINDER_SLACK_BOT_TOKEN"]
+    if "SLACK_APP_TOKEN" not in values and "CINDER_SLACK_APP_TOKEN" in values:
+        values["SLACK_APP_TOKEN"] = values["CINDER_SLACK_APP_TOKEN"]
+    return values
+
+
+def _read_runtime_binding() -> RuntimeBinding:
+    try:
+        value = RUNTIME_BINDING
+        binding = RuntimeBinding.from_mapping(value)
+    except (NameError, TypeError, ValueError) as error:
+        raise ValueError(f"runtime binding is malformed: {error}") from error
+    if binding.uid != os.getuid():
+        raise ValueError("runtime binding uid does not match the current user")
+    try:
+        if binding.python.resolve(strict=True) != Path(sys.executable).resolve(strict=True):
+            raise ValueError("runtime binding Python interpreter changed")
+    except (OSError, RuntimeError) as error:
+        raise ValueError("runtime binding Python interpreter is invalid") from error
+    return binding
+
+
+def _bound_home(binding: RuntimeBinding, environment: Mapping[str, str]) -> Path:
+    try:
+        current_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        raise ValueError("cannot resolve the current user's HOME") from error
+    if not current_home.is_absolute() or current_home != binding.home:
+        raise ValueError("runtime binding HOME does not match the current passwd home")
+    raw_home = environment.get("HOME")
+    if not isinstance(raw_home, str) or raw_home != str(binding.home):
+        raise ValueError("HOME does not match the runtime binding")
+    if CONTROL_CHARACTER_RE.search(raw_home) or ":" in raw_home:
+        raise ValueError("HOME contains unsafe characters")
+    descriptor = _open_trusted_directory_chain(
+        binding.home,
+        binding.uid,
+        "HOME",
+        owner=True,
+    )
+    os.close(descriptor)
+    return binding.home
+
+
+def _validate_bound_path(binding: RuntimeBinding) -> None:
+    path_value = binding.path
+    if (
+        not isinstance(path_value, str)
+        or not path_value
+        or CONTROL_CHARACTER_RE.search(path_value)
+    ):
+        raise ValueError("runtime binding PATH is invalid")
+    components = path_value.split(":")
+    if not components:
+        raise ValueError("runtime binding PATH is empty")
+    for component in components:
+        if not component or not Path(component).is_absolute():
+            raise ValueError("runtime binding PATH must contain absolute directories")
+        descriptor = _open_trusted_directory_chain(
+            Path(component),
+            binding.uid,
+            f"bound PATH directory {component}",
+            owner=False,
+        )
+        os.close(descriptor)
+
+
+def _validate_codex_home(binding: RuntimeBinding) -> None:
+    codex_home = binding.codex_home
+    if (
+        not isinstance(codex_home, Path)
+        or not codex_home.is_absolute()
+        or CONTROL_CHARACTER_RE.search(str(codex_home))
+        or ":" in str(codex_home)
+    ):
+        raise ValueError("runtime binding CODEX_HOME is invalid")
+    descriptor = _open_trusted_directory_chain(
+        codex_home,
+        binding.uid,
+        "Codex home",
+        owner=True,
+    )
+    try:
+        _validate_regular_at(
+            descriptor,
+            "config.toml",
+            binding.uid,
+            "Codex home config.toml",
+            auth=True,
+        )
+        _validate_regular_at(
+            descriptor,
+            "auth.json",
+            binding.uid,
+            "Codex home auth.json",
+            auth=True,
+        )
+        for name in ("AGENTS.md", "RTK.md", "hooks.json"):
+            _validate_codex_surface_entry(
+                descriptor,
+                codex_home,
+                name,
+                binding.uid,
+                f"Codex home {name}",
+                directory=False,
+            )
+        for name in ("agents", "skills", "rules", "policy", "plugins"):
+            surface = _validate_codex_surface_entry(
+                descriptor,
+                codex_home,
+                name,
+                binding.uid,
+                f"Codex home {name}",
+                directory=True,
+            )
+            if surface is not None:
+                _validate_codex_surface_tree(
+                    surface,
+                    binding.uid,
+                    f"Codex home {name}",
+                )
+    finally:
+        os.close(descriptor)
+
+
+def _resolve_bound_skill_root(root: Path, uid: int) -> Path:
+    parent = _open_trusted_directory_chain(
+        root.parent,
+        uid,
+        "scheduled skill root parent",
+        owner=False,
+    )
+    try:
+        try:
+            metadata = os.stat(
+                root.name,
+                dir_fd=parent,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return root
+        except OSError as error:
+            raise ValueError("scheduled skill root is not trustworthy") from error
+        if not stat.S_ISLNK(metadata.st_mode):
+            return root
+        if metadata.st_uid != uid:
+            raise ValueError("scheduled skill root symlink is not owned by the current user")
+        try:
+            target_text = os.readlink(root.name, dir_fd=parent)
+        except OSError as error:
+            raise ValueError("scheduled skill root symlink cannot be read") from error
+        target = Path(target_text)
+        if not target.is_absolute():
+            target = root.parent / target
+        try:
+            canonical = target.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ValueError("scheduled skill root symlink target is missing") from error
+        if canonical == root or not canonical.is_dir():
+            raise ValueError("scheduled skill root symlink target is invalid")
+        target_descriptor = _open_trusted_directory_chain(
+            canonical,
+            uid,
+            "scheduled skill root canonical target",
+            owner=False,
+        )
+        os.close(target_descriptor)
+        return canonical
+    finally:
+        os.close(parent)
+
+
+def _task_contract(task_id: str, binding: RuntimeBinding) -> Tuple[str, Path, Path]:
+    task = TASKS.get(task_id)
+    if task is None:
+        raise KeyError(task_id)
+    skill_name, project_relative, invocation = task
+    if binding.binding_version >= RUNTIME_BINDING_VERSION:
+        try:
+            root = binding.skill_roots[task_id]
+        except KeyError as error:
+            raise ValueError("scheduled skill root is missing") from error
+    else:
+        root = (
+            binding.repository / ".agents" / "skills" / skill_name
+            if project_relative
+            else binding.codex_home / "skills" / skill_name
+        )
+    if not root.is_absolute() or CONTROL_CHARACTER_RE.search(str(root)) or ":" in str(root):
+        raise ValueError("scheduled skill root is invalid")
+    root = _resolve_bound_skill_root(root, binding.uid)
+    link = root / "SKILL.md"
+    prompt = f"Use ${skill_name} at {root} {invocation}. Execute the canonical workflow once."
+    return prompt, root, link
+
+
+def _capture_run_date() -> str:
+    return dt.datetime.now(tz=ZoneInfo(TRUSTED_TZ)).date().isoformat()
+
+
+def _build_environment(
+    binding: RuntimeBinding,
+    task_id: str,
+    root: Path,
+    link: Path,
+    run_date: str,
+    dotenv: Mapping[str, str],
+    inherited: Mapping[str, str],
+) -> Dict[str, str]:
+    child_environment: Dict[str, str] = {}
+    aliases: Dict[str, str] = {}
+    for key, value in inherited.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        if key in ENVIRONMENT_ALIASES:
+            canonical = (
+                "SLACK_BOT_TOKEN"
+                if key == "CINDER_SLACK_BOT_TOKEN"
+                else "SLACK_APP_TOKEN"
+            )
+            aliases[canonical] = value
+        elif key in APPROVED_ENVIRONMENT_NAMES:
+            child_environment[key] = value
+    for key, value in dotenv.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        if key in ENVIRONMENT_ALIASES:
+            canonical = (
+                "SLACK_BOT_TOKEN"
+                if key == "CINDER_SLACK_BOT_TOKEN"
+                else "SLACK_APP_TOKEN"
+            )
+            aliases[canonical] = value
+        elif key in APPROVED_ENVIRONMENT_NAMES:
+            child_environment[key] = value
+    for canonical, value in aliases.items():
+        child_environment.setdefault(canonical, value)
+    child_environment.update(
+        {
+            "SCHEDULED_RUN_DATE_ET": run_date,
+            "SCHEDULED_AGENT_ENGINE": "codex",
+            "SCHEDULED_SKILL_ROOT": str(root),
+            "SCHEDULED_SKILL_LINK": str(link),
+            "TASK_ID": task_id,
+            "WORKING_DIRECTORY": str(binding.repository),
+            "CODEX": str(binding.codex),
+            "CONTROLLED_PATH": binding.path,
+            "ENV_LOADER": "",
+            "HOME": str(binding.home),
+            "PATH": binding.path,
+            "TZ": TRUSTED_TZ,
+            "CODEX_HOME": str(binding.codex_home),
+            "LANG": "en_US.UTF-8",
+            "LC_ALL": "en_US.UTF-8",
+            "CODEX_MANAGED_PACKAGE_ROOT": (
+                ""
+                if binding.codex_managed_package_root is None
+                else str(binding.codex_managed_package_root)
+            ),
+        }
+    )
+    child_environment[f"CODEX_MANAGED_BY_{binding.codex_managed_by.upper()}"] = "1"
+    return child_environment
+
+
+def _host_native_arch() -> str:
+    machine = platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        return "arm64"
+    if machine in {"x86_64", "amd64"}:
+        return "x86_64"
+    raise ValueError(f"unsupported host architecture: {machine}")
+
+
+def _macho_arch(cputype: int) -> Optional[str]:
+    return {0x0100000C: "arm64", 0x01000007: "x86_64"}.get(cputype & 0xFFFFFFFF)
+
+
+def _parse_thin_macho(payload: bytes, expected_arch: str) -> str:
+    magic = payload[:4]
+    if magic in {b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe"}:
+        endian, header_size = (">", 28) if magic[0] == 0xFE else ("<", 28)
+    elif magic in {b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe"}:
+        endian, header_size = (">", 32) if magic[0] == 0xFE else ("<", 32)
+    else:
+        raise ValueError("bound Codex is not Mach-O")
+    if len(payload) < header_size:
+        raise ValueError("bound Codex Mach-O header is truncated")
+    arch = _macho_arch(struct.unpack_from(endian + "I", payload, 4)[0])
+    if arch != expected_arch:
+        raise ValueError("bound Codex Mach-O architecture changed")
+    if struct.unpack_from(endian + "I", payload, 12)[0] != 2:
+        raise ValueError("bound Codex Mach-O file type is not MH_EXECUTE")
+    ncmds, sizeofcmds = struct.unpack_from(endian + "II", payload, 16)
+    end = header_size + sizeofcmds
+    if end > len(payload) or sizeofcmds < ncmds * 8:
+        raise ValueError("bound Codex Mach-O load commands are truncated")
+    cursor = header_size
+    for _ in range(ncmds):
+        if cursor + 8 > end:
+            raise ValueError("bound Codex Mach-O load command is truncated")
+        command_size = struct.unpack_from(endian + "I", payload, cursor + 4)[0]
+        if command_size < 8 or cursor + command_size > end:
+            raise ValueError("bound Codex Mach-O load command bounds are invalid")
+        cursor += command_size
+    if cursor != end:
+        raise ValueError("bound Codex Mach-O load command size is invalid")
+    return arch
+
+
+def _parse_macho(payload: bytes, expected_arch: str) -> str:
+    magic = payload[:4]
+    if magic in {b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"}:
+        endian = ">" if magic == b"\xca\xfe\xba\xbe" else "<"
+        if len(payload) < 8:
+            raise ValueError("bound Codex fat Mach-O header is truncated")
+        count = struct.unpack_from(endian + "I", payload, 4)[0]
+        table_end = 8 + count * 20
+        if count == 0 or table_end > len(payload):
+            raise ValueError("bound Codex fat Mach-O table is invalid")
+        for index in range(count):
+            offset = 8 + index * 20
+            cputype, _subtype, slice_offset, slice_size, _align = struct.unpack_from(
+                endian + "IIIII", payload, offset
+            )
+            if (
+                slice_offset < table_end
+                or slice_offset + slice_size > len(payload)
+            ):
+                raise ValueError("bound Codex fat Mach-O slice bounds are invalid")
+            if _macho_arch(cputype) == expected_arch:
+                return _parse_thin_macho(
+                    payload[slice_offset : slice_offset + slice_size],
+                    expected_arch,
+                )
+        raise ValueError("bound Codex fat Mach-O has no host slice")
+    return _parse_thin_macho(payload, expected_arch)
+
+
+def _parse_elf(payload: bytes, expected_arch: str) -> str:
+    if len(payload) < 16 or payload[:4] != ELF_MAGIC:
+        raise ValueError("bound Codex is not ELF")
+    elf_class, endian_byte = payload[4], payload[5]
+    if elf_class not in {1, 2} or endian_byte not in {1, 2}:
+        raise ValueError("bound Codex ELF header is invalid")
+    endian = "<" if endian_byte == 1 else ">"
+    header_size = 52 if elf_class == 1 else 64
+    if len(payload) < header_size:
+        raise ValueError("bound Codex ELF header is truncated")
+    e_type, machine = struct.unpack_from(endian + "HH", payload, 16)
+    arch = {183: "arm64", 62: "x86_64"}.get(machine)
+    if arch != expected_arch:
+        raise ValueError("bound Codex ELF architecture changed")
+    if e_type not in {2, 3}:
+        raise ValueError("bound Codex ELF file type is not executable")
+    if elf_class == 1:
+        phoff, shoff = struct.unpack_from(endian + "II", payload, 28)
+        ehsize, phentsize, phnum, shentsize, shnum = struct.unpack_from(
+            endian + "HHHHH", payload, 40
+        )
+    else:
+        phoff, shoff = struct.unpack_from(endian + "QQ", payload, 32)
+        ehsize, phentsize, phnum, shentsize, shnum = struct.unpack_from(
+            endian + "HHHHH", payload, 52
+        )
+    if ehsize < header_size or ehsize > len(payload):
+        raise ValueError("bound Codex ELF header size is invalid")
+    if phnum and (phentsize == 0 or phoff + phentsize * phnum > len(payload)):
+        raise ValueError("bound Codex ELF program headers are truncated")
+    if shnum and (shentsize == 0 or shoff + shentsize * shnum > len(payload)):
+        raise ValueError("bound Codex ELF section headers are truncated")
+    return arch
+
+
+def _native_bytes_and_identity(descriptor: int) -> Tuple[bytes, str, str]:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or stat.S_IMODE(metadata.st_mode) & 0o111 == 0
+    ):
+        raise ValueError("bound Codex ownership, mode, or type is invalid")
+    chunks = []
+    remaining = metadata.st_size
+    while remaining:
+        chunk = os.read(descriptor, min(1024 * 1024, remaining))
+        if not chunk:
+            raise ValueError("bound Codex changed while being read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    payload = b"".join(chunks)
+    expected_arch = _host_native_arch()
+    if sys.platform.startswith("darwin"):
+        if payload[:4] == ELF_MAGIC:
+            raise ValueError("Darwin bound Codex is not Mach-O")
+        arch = _parse_macho(payload, expected_arch)
+    elif sys.platform.startswith("linux"):
+        if payload[:4] in MACHO_MAGICS:
+            raise ValueError("Linux bound Codex is not ELF")
+        arch = _parse_elf(payload, expected_arch)
+    elif payload[:4] in MACHO_MAGICS:
+        arch = _parse_macho(payload, expected_arch)
+    else:
+        arch = _parse_elf(payload, expected_arch)
+    return payload, arch, hashlib.sha256(payload).hexdigest()
+
+
+def _read_package_metadata(path: Path, description: str) -> Dict[str, Any]:
+    try:
+        if path.resolve(strict=True) != path:
+            raise ValueError(f"{description} must not be a symlink")
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"{description} is not readable") from error
+    _validate_readable_file(path, os.getuid(), description)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{description} is malformed") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{description} must contain an object")
+    return value
+
+
+def _platform_package_details() -> Tuple[str, str, str, str, str]:
+    arch = _host_native_arch()
+    if sys.platform == "darwin":
+        if arch == "arm64":
+            return (
+                "codex-darwin-arm64",
+                "aarch64-apple-darwin",
+                "darwin",
+                "arm64",
+                "darwin-arm64",
+            )
+        if arch == "x86_64":
+            return (
+                "codex-darwin-x64",
+                "x86_64-apple-darwin",
+                "darwin",
+                "x64",
+                "darwin-x64",
+            )
+    elif sys.platform == "linux":
+        if arch == "arm64":
+            return (
+                "codex-linux-arm64",
+                "aarch64-unknown-linux-gnu",
+                "linux",
+                "arm64",
+                "linux-arm64",
+            )
+        if arch == "x86_64":
+            return (
+                "codex-linux-x64",
+                "x86_64-unknown-linux-gnu",
+                "linux",
+                "x64",
+                "linux-x64",
+            )
+    raise ValueError(f"unsupported host platform: {sys.platform} / {arch}")
+
+
+def _package_details() -> Tuple[str, str]:
+    platform_name, vendor_target, _platform_os, _platform_cpu, _platform_suffix = (
+        _platform_package_details()
+    )
+    return platform_name, vendor_target
+
+
+def _validate_package_identity(
+    package_root: Path,
+    bound_codex: Path,
+    bound_code_mode_host: Path,
+    expected_digest: Optional[str],
+    expected_code_mode_host_digest: Optional[str],
+    expected_version: Optional[str] = None,
+) -> None:
+    _validate_directory_chain(package_root, os.getuid(), "Codex package root", owner=True)
+    root_metadata = _read_package_metadata(package_root / "package.json", "Codex package metadata")
+    version = root_metadata.get("version")
+    if (
+        root_metadata.get("name") != "@openai/codex"
+        or not isinstance(version, str)
+        or not version
+        or CONTROL_CHARACTER_RE.search(version)
+        or ":" in version
+    ):
+        raise ValueError("Codex package metadata identity is invalid")
+    if expected_version is not None and version != expected_version:
+        raise ValueError("Codex package version changed")
+    bin_metadata = root_metadata.get("bin")
+    if not isinstance(bin_metadata, dict) or bin_metadata.get("codex") != "bin/codex.js":
+        raise ValueError("Codex package bin metadata is invalid")
+    platform_name, vendor_target, platform_os, platform_cpu, platform_suffix = (
+        _platform_package_details()
+    )
+    platform_version = f"{version}-{platform_suffix}"
+    platform_dependency_key = f"@openai/{platform_name}"
+    platform_dependency = f"npm:@openai/codex@{platform_version}"
+    optional = root_metadata.get("optionalDependencies")
+    if (
+        not isinstance(optional, dict)
+        or optional.get(platform_dependency_key) != platform_dependency
+    ):
+        raise ValueError("Codex package platform dependency is invalid")
+    platform_package = package_root / "node_modules" / "@openai" / platform_name
+    for directory in (
+        package_root / "node_modules",
+        package_root / "node_modules" / "@openai",
+        platform_package,
+        package_root / "bin",
+    ):
+        _validate_directory_chain(directory, os.getuid(), "Codex package component", owner=True)
+    platform_metadata = _read_package_metadata(
+        platform_package / "package.json",
+        "Codex platform package metadata",
+    )
+    if (
+        platform_metadata.get("name") != "@openai/codex"
+        or platform_metadata.get("version") != platform_version
+        or platform_metadata.get("os") != [platform_os]
+        or platform_metadata.get("cpu") != [platform_cpu]
+    ):
+        raise ValueError("Codex platform package metadata identity is invalid")
+    entrypoint = package_root / "bin" / "codex.js"
+    try:
+        if entrypoint.resolve(strict=True) != entrypoint:
+            raise ValueError("Codex package entrypoint must not be a symlink")
+    except (OSError, RuntimeError) as error:
+        raise ValueError("Codex package entrypoint is not readable") from error
+    _validate_readable_file(entrypoint, os.getuid(), "Codex package entrypoint")
+    if stat.S_IMODE(entrypoint.stat().st_mode) & 0o111 == 0:
+        raise ValueError("Codex package entrypoint is not executable")
+    native = platform_package / "vendor" / vendor_target / "bin" / "codex"
+    code_mode_host = native.with_name("codex-code-mode-host")
+    _validate_directory_chain(native.parent, os.getuid(), "Codex native vendor path", owner=False)
+    if native != bound_codex or code_mode_host != bound_code_mode_host:
+        raise ValueError("bound Codex paths are outside the official package topology")
+    if expected_digest is None or expected_code_mode_host_digest is None:
+        raise ValueError("npm Codex binding has incomplete native digests")
+
+def _open_bound_native(
+    path: Path,
+    binding: RuntimeBinding,
+    expected_digest: Optional[str],
+    description: str,
+) -> Tuple[int, str, str]:
+    if not path.is_absolute():
+        raise ValueError(f"{description} path is not absolute")
+    parent = _open_trusted_directory_chain(
+        path.parent,
+        binding.uid,
+        f"{description} parent",
+        owner=False,
+    )
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent,
+        )
+    finally:
+        os.close(parent)
+    try:
+        _payload, arch, digest = _native_bytes_and_identity(descriptor)
+        if expected_digest is None or digest != expected_digest:
+            raise ValueError(f"{description} identity changed")
+        if arch != binding.codex_macho_arch:
+            raise ValueError(f"{description} architecture changed")
+        return descriptor, arch, digest
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_bound_codex(binding: RuntimeBinding) -> Tuple[int, int, str, str]:
+    if (
+        binding.binding_version < RUNTIME_BINDING_VERSION
+        or binding.codex_code_mode_host is None
+    ):
+        raise ValueError("runtime binding lacks the Codex code-mode host identity")
+    descriptor, arch, digest = _open_bound_native(
+        binding.codex,
+        binding,
+        binding.codex_sha256,
+        "bound Codex",
+    )
+    code_mode_descriptor: Optional[int] = None
+    try:
+        code_mode_descriptor, code_mode_arch, _code_mode_digest = _open_bound_native(
+            binding.codex_code_mode_host,
+            binding,
+            binding.codex_code_mode_host_sha256,
+            "bound Codex code-mode host",
+        )
+        if code_mode_arch != arch:
+            raise ValueError("Codex native executables have different architectures")
+        if binding.codex_managed_by == "npm":
+            if binding.codex_managed_package_root is None:
+                raise ValueError("npm Codex binding has no package root")
+            _validate_package_identity(
+                binding.codex_managed_package_root,
+                binding.codex,
+                binding.codex_code_mode_host,
+                binding.codex_sha256,
+                binding.codex_code_mode_host_sha256,
+                binding.codex_managed_package_version,
+            )
+        elif binding.codex_managed_package_root is not None:
+            raise ValueError("direct Codex binding contains package metadata")
+        return descriptor, code_mode_descriptor, arch, digest
+    except BaseException:
+        os.close(descriptor)
+        if code_mode_descriptor is not None:
+            os.close(code_mode_descriptor)
+        raise
+
+
+def _read_validated_executable(
+    descriptor: int,
+    binding: RuntimeBinding,
+    expected_digest: Optional[str],
+    description: str,
+) -> bytes:
+    metadata = os.fstat(descriptor)
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != binding.uid
+        or mode & 0o022
+        or mode & 0o111 == 0
+        or metadata.st_size < 0
+    ):
+        raise ValueError(f"{description} descriptor is not a validated executable")
+    payload = bytearray()
+    offset = 0
+    while offset < metadata.st_size:
+        chunk = os.pread(
+            descriptor,
+            min(1024 * 1024, metadata.st_size - offset),
+            offset,
+        )
+        if not chunk:
+            raise ValueError(f"{description} changed while being copied")
+        payload.extend(chunk)
+        offset += len(chunk)
+    if expected_digest is None or hashlib.sha256(payload).hexdigest() != expected_digest:
+        raise ValueError(f"{description} identity changed while being copied")
+    return bytes(payload)
+
+
+def _write_private_executable(
+    directory_descriptor: int,
+    name: str,
+    payload: bytes,
+    binding: RuntimeBinding,
+) -> None:
+    descriptor = os.open(
+        name,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o700,
+        dir_fd=directory_descriptor,
+    )
+    try:
+        os.fchmod(descriptor, 0o700)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError(f"{name} private-copy write made no progress")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+    read_descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_descriptor,
+    )
+    try:
+        metadata = os.fstat(read_descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != binding.uid
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_size != len(payload)
+        ):
+            raise ValueError(f"{name} private copy metadata changed")
+        readback = bytearray()
+        offset = 0
+        while offset < len(payload):
+            chunk = os.pread(
+                read_descriptor,
+                min(1024 * 1024, len(payload) - offset),
+                offset,
+            )
+            if not chunk:
+                raise ValueError(f"{name} private copy changed while being read")
+            readback.extend(chunk)
+            offset += len(chunk)
+        if bytes(readback) != payload:
+            raise ValueError(f"{name} private copy differs from validated bytes")
+    finally:
+        os.close(read_descriptor)
+
+
+def _materialize_validated_codex(
+    binding: RuntimeBinding,
+    descriptor: int,
+    code_mode_descriptor: int,
+) -> Path:
+    staging_bin = binding.home / ".local" / "bin"
+    _validate_directory_chain(
+        staging_bin,
+        binding.uid,
+        "Codex private-copy directory",
+        owner=True,
+    )
+    codex_payload = _read_validated_executable(
+        descriptor,
+        binding,
+        binding.codex_sha256,
+        "bound Codex",
+    )
+    host_payload = _read_validated_executable(
+        code_mode_descriptor,
+        binding,
+        binding.codex_code_mode_host_sha256,
+        "bound Codex code-mode host",
+    )
+    parent_descriptor = _open_trusted_directory_chain(
+        staging_bin,
+        binding.uid,
+        "Codex private-copy directory",
+        owner=True,
+    )
+    private_directory_descriptor: Optional[int] = None
+    private_directory_name: Optional[str] = None
+    try:
+        for _attempt in range(128):
+            candidate = f".ticker-codex-{uuid.uuid4().hex}"
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                continue
+            private_directory_name = candidate
+            break
+        if private_directory_name is None:
+            raise OSError("cannot create a unique Codex private bundle")
+        private_directory_descriptor = os.open(
+            private_directory_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        private_metadata = os.fstat(private_directory_descriptor)
+        if (
+            not stat.S_ISDIR(private_metadata.st_mode)
+            or private_metadata.st_uid != binding.uid
+            or stat.S_IMODE(private_metadata.st_mode) != 0o700
+        ):
+            raise ValueError("Codex private bundle metadata changed")
+        _write_private_executable(
+            private_directory_descriptor,
+            "codex-code-mode-host",
+            host_payload,
+            binding,
+        )
+        _write_private_executable(
+            private_directory_descriptor,
+            "codex",
+            codex_payload,
+            binding,
+        )
+        os.fsync(private_directory_descriptor)
+        os.fsync(parent_descriptor)
+        return staging_bin / private_directory_name / "codex"
+    except BaseException as primary_error:
+        cleanup_errors: list[OSError] = []
+        if private_directory_descriptor is not None:
+            for name in ("codex", "codex-code-mode-host"):
+                try:
+                    os.unlink(name, dir_fd=private_directory_descriptor)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    cleanup_errors.append(error)
+        if private_directory_name is not None:
+            try:
+                os.rmdir(private_directory_name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            cleanup_context = "; ".join(str(error) for error in cleanup_errors)
+            raise OSError(
+                "Codex materialization failed: "
+                f"{primary_error}; cleanup failed: {cleanup_context}"
+            ) from primary_error
+        raise
+    finally:
+        if private_directory_descriptor is not None:
+            os.close(private_directory_descriptor)
+        os.close(parent_descriptor)
+
+
+def _remove_private_codex_bundle(private_codex: Path) -> None:
+    errors: list[OSError] = []
+    for path in (
+        private_codex,
+        private_codex.with_name("codex-code-mode-host"),
+    ):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            errors.append(error)
+    try:
+        private_codex.parent.rmdir()
+    except OSError as error:
+        errors.append(error)
+    if errors:
+        raise OSError("; ".join(str(error) for error in errors))
+
+
+def _forwarded_child_status(
+    binding: RuntimeBinding,
+    prompt: str,
+    environment: Mapping[str, str],
+) -> int:
+    arguments = [
+        str(binding.codex),
+        "exec",
+        "--model",
+        binding.model,
+        "--cd",
+        str(binding.repository),
+        "-c",
+        f'model_reasoning_effort="{RUNTIME_REASONING_EFFORT}"',
+        "-",
+    ]
+    try:
+        descriptor, code_mode_descriptor, _arch, _digest = _open_bound_codex(binding)
+    except (OSError, ValueError) as error:
+        return _error(f"cannot validate bound Codex: {error}", 69)
+
+    previous: Dict[int, Any] = {}
+    child_slot: list[Any] = [None]
+    original_mask: Optional[set[int]] = None
+    if hasattr(signal, "pthread_sigmask"):
+        original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set(HANDLED_SIGNALS))
+
+    def forward(signum: int, _frame: object) -> None:
+        child = child_slot[0]
+        if child is None:
+            return
+        try:
+            child.send_signal(signum)
+        except OSError:
+            pass
+
+    def restore_child_mask() -> None:
+        if original_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+    child: Any = None
+    private_copy: Optional[Path] = None
+    status = 69
+    execution_error: Optional[BaseException] = None
+    cleanup_error: Optional[BaseException] = None
+    try:
+        private_copy = _materialize_validated_codex(
+            binding,
+            descriptor,
+            code_mode_descriptor,
+        )
+        for signum in HANDLED_SIGNALS:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, forward)
+        child = subprocess.Popen(
+            arguments,
+            cwd=binding.repository,
+            env=dict(environment),
+            stdin=subprocess.PIPE,
+            executable=str(private_copy),
+            preexec_fn=restore_child_mask if original_mask is not None else None,
+        )
+        child_slot[0] = child
+        if original_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+        assert child.stdin is not None
+        try:
+            child.stdin.write((prompt + "\n").encode("utf-8"))
+            child.stdin.close()
+        except BrokenPipeError:
+            pass
+        status = child.wait()
+    except (OSError, ValueError) as error:
+        execution_error = error
+    finally:
+        try:
+            if original_mask is not None:
+                signal.pthread_sigmask(signal.SIG_BLOCK, set(HANDLED_SIGNALS))
+            for signum, prior in previous.items():
+                signal.signal(signum, prior)
+            if original_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+        except (OSError, ValueError) as error:
+            if execution_error is None:
+                execution_error = error
+        finally:
+            if private_copy is not None:
+                try:
+                    _remove_private_codex_bundle(private_copy)
+                except OSError as error:
+                    cleanup_error = error
+            for native_descriptor in (descriptor, code_mode_descriptor):
+                try:
+                    os.close(native_descriptor)
+                except OSError as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+
+    if cleanup_error is not None:
+        if execution_error is not None:
+            return _error(
+                f"cannot execute bound Codex: {execution_error}; "
+                f"private-copy cleanup failed: {cleanup_error}",
+                69,
+            )
+        return _error(f"private-copy cleanup failed: {cleanup_error}", 69)
+    if execution_error is not None:
+        return _error(f"cannot execute bound Codex: {execution_error}", 69)
+    if status < 0:
+        return 128 + (-status)
+    return status
+
+
+def run(arguments: Sequence[str]) -> int:
+    if len(arguments) != 2:
+        return _error("usage: run-codex-scheduled-task TASK_ID WORKING_DIRECTORY", 64)
+    task_id, requested_repository = arguments
+    try:
+        binding = _read_runtime_binding()
+    except ValueError as error:
+        return _error(str(error), 78)
+    if task_id not in TASKS:
+        return _error(f"unknown scheduled task id: {task_id}", 64)
+
+    inherited = os.environ
+    try:
+        _bound_home(binding, inherited)
+        if requested_repository != str(binding.repository):
+            return _error(
+                f"working directory is not the approved repository: {requested_repository}",
+                72,
+            )
+        _validate_directory_chain(binding.repository, binding.uid, "approved working directory", owner=True)
+        _validate_bound_path(binding)
+        _validate_codex_home(binding)
+        run_date = _capture_run_date()
+        prompt, root, link = _task_contract(task_id, binding)
+        try:
+            _validate_readable_file(
+                link,
+                binding.uid,
+                f"scheduled root skill: {link}",
+            )
+        except ValueError:
+            return _error(
+                f"scheduled root skill is not a readable regular file: {link}",
+                66,
+            )
+        dotenv = _read_dotenv(binding.repository / ".env", binding.uid)
+        child_environment = _build_environment(
+            binding,
+            task_id,
+            root,
+            link,
+            run_date,
+            dotenv,
+            inherited,
+        )
+        return _forwarded_child_status(binding, prompt, child_environment)
+    except (ValueError, KeyError) as error:
+        return _error(str(error), 78)
+    except OSError as error:
+        return _error(f"runner filesystem validation failed: {error}", 78)
+
+
+if __name__ == "__main__":
+    raise SystemExit(run(sys.argv[1:]))

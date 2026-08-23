@@ -1187,6 +1187,7 @@ private func test3A_runProcess(
     _ executable: String,
     _ arguments: [String],
     environment overrides: [String: String] = [:],
+    removingEnvironmentKeys: Set<String> = [],
     currentDirectory: URL? = nil,
     timeout: TimeInterval = 15
 ) throws -> test3A_ProcessResult {
@@ -1197,6 +1198,9 @@ private func test3A_runProcess(
     process.arguments = arguments
     process.currentDirectoryURL = currentDirectory
     var environment = ProcessInfo.processInfo.environment
+    for key in removingEnvironmentKeys {
+        environment.removeValue(forKey: key)
+    }
     for (key, value) in overrides {
         environment[key] = value
     }
@@ -1244,16 +1248,98 @@ private func test3A_runProcess(
     )
 }
 
+private func test3A_compileProgramProbe(in directory: URL) throws -> URL {
+    let source = #"""
+    #include <limits.h>
+    #include <mach-o/dyld.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <sysexits.h>
+
+    int main(int argc, char *argv[]) {
+        if (argc != 2) {
+            fputs("usage: ProgramProbe OUTPUT\n", stderr);
+            return EX_USAGE;
+        }
+
+        char executablePath[PATH_MAX];
+        uint32_t executablePathSize = (uint32_t)sizeof(executablePath);
+        if (_NSGetExecutablePath(executablePath, &executablePathSize) != 0) {
+            fputs("_NSGetExecutablePath failed: executable path is too long\n", stderr);
+            return EX_OSERR;
+        }
+
+        char actualExecutable[PATH_MAX];
+        if (realpath(executablePath, actualExecutable) == NULL) {
+            perror("realpath");
+            return EX_OSERR;
+        }
+
+        FILE *output = fopen(argv[1], "w");
+        if (output == NULL) {
+            perror("fopen");
+            return EX_IOERR;
+        }
+        if (fprintf(
+                output,
+                "executable=%s\nargv0=%s\n",
+                actualExecutable,
+                argv[0]
+            ) < 0) {
+            perror("fprintf");
+            (void)fclose(output);
+            return EX_IOERR;
+        }
+        if (fclose(output) != 0) {
+            perror("fclose");
+            return EX_IOERR;
+        }
+        return EX_OK;
+    }
+    """#
+    let sourceURL = directory.appendingPathComponent("ProgramProbe.c")
+    try source.write(to: sourceURL, atomically: true, encoding: .utf8)
+    let executableURL = directory.appendingPathComponent("ProgramProbe")
+    try test3B_runProcess(
+        "/usr/bin/clang",
+        [
+            "-o", executableURL.path,
+            sourceURL.path,
+        ]
+    )
+    return executableURL
+}
+
+private func test3A_canonicalPath(_ url: URL) throws -> String {
+    errno = 0
+    guard let resolvedPath = Darwin.realpath(url.path, nil) else {
+        let errorNumber = errno
+        throw FixtureError.missing(
+            "test3A realpath \(url.path): \(String(cString: strerror(errorNumber)))"
+        )
+    }
+    defer { free(resolvedPath) }
+    return String(cString: resolvedPath)
+}
+
 private func test3A_ProgramAndArgumentsExecution(_ tests: TestHarness) throws {
     try withTemporaryDirectory("round3a-program-and-arguments") { directory in
         let tickerPath = try test3A_builtCLIPath()
+        let storePath = test10_compiledStorePath()
+        test10_removeStore(at: storePath)
+        defer { test10_removeStore(at: storePath) }
+        let fakeLaunchctl = try test10_fakeLaunchctl(in: directory)
+        let environment = [
+            "TICKER_TEST_LAUNCHCTL_PATH": fakeLaunchctl.path,
+            "TICKER_TEST_LAUNCHD_DIRECTORIES": directory.path,
+        ]
+        let probeURL = try test3A_compileProgramProbe(in: directory)
         let observedURL = directory.appendingPathComponent("observed.txt")
-        let script = "printf 'binary=/bin/sh argv0=%s' \"$0\" > '\(observedURL.path)'"
         let plistURL = directory.appendingPathComponent("program-and-arguments.plist")
         try writePropertyList([
             "Label": "com.example.program-and-arguments",
-            "Program": "/bin/sh",
-            "ProgramArguments": ["nightly-shell", "-c", script],
+            "Program": probeURL.path,
+            "ProgramArguments": ["nightly-shell", observedURL.path],
             "ThrottleInterval": 15,
         ], to: plistURL)
         let originalData = try Data(contentsOf: plistURL)
@@ -1264,11 +1350,11 @@ private func test3A_ProgramAndArgumentsExecution(_ tests: TestHarness) throws {
         let job = try require(try adapter.discover().first, "test3A combined launchd job")
         tests.expectEqual(
             job.command,
-            ["/bin/sh", "-c", script],
+            [probeURL.path, observedURL.path],
             "test3A launchd discovery uses Program as the executable"
         )
 
-        let store = try SQLiteRunStore(path: directory.appendingPathComponent("ticker.db").path)
+        let store = try SQLiteRunStore(path: storePath)
         let wrapper = JobWrapper(
             store: store,
             backupDirectory: directory.appendingPathComponent("backups", isDirectory: true)
@@ -1281,11 +1367,21 @@ private func test3A_ProgramAndArgumentsExecution(_ tests: TestHarness) throws {
         )
         let result = try test3A_runProcess(
             wrappedArguments[0],
-            Array(wrappedArguments.dropFirst())
+            Array(wrappedArguments.dropFirst()),
+            environment: environment
         )
         let observed = String(
             decoding: try Data(contentsOf: observedURL),
             as: UTF8.self
+        )
+        let observedLines = observed.split(whereSeparator: \.isNewline).map(String.init)
+        let observedExecutable = try require(
+            observedLines.first,
+            "test3A probe executable observation"
+        )
+        let observedArgv0 = try require(
+            observedLines.dropFirst().first,
+            "test3A probe argv zero observation"
         )
         print(
             "TRANSCRIPT test3A N-001 status=\(result.status) "
@@ -1293,9 +1389,19 @@ private func test3A_ProgramAndArgumentsExecution(_ tests: TestHarness) throws {
         )
         tests.expectEqual(result.status, 0, "test3A wrapped Program executable runs successfully")
         tests.expectEqual(
-            observed,
-            "binary=/bin/sh argv0=nightly-shell",
-            "test3A wrapped child observes the original launchd argv zero"
+            observedExecutable,
+            "executable=\(try test3A_canonicalPath(probeURL))",
+            "test3A compiled probe observes the actual Program executable identity"
+        )
+        tests.expectEqual(
+            observedArgv0,
+            "argv0=nightly-shell",
+            "test3A compiled probe observes the explicit launchd argv zero"
+        )
+        tests.expectEqual(
+            observedLines.count,
+            2,
+            "test3A compiled probe writes only executable identity and argv zero"
         )
 
         _ = try wrapper.unwrap(job: job)
@@ -2827,6 +2933,297 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                     "test13_nonTemporalSchedules_haveNoSecondLineValue"
                 )
 
+                let recentRunsNewestFirst = [
+                    Run(
+                        id: 104,
+                        jobID: "launchd:history-presentation",
+                        startedAt: Date(timeIntervalSince1970: 400),
+                        finishedAt: Date(timeIntervalSince1970: 410),
+                        exitCode: 9,
+                        stdoutTail: "partial output",
+                        stderrTail: "failed"
+                    ),
+                    Run(
+                        id: 103,
+                        jobID: "launchd:history-presentation",
+                        startedAt: Date(timeIntervalSince1970: 300),
+                        finishedAt: Date(timeIntervalSince1970: 305),
+                        exitCode: nil,
+                        stdoutTail: nil,
+                        stderrTail: nil
+                    ),
+                    Run(
+                        id: 102,
+                        jobID: "launchd:history-presentation",
+                        startedAt: Date(timeIntervalSince1970: 200),
+                        finishedAt: nil,
+                        exitCode: nil,
+                        stdoutTail: nil,
+                        stderrTail: nil
+                    ),
+                    Run(
+                        id: 101,
+                        jobID: "launchd:history-presentation",
+                        startedAt: Date(timeIntervalSince1970: 100),
+                        finishedAt: Date(timeIntervalSince1970: 104),
+                        exitCode: 0,
+                        stdoutTail: "done",
+                        stderrTail: ""
+                    ),
+                ]
+                let historyCells = JobRunHistoryPresentation.cells(
+                    from: recentRunsNewestFirst
+                )
+                try check(
+                    historyCells.map(\.id) == [101, 102, 103, 104],
+                    "test13_recentHistory_ordersOldestToNewest"
+                )
+                try check(
+                    historyCells.map(\.statusText)
+                        == ["Succeeded", "Running", "Unknown result", "Failed"],
+                    "test13_recentHistory_mapsEveryOutcome"
+                )
+                try check(
+                    Set(historyCells.map(\.symbolName)).count == 4,
+                    "test13_recentHistory_usesDistinctOutcomeShapes"
+                )
+                try check(
+                    historyCells.last?.accessibilityLabel
+                        == "Recent run 4 of 4: Failed, exit code 9",
+                    "test13_recentHistory_failureHasNonColorAccessibilityLabel"
+                )
+                try check(
+                    JobRunHistoryPresentation.cells(
+                        from: recentRunsNewestFirst,
+                        limit: 2
+                    ).map(\.id) == [103, 104],
+                    "test13_recentHistory_limitsToNewestRecords"
+                )
+                if let failedCell = historyCells.last {
+                    try check(
+                        JobRunHistoryPresentation.selection(
+                            jobID: "launchd:history-presentation",
+                            cell: failedCell
+                        ) == JobRunSelection(
+                            jobID: "launchd:history-presentation",
+                            runID: 104
+                        ),
+                        "test13_failedHistoryCell_selectsItsJobAndRun"
+                    )
+                } else {
+                    try check(false, "test13_failedHistoryCell_exists")
+                }
+
+                var navigationState = JobRunNavigationState()
+                navigationState.selectJob("launchd:history-presentation")
+                try check(
+                    navigationState.selectedJobID == "launchd:history-presentation"
+                        && navigationState.selectedRunID(
+                            for: "launchd:history-presentation"
+                        ) == nil,
+                    "test13_jobSelection_opensJobDetailsWithoutAStaleRun"
+                )
+                if let failedCell = historyCells.last {
+                    let failedSelection = JobRunHistoryPresentation.selection(
+                        jobID: "launchd:history-presentation",
+                        cell: failedCell
+                    )
+                    navigationState.selectRun(failedSelection)
+                    try check(
+                        navigationState.selectedJobID == failedSelection.jobID
+                            && navigationState.selectedRunID(for: failedSelection.jobID)
+                                == failedSelection.runID
+                            && navigationState.selectedRun(
+                                for: failedSelection.jobID,
+                                in: recentRunsNewestFirst
+                            )?.id == failedSelection.runID,
+                        "test13_historyCellClick_resolvesExactRunInspector"
+                    )
+                }
+
+                let originalWindow = stride(
+                    from: Int64(20),
+                    through: Int64(1),
+                    by: Int(-1)
+                ).map { id in
+                    Run(
+                        id: id,
+                        jobID: "launchd:shifted-history",
+                        startedAt: Date(timeIntervalSince1970: TimeInterval(id)),
+                        finishedAt: Date(timeIntervalSince1970: TimeInterval(id + 1)),
+                        exitCode: 0,
+                        stdoutTail: "run \(id)",
+                        stderrTail: ""
+                    )
+                }
+                let shiftedWindow = stride(
+                    from: Int64(21),
+                    through: Int64(2),
+                    by: Int(-1)
+                ).map { id in
+                    Run(
+                        id: id,
+                        jobID: "launchd:shifted-history",
+                        startedAt: Date(timeIntervalSince1970: TimeInterval(id)),
+                        finishedAt: Date(timeIntervalSince1970: TimeInterval(id + 1)),
+                        exitCode: 0,
+                        stdoutTail: "run \(id)",
+                        stderrTail: ""
+                    )
+                }
+                navigationState.selectRun(
+                    JobRunSelection(jobID: "launchd:shifted-history", runID: 1)
+                )
+                try check(
+                    navigationState.selectedRun(
+                        for: "launchd:shifted-history",
+                        in: originalWindow
+                    )?.id == 1,
+                    "test13_historyWindow_selectsOldestVisibleRun"
+                )
+                navigationState.reconcileRuns(
+                    for: "launchd:shifted-history",
+                    with: shiftedWindow
+                )
+                try check(
+                    navigationState.selectedRunID(for: "launchd:shifted-history") == 21
+                        && navigationState.selectedRun(
+                            for: "launchd:shifted-history",
+                            in: shiftedWindow
+                        )?.id == 21,
+                    "test13_shiftedHistoryWindow_selectsNewestReplacement"
+                )
+                navigationState.reconcileRuns(for: "launchd:shifted-history", with: [])
+                try check(
+                    navigationState.selectedJobID == "launchd:shifted-history"
+                        && navigationState.selectedRunID(for: "launchd:shifted-history") == nil,
+                    "test13_emptyReplacementWindow_clearsRunButKeepsVisibleJob"
+                )
+                navigationState.reconcileJobs([])
+                try check(
+                    navigationState.selectedJobID == nil,
+                    "test13_removedJob_returnsToCompactJobList"
+                )
+
+                var historyLoadState = JobHistoryLoadState.idle
+                historyLoadState = historyLoadState.reducing(.requested)
+                try check(
+                    historyLoadState == .loading,
+                    "test13_historyLoad_requestShowsLoading"
+                )
+                historyLoadState = historyLoadState.reducing(.succeeded)
+                try check(
+                    historyLoadState == .loaded,
+                    "test13_historyLoad_successShowsLoaded"
+                )
+                historyLoadState = historyLoadState.reducing(.requested)
+                historyLoadState = historyLoadState.reducing(.failed("database unavailable"))
+                try check(
+                    historyLoadState == .failed("database unavailable"),
+                    "test13_historyLoad_failurePreservesError"
+                )
+
+                var historyLoadGenerations = JobHistoryLoadGenerationCoordinator()
+                let requestA = historyLoadGenerations.begin(for: "launchd:overlapping-history")
+                let requestB = historyLoadGenerations.begin(for: "launchd:overlapping-history")
+                try check(
+                    historyLoadGenerations.eventIfCurrent(
+                        .succeeded,
+                        for: "launchd:overlapping-history",
+                        generation: requestA
+                    ) == nil,
+                    "test13_overlappingHistoryLoad_supersededSuccessCannotPublish"
+                )
+                try check(
+                    historyLoadGenerations.eventIfCurrent(
+                        .failed("stale database failure"),
+                        for: "launchd:overlapping-history",
+                        generation: requestA
+                    ) == nil,
+                    "test13_overlappingHistoryLoad_supersededFailureCannotPublish"
+                )
+                try check(
+                    historyLoadGenerations.eventIfCurrent(
+                        .succeeded,
+                        for: "launchd:overlapping-history",
+                        generation: requestB
+                    ) == .succeeded,
+                    "test13_overlappingHistoryLoad_newestRequestCanPublish"
+                )
+
+                let refreshHistoryJob = makeJob(
+                    id: "cron:refresh-history",
+                    environment: [:],
+                    command: ["/usr/bin/true"]
+                )
+                let refreshHistoryStore = try SQLiteRunStore(
+                    path: root.appendingPathComponent("refresh-history.sqlite").path
+                )
+                let refreshHistoryModel = AppModel(
+                    registry: JobRegistry(
+                        adapters: [
+                            StaticAdapter(source: .crontab, jobs: [refreshHistoryJob]),
+                        ]
+                    ),
+                    store: refreshHistoryStore
+                )
+                let initialRefreshRunID = try refreshHistoryStore.beginRun(
+                    jobID: refreshHistoryJob.id,
+                    startedAt: Date(timeIntervalSince1970: 1_000)
+                )
+                try refreshHistoryStore.finishRun(
+                    id: initialRefreshRunID,
+                    exitCode: 0,
+                    stdoutTail: "initial",
+                    stderrTail: "",
+                    finishedAt: Date(timeIntervalSince1970: 1_001)
+                )
+                refreshHistoryModel.loadRuns(for: refreshHistoryJob)
+                try check(
+                    waitUntil {
+                        refreshHistoryModel.runsByJob[refreshHistoryJob.id]?.map(\.id)
+                            == [initialRefreshRunID]
+                    },
+                    "test16 initial visible history did not load"
+                )
+                var stableRefreshSelection = JobRunNavigationState()
+                stableRefreshSelection.selectRun(
+                    JobRunSelection(
+                        jobID: refreshHistoryJob.id,
+                        runID: initialRefreshRunID
+                    )
+                )
+                let newlyInsertedRunID = try refreshHistoryStore.beginRun(
+                    jobID: refreshHistoryJob.id,
+                    startedAt: Date(timeIntervalSince1970: 2_000)
+                )
+                try refreshHistoryStore.finishRun(
+                    id: newlyInsertedRunID,
+                    exitCode: 0,
+                    stdoutTail: "new",
+                    stderrTail: "",
+                    finishedAt: Date(timeIntervalSince1970: 2_001)
+                )
+                refreshHistoryModel.refresh()
+                try check(
+                    waitUntil {
+                        refreshHistoryModel.runsByJob[refreshHistoryJob.id]?.map(\.id)
+                            == [newlyInsertedRunID, initialRefreshRunID]
+                    },
+                    "test16 model refresh did not reload the existing history window"
+                )
+                let refreshedWindow = refreshHistoryModel.runsByJob[refreshHistoryJob.id] ?? []
+                stableRefreshSelection.reconcileRuns(
+                    for: refreshHistoryJob.id,
+                    with: refreshedWindow
+                )
+                try check(
+                    stableRefreshSelection.selectedRunID(for: refreshHistoryJob.id)
+                        == initialRefreshRunID,
+                    "test16 history refresh discarded a selected run still in the window"
+                )
+                print("APP HARNESS test16_denseHistoryRefresh PASS")
+
                 try check(
                     JobDisplayName.candidate(for: "com.skyvern.daily-summary") == "Daily summary",
                     "test13_displayName_humanizesSafeFinalComponent"
@@ -3057,6 +3454,10 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
         tests.expect(
             output.contains("APP HARNESS test11_recorderDiagnosticClearing PASS"),
             "test11_appRefresh_removesResolvedRecorderDiagnostic"
+        )
+        tests.expect(
+            output.contains("APP HARNESS test16_denseHistoryRefresh PASS"),
+            "test16_existingDenseHistory_refreshesWithoutRecreatingModelOrSelection"
         )
     }
 }
@@ -5338,11 +5739,16 @@ private func test10_RuntimeOwnershipAndDiagnostics(_ tests: TestHarness) throws 
         ]
         let delayedPIDResult = try test3A_runProcess(fixture.arguments[0],
             Array(fixture.arguments.dropFirst()), environment: environment)
-        tests.expectEqual(delayedPIDResult.status, 0, "test10_noPIDYet_stillExecutesChild")
-        tests.expect(FileManager.default.fileExists(atPath: marker.path),
-                     "test10_noPIDYet_provesChildExecuted")
+        tests.expectEqual(delayedPIDResult.status, 1, "test10_noPIDYet_failsClosed")
+        tests.expect(!FileManager.default.fileExists(atPath: marker.path),
+                     "test10_noPIDYet_doesNotExecuteChild")
+        tests.expect(
+            delayedPIDResult.stderr.contains("scheduled wrapper authorization failed")
+                && delayedPIDResult.stderr.contains("child was not executed"),
+            "test10_noPIDYet_reportsAuthorizationFailure"
+        )
         tests.expectEqual(try store.runs(jobID: fixture.job.id, limit: 10).count, 0,
-                          "test10_noPIDYet_doesNotAttributeUnprovenRun")
+                          "test10_noPIDYet_doesNotCreateRunHistory")
         let delayedPIDDiagnostic = try store.recorderDiagnostics().first?.message
         tests.expect(delayedPIDDiagnostic?.contains("has not published") == true,
                      "test10_noPIDYet_persistsDistinctRecorderDiagnostic")
@@ -5360,7 +5766,12 @@ private func test10_RuntimeOwnershipAndDiagnostics(_ tests: TestHarness) throws 
             ],
             environment: environment
         )
-        tests.expectEqual(forged.status, 1, "test10_handRunScheduledInjection_executesSuppliedChild")
+        tests.expectEqual(forged.status, 1, "test10_handRunScheduledInjection_failsClosed")
+        tests.expect(
+            forged.stderr.contains("scheduled wrapper authorization failed")
+                && forged.stderr.contains("child was not executed"),
+            "test10_handRunScheduledInjection_reportsAuthorizationFailure"
+        )
         tests.expectEqual(try store.runs(jobID: fixture.job.id, limit: 10).count, 0,
                           "test10_handRunScheduledInjection_cannotForgeHistory")
         let forgedDiagnostic = try store.recorderDiagnostics().first?.message
@@ -5386,14 +5797,18 @@ private func test10_RuntimeOwnershipAndDiagnostics(_ tests: TestHarness) throws 
             )
             tests.expectEqual(
                 differentPIDResult.status,
-                0,
-                "test11_exactCommandDifferentPID_stillExecutesChild"
+                1,
+                "test11_exactCommandDifferentPID_failsClosed"
             )
         }
+        tests.expect(
+            !FileManager.default.fileExists(atPath: marker.path),
+            "test11_exactCommandDifferentPID_doesNotExecuteChild"
+        )
         tests.expectEqual(
             try store.runs(jobID: fixture.job.id, limit: 10).count,
             0,
-            "test11_exactCommandDifferentPID_cannotAttributeHistory"
+            "test11_exactCommandDifferentPID_doesNotCreateRunHistory"
         )
         let differentPIDDiagnostic = try store.recorderDiagnostics().first?.message
         tests.expect(
@@ -5409,6 +5824,118 @@ private func test10_RuntimeOwnershipAndDiagnostics(_ tests: TestHarness) throws 
         let ownedLaunchctl = try test10_fakeLaunchctl(in: directory)
         var ownedEnvironment = environment
         ownedEnvironment["TICKER_TEST_LAUNCHCTL_PATH"] = ownedLaunchctl.path
+        try test10_setRunStartFailure(
+            at: URL(fileURLWithPath: compiledStorePath),
+            enabled: true
+        )
+        let failedStartResult = try test3A_runProcess(
+            fixture.arguments[0],
+            Array(fixture.arguments.dropFirst()),
+            environment: ownedEnvironment
+        )
+        try test10_setRunStartFailure(
+            at: URL(fileURLWithPath: compiledStorePath),
+            enabled: false
+        )
+        tests.expectEqual(
+            failedStartResult.status,
+            1,
+            "test11_durableRunStartFailure_failsClosed"
+        )
+        tests.expect(
+            !FileManager.default.fileExists(atPath: marker.path),
+            "test11_durableRunStartFailure_doesNotExecuteChild"
+        )
+        tests.expect(
+            failedStartResult.stderr.contains("scheduled durable run-start failed")
+                && failedStartResult.stderr.contains("child was not executed"),
+            "test11_durableRunStartFailure_reportsFailureClass"
+        )
+        tests.expectEqual(
+            try store.runs(jobID: fixture.job.id, limit: 10).count,
+            0,
+            "test11_durableRunStartFailure_doesNotCreatePartialHistory"
+        )
+
+        try test16_setRunFinishFailure(
+            at: URL(fileURLWithPath: compiledStorePath),
+            enabled: true
+        )
+        let failedFinishResult = try test3A_runProcess(
+            fixture.arguments[0],
+            Array(fixture.arguments.dropFirst()),
+            environment: ownedEnvironment
+        )
+        try test16_setRunFinishFailure(
+            at: URL(fileURLWithPath: compiledStorePath),
+            enabled: false
+        )
+        tests.expect(
+            FileManager.default.fileExists(atPath: marker.path),
+            "test16_durableRunFinishFailure_provesChildExecuted"
+        )
+        tests.expectEqual(
+            failedFinishResult.status,
+            74,
+            "test16_zeroExitWithDurableRunFinishFailure_usesReservedWrapperExit"
+        )
+        tests.expect(
+            failedFinishResult.stderr.contains("scheduled durable run-finish failed")
+                && failedFinishResult.stderr.contains("child exited 0")
+                && failedFinishResult.stderr.contains("wrapper exiting 74"),
+            "test16_durableRunFinishFailure_reportsFailureClass"
+        )
+        let unfinalizedRun = try require(
+            try store.latestRun(jobID: fixture.job.id),
+            "test16 unfinalized scheduled run"
+        )
+        tests.expect(
+            unfinalizedRun.finishedAt == nil
+                && unfinalizedRun.exitCode == nil
+                && unfinalizedRun.outcome != .success,
+            "test16_durableRunFinishFailure_doesNotPublishFalseSuccess"
+        )
+        try FileManager.default.removeItem(at: marker)
+
+        let nonzeroMarker = directory.appendingPathComponent("nonzero-child-launched.txt")
+        let nonzeroFixture = try test10_wrappedInvocation(
+            directory: directory,
+            label: "com.example.test16.finish-nonzero",
+            command: [
+                "/bin/sh", "-c",
+                "printf launched > '\(nonzeroMarker.path)'; exit 23",
+            ],
+            tickerPath: tickerPath,
+            store: store
+        )
+        try test16_setRunFinishFailure(
+            at: URL(fileURLWithPath: compiledStorePath),
+            enabled: true
+        )
+        let nonzeroFinishResult = try test3A_runProcess(
+            nonzeroFixture.arguments[0],
+            Array(nonzeroFixture.arguments.dropFirst()),
+            environment: ownedEnvironment
+        )
+        try test16_setRunFinishFailure(
+            at: URL(fileURLWithPath: compiledStorePath),
+            enabled: false
+        )
+        tests.expect(
+            FileManager.default.fileExists(atPath: nonzeroMarker.path),
+            "test16_nonzeroChildWithFinishFailure_provesChildExecuted"
+        )
+        tests.expectEqual(
+            nonzeroFinishResult.status,
+            23,
+            "test16_nonzeroChildWithFinishFailure_preservesChildExit"
+        )
+        tests.expect(
+            nonzeroFinishResult.stderr.contains("scheduled durable run-finish failed")
+                && nonzeroFinishResult.stderr.contains("preserving child exit 23"),
+            "test16_nonzeroChildWithFinishFailure_reportsPreservedExit"
+        )
+
         let ownedResult = try test3A_runProcess(
             fixture.arguments[0],
             Array(fixture.arguments.dropFirst()),
@@ -5417,17 +5944,26 @@ private func test10_RuntimeOwnershipAndDiagnostics(_ tests: TestHarness) throws 
         tests.expectEqual(
             ownedResult.status,
             0,
-            "test11_nextSuccessfulAuthorization_executesChild"
+            "test11_authorizedPersistedStart_executesChild"
         )
-        tests.expectEqual(
-            try store.runs(jobID: fixture.job.id, limit: 10).count,
-            1,
-            "test11_nextSuccessfulAuthorization_recordsHistory"
+        tests.expect(
+            FileManager.default.fileExists(atPath: marker.path),
+            "test11_authorizedPersistedStart_provesChildExecuted"
         )
+        let completedRun = try require(
+            try store.latestRun(jobID: fixture.job.id),
+            "test11 authorized completed run"
+        )
+        tests.expect(completedRun.finishedAt != nil,
+                     "test11_authorizedPersistedStart_finalizesRun")
+        tests.expectEqual(completedRun.exitCode, 0,
+                          "test11_authorizedPersistedStart_recordsChildExit")
+        tests.expectEqual(completedRun.outcome, .success,
+                          "test11_authorizedPersistedStart_recordsSuccess")
         tests.expectEqual(
             try store.recorderDiagnostics(),
             [],
-            "test11_nextSuccessfulAuthorization_clearsDiagnostic"
+            "test11_authorizedPersistedStart_clearsDiagnostic"
         )
     }
 }
@@ -5461,6 +5997,76 @@ private func test11_recorderDiagnosticRowCount(at databaseURL: URL) throws -> In
         throw FixtureError.missing("test11 read recorder diagnostic count")
     }
     return Int(sqlite3_column_int64(statement, 0))
+}
+
+private func test10_setRunStartFailure(at databaseURL: URL, enabled: Bool) throws {
+    var database: OpaquePointer?
+    let openResult = sqlite3_open_v2(
+        databaseURL.path,
+        &database,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX,
+        nil
+    )
+    guard openResult == SQLITE_OK, let database else {
+        throw FixtureError.missing("test10 open database for run-start failure injection")
+    }
+    defer { sqlite3_close(database) }
+
+    let statement = enabled
+        ? """
+          CREATE TRIGGER ticker_tests_fail_run_start
+          BEFORE INSERT ON runs
+          BEGIN
+            SELECT RAISE(FAIL, 'injected durable run-start failure');
+          END;
+          """
+        : "DROP TRIGGER IF EXISTS ticker_tests_fail_run_start;"
+    var errorMessage: UnsafeMutablePointer<CChar>?
+    let result = sqlite3_exec(database, statement, nil, nil, &errorMessage)
+    let detail = errorMessage.map { String(cString: $0) }
+    if let errorMessage {
+        sqlite3_free(errorMessage)
+    }
+    guard result == SQLITE_OK else {
+        throw FixtureError.missing(
+            "test10 configure run-start failure injection: \(detail ?? "SQLite error \(result)")"
+        )
+    }
+}
+
+private func test16_setRunFinishFailure(at databaseURL: URL, enabled: Bool) throws {
+    var database: OpaquePointer?
+    let openResult = sqlite3_open_v2(
+        databaseURL.path,
+        &database,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX,
+        nil
+    )
+    guard openResult == SQLITE_OK, let database else {
+        throw FixtureError.missing("test10 open database for run-finish failure injection")
+    }
+    defer { sqlite3_close(database) }
+
+    let statement = enabled
+        ? """
+          CREATE TRIGGER ticker_tests_fail_run_finish
+          BEFORE UPDATE OF finished_at ON runs
+          BEGIN
+            SELECT RAISE(FAIL, 'injected durable run-finish failure');
+          END;
+          """
+        : "DROP TRIGGER IF EXISTS ticker_tests_fail_run_finish;"
+    var errorMessage: UnsafeMutablePointer<CChar>?
+    let result = sqlite3_exec(database, statement, nil, nil, &errorMessage)
+    let detail = errorMessage.map { String(cString: $0) }
+    if let errorMessage {
+        sqlite3_free(errorMessage)
+    }
+    guard result == SQLITE_OK else {
+        throw FixtureError.missing(
+            "test10 configure run-finish failure injection: \(detail ?? "SQLite error \(result)")"
+        )
+    }
 }
 
 private func test11_RecorderDiagnosticsAreCurrentAndBounded(_ tests: TestHarness) throws {
@@ -5577,11 +6183,14 @@ private func test9_CopiedWrapperRuntimeOwnership(_ tests: TestHarness) throws {
             "test9 copied wrapper arguments")
         let copiedResult = try test3A_runProcess(copiedArguments[0],
             Array(copiedArguments.dropFirst()), environment: environment)
-        tests.expectEqual(copiedResult.status, 0, "test9_copiedWrapper_stillExecutesChild")
-        tests.expectEqual(copiedResult.stdout, "owner\n",
-                          "test10_copiedWrapper_provesChildActuallyLaunched")
-        tests.expect(copiedResult.stderr.contains("scheduled wrapper ownership not proven"),
-                     "test9_copiedWrapper_reportsOwnershipFailureClearly")
+        tests.expectEqual(copiedResult.status, 1, "test9_copiedWrapper_failsClosed")
+        tests.expectEqual(copiedResult.stdout, "",
+                          "test10_copiedWrapper_doesNotExecuteChild")
+        tests.expect(
+            copiedResult.stderr.contains("scheduled wrapper authorization failed")
+                && copiedResult.stderr.contains("child was not executed"),
+            "test9_copiedWrapper_reportsAuthorizationFailureClearly"
+        )
         tests.expectEqual(try store.runs(jobID: owner.job.id, limit: 10).count, 1,
                           "test9_copiedWrapper_leavesVictimHistoryUnchanged")
 
@@ -5615,11 +6224,17 @@ private func test9_CopiedWrapperRuntimeOwnership(_ tests: TestHarness) throws {
         )
         tests.expectEqual(
             pathBoundResult.status,
-            0,
-            "test11_differentLabelCopiedWrapper_stillExecutesChild"
+            1,
+            "test11_differentLabelCopiedWrapper_failsClosed"
+        )
+        tests.expectEqual(
+            pathBoundResult.stdout,
+            "",
+            "test11_differentLabelCopiedWrapper_doesNotExecuteChild"
         )
         tests.expect(
-            pathBoundResult.stderr.contains("scheduled wrapper ownership not proven"),
+            pathBoundResult.stderr.contains("scheduled wrapper authorization failed")
+                && pathBoundResult.stderr.contains("child was not executed"),
             "test11_differentLabelCopiedWrapper_reportsPathIdentityFailure"
         )
         tests.expectEqual(
@@ -6029,6 +6644,80 @@ private func test13_ProvenanceClassificationAndCaching(_ tests: TestHarness) thr
             .system,
             "test14_usrBinPath_isPositiveSystemProof"
         )
+
+        let tickerExecutable = "/Applications/Ticker.app/Contents/MacOS/Ticker"
+        let tickerLaunchAgents = home.appendingPathComponent(
+            "Library/LaunchAgents",
+            isDirectory: true
+        )
+        let exactTickerFallback = tickerLaunchAgents.appendingPathComponent(
+            "com.suchintan.ticker.login.plist"
+        )
+        tests.expectEqual(
+            classifier.classify(
+                source: .launchd,
+                command: [tickerExecutable],
+                configPath: exactTickerFallback.path,
+                launchdLabel: "com.suchintan.ticker.login",
+                effectiveExecutable: tickerExecutable
+            ).provenance,
+            .ticker,
+            "test13_exactTickerFallback_isTicker"
+        )
+
+        for lookalikeLabel in [
+            "com.suchintan.ticker",
+            "com.suchintan.ticker.login.backup",
+        ] {
+            tests.expectEqual(
+                classifier.classify(
+                    source: .launchd,
+                    command: [tickerExecutable],
+                    configPath: tickerLaunchAgents
+                        .appendingPathComponent("\(lookalikeLabel).plist").path,
+                    launchdLabel: lookalikeLabel,
+                    effectiveExecutable: tickerExecutable
+                ).provenance,
+                .app("Ticker"),
+                "test13_tickerLookalikeLabel_\(lookalikeLabel)_isNotTicker"
+            )
+        }
+
+        let copyWithTickerArgument = classifier.classify(
+            source: .launchd,
+            command: ["/bin/cp", tickerExecutable, root.appendingPathComponent("copy").path],
+            configPath: exactTickerFallback.path
+        )
+        tests.expectEqual(
+            copyWithTickerArgument.provenance,
+            .system,
+            "test13_programExecutableWinsOverLaterTickerArgument"
+        )
+        tests.expectEqual(
+            copyWithTickerArgument.attention,
+            nil,
+            "test13_laterTickerArgument_doesNotCreatePayloadAttention"
+        )
+
+        let backupProgram = home.appendingPathComponent("ticker-backup")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: backupProgram)
+        let backupClassification = classifier.classify(
+            source: .launchd,
+            command: [backupProgram.path, tickerExecutable],
+            configPath: tickerLaunchAgents
+                .appendingPathComponent("com.suchintan.ticker.backup.plist").path
+        )
+        tests.expectEqual(
+            backupClassification.provenance,
+            .yours,
+            "test13_tickerBackupJob_preservesUserManagedProvenance"
+        )
+        tests.expectEqual(
+            backupClassification.attention,
+            nil,
+            "test13_tickerBackupJob_preservesHealthyAttentionState"
+        )
+
         tests.expectEqual(
             classifier.classify(source: .crontab, command: [], configPath: nil).provenance,
             .yours,
@@ -6169,12 +6858,6 @@ private func test13_UIArchitectureContract(_ tests: TestHarness) throws {
     )
 
     tests.expect(
-        listSource.contains("NavigationSplitView")
-            && listSource.contains("List(selection:")
-            && listSource.contains(".listStyle(.sidebar)"),
-        "test13_sidebar_usesNativeNavigationAndSelection"
-    )
-    tests.expect(
         listSource.contains("@AppStorage")
             && listSource.contains("DisclosureGroup")
             && listSource.contains("Section(\"My Jobs\")"),
@@ -6193,10 +6876,10 @@ private func test13_UIArchitectureContract(_ tests: TestHarness) throws {
         "test13_sidebar_removesLegacyChromeAndRoutineCapsules"
     )
     tests.expect(
-        detailSource.contains("Table(")
+        detailSource.contains("Run inspector")
             && detailSource.contains("DisclosureGroup(\"Configuration\")")
             && detailSource.contains("DisclosureGroup(\"Advanced\")"),
-        "test13_detail_prioritizesHistoryAndCollapsesDiagnostics"
+        "test13_detail_prioritizesDirectRunInspectionAndCollapsesDiagnostics"
     )
     tests.expect(
         detailSource.contains("truncationMode(.middle)")
@@ -6519,6 +7202,54 @@ private func test14_LaunchdFormsAndDiagnostics(_ tests: TestHarness) throws {
             to: agents.appendingPathComponent("shell-builtin.plist")
         )
 
+        let tickerExecutable = "/Applications/Ticker.app/Contents/MacOS/Ticker"
+        let tickerLabel = "com.suchintan.ticker.login"
+        try writePropertyList(
+            [
+                "Label": "com.example.foreign-ticker-label",
+                "ProgramArguments": [tickerExecutable],
+            ],
+            to: agents.appendingPathComponent("com.suchintan.ticker.login.plist")
+        )
+        try writePropertyList(
+            [
+                "Label": tickerLabel,
+                "Program": "/bin/false",
+                "ProgramArguments": [
+                    tickerExecutable,
+                    "run",
+                    "--ticker-wrapper-version",
+                    LaunchdWrapper.currentVersion,
+                    "--label",
+                    tickerLabel,
+                    "--",
+                    tickerExecutable,
+                ],
+            ],
+            to: agents.appendingPathComponent("ticker-program-precedence.plist")
+        )
+        try writePropertyList(
+            [
+                "Label": "com.suchintan.ticker.login.backup",
+                "ProgramArguments": [tickerExecutable],
+            ],
+            to: agents.appendingPathComponent("com.suchintan.ticker.login.backup.plist")
+        )
+        try writePropertyList(
+            [
+                "Label": tickerLabel,
+                "ProgramArguments": ["/bin/cp", tickerExecutable, bin.path],
+            ],
+            to: agents.appendingPathComponent("ticker-reference-only.plist")
+        )
+        try writePropertyList(
+            [
+                "Label": tickerLabel,
+                "ProgramArguments": [tickerExecutable],
+            ],
+            to: agents.appendingPathComponent("ticker-positive.plist")
+        )
+
         let adapter = LaunchdAdapter(
             searchDirectories: [agents],
             homeDirectory: home
@@ -6562,6 +7293,49 @@ private func test14_LaunchdFormsAndDiagnostics(_ tests: TestHarness) throws {
             shellBuiltin.attention,
             nil,
             "test14_shellC_doesNotStatAbsoluteRedirectionTarget"
+        )
+
+        func provenanceForConfiguration(_ filename: String) throws -> JobProvenance {
+            try require(
+                jobs.first { $0.configPath?.hasSuffix("/\(filename)") == true },
+                "test14 launchd provenance fixture \(filename)"
+            ).provenance
+        }
+        tests.expectEqual(
+            try provenanceForConfiguration("com.suchintan.ticker.login.plist"),
+            .app("Ticker"),
+            "test14_adapter_foreignParsedLabelIsNotTicker"
+        )
+        tests.expectEqual(
+            try provenanceForConfiguration("ticker-program-precedence.plist"),
+            .system,
+            "test14_adapter_programOverridesWrapperShapedProgramArguments"
+        )
+        let programPrecedenceJob = try require(
+            jobs.first {
+                $0.configPath?.hasSuffix("/ticker-program-precedence.plist") == true
+            },
+            "test14 Program precedence job"
+        )
+        tests.expect(
+            programPrecedenceJob.command.first == "/bin/false"
+                && !programPrecedenceJob.managed,
+            "test14_adapter_programPrecedencePreservesLiteralLogicalCommand"
+        )
+        tests.expectEqual(
+            try provenanceForConfiguration("com.suchintan.ticker.login.backup.plist"),
+            .app("Ticker"),
+            "test14_adapter_lookalikeConfigurationNameIsNotTicker"
+        )
+        tests.expectEqual(
+            try provenanceForConfiguration("ticker-reference-only.plist"),
+            .system,
+            "test14_adapter_arbitraryTickerAppReferenceIsNotTicker"
+        )
+        tests.expectEqual(
+            try provenanceForConfiguration("ticker-positive.plist"),
+            .ticker,
+            "test14_adapter_exactParsedFallbackIdentityIsTicker"
         )
 
         let directPayload = bin.appendingPathComponent("direct-nightly")
@@ -6853,6 +7627,25 @@ private func test14_UISafetyContract(_ tests: TestHarness) throws {
         listSource.contains("allYourJobs.isEmpty && !allOtherJobs.isEmpty"),
         "test14_onlyOtherJobs_autoExpandsVisibleRows"
     )
+    let confirmedThirdPartyRowContracts: [(JobProvenance, [String])] = [
+        (.ticker, ["tickerJobs", "jobRows(tickerJobs)", "subgroupHeader(\"Ticker\""]),
+        (.app("Example"), ["appJobs", "jobRows(appJobs.filter"]),
+        (.packageManager("Example"), ["packageManagerJobs", "jobRows(packageManagerJobs)"]),
+        (.system, ["systemJobs", "jobRows(systemJobs)"]),
+    ]
+    for (provenance, rowPathTokens) in confirmedThirdPartyRowContracts {
+        tests.expect(
+            provenance.isConfirmedThirdParty
+                && rowPathTokens.allSatisfy { listSource.contains($0) },
+            "test14_confirmedThirdParty_\(provenance.kind)_hasVisibleRowPath"
+        )
+    }
+    tests.expect(
+        listSource.contains("otherJobs.filter { $0.provenance == .ticker }")
+            && listSource.contains("Text(\"Other Jobs\")")
+            && listSource.contains("allOtherJobs.count"),
+        "test14_tickerSubgroup_rowsAndOtherJobsCountUseSamePopulation"
+    )
     tests.expect(
         listSource.contains("lastPathComponent")
             && listSource.contains("shortID")
@@ -6873,6 +7666,6264 @@ private func test14_UISafetyContract(_ tests: TestHarness) throws {
     )
 }
 
+
+private func test16_LoginAtBootAndFallbackVerification(_ tests: TestHarness) throws {
+    try withTemporaryDirectory("round16-login-fallback") { root in
+        let agentTarget = "gui/\(getuid())/com.suchintan.ticker.login"
+        let agentPlist = root
+            .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+            .appendingPathComponent("com.suchintan.ticker.login.plist")
+        let installedExecutable = "/Applications/Ticker.app/Contents/MacOS/Ticker"
+
+        func fallbackPlistURL(for home: URL) -> URL {
+            home.appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+                .appendingPathComponent("com.suchintan.ticker.login.plist")
+        }
+
+        func writeFallbackPlist(
+            home: URL,
+            label: String = "com.suchintan.ticker.login",
+            arguments: [String],
+            program: String? = nil
+        ) throws {
+            let url = fallbackPlistURL(for: home)
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            var propertyList: [String: Any] = [
+                "Label": label,
+                "ProgramArguments": arguments,
+                "RunAtLoad": true,
+            ]
+            if let program {
+                propertyList["Program"] = program
+            }
+            let data = try PropertyListSerialization.data(
+                fromPropertyList: propertyList,
+                format: .xml,
+                options: 0
+            )
+            try data.write(to: url, options: .atomic)
+        }
+
+        func liveServiceOutput(executable: String) -> String {
+            """
+            \(agentTarget) = {
+                state = running
+                program = \(executable)
+            }
+            """
+        }
+
+        let stagedBundle = root.appendingPathComponent(
+            "staged/Ticker.app",
+            isDirectory: true
+        )
+        let stagedHelper = stagedBundle.appendingPathComponent(
+            "Contents/Helpers/ticker",
+            isDirectory: false
+        )
+        try FileManager.default.createDirectory(
+            at: stagedHelper.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: stagedHelper)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: stagedHelper.path
+        )
+        let stagedCLISymlink = root.appendingPathComponent("bin/ticker")
+        try FileManager.default.createDirectory(
+            at: stagedCLISymlink.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: stagedCLISymlink,
+            withDestinationURL: stagedHelper
+        )
+        let resolvedStagedBundle = LoginItemController.bundlePath(
+            enclosingHelperExecutableAt: stagedCLISymlink.path
+        )
+        let actualStagedBundlePath = stagedBundle
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL.path
+        tests.expectEqual(
+            resolvedStagedBundle,
+            actualStagedBundlePath,
+            "test16_loginHelper_symlinkResolvesToActualStagedBundle"
+        )
+
+        var stagedMutationLaunchctlCalls: [[String]] = []
+        var stagedMutationServiceQueries = 0
+        var stagedMutationRegisterCalls = 0
+        var stagedMutationUnregisterCalls = 0
+        let stagedMutationController = LoginItemController(
+            bundlePath: resolvedStagedBundle,
+            homeDirectory: root.appendingPathComponent("staged-mutation-home"),
+            launchctl: { arguments in
+                stagedMutationLaunchctlCalls.append(arguments)
+                return LoginItemCommandResult(status: 0)
+            },
+            serviceState: {
+                stagedMutationServiceQueries += 1
+                return .enabled
+            },
+            registerService: { stagedMutationRegisterCalls += 1 },
+            unregisterService: { stagedMutationUnregisterCalls += 1 }
+        )
+        let expectedStagedRejection = LoginItemState.notInstalled(
+            running: actualStagedBundlePath,
+            expected: LoginItemController.installedBundlePath
+        )
+        tests.expectEqual(
+            stagedMutationController.enable(),
+            expectedStagedRejection,
+            "test16_stagedHelper_enableIsRejectedAsNotInstalled"
+        )
+        tests.expectEqual(
+            stagedMutationController.disable(),
+            expectedStagedRejection,
+            "test16_stagedHelper_disableIsRejectedAsNotInstalled"
+        )
+        tests.expect(
+            stagedMutationLaunchctlCalls.isEmpty
+                && stagedMutationServiceQueries == 0
+                && stagedMutationRegisterCalls == 0
+                && stagedMutationUnregisterCalls == 0,
+            "test16_stagedHelper_mutationsPerformNoServiceManagementOrLaunchctlWork"
+        )
+
+        var stagedStatusLaunchctlCalls: [[String]] = []
+        var stagedStatusServiceQueries = 0
+        var stagedStatusMutationCalls = 0
+        let stagedStatusController = LoginItemController(
+            bundlePath: resolvedStagedBundle,
+            homeDirectory: root.appendingPathComponent("staged-status-home"),
+            launchctl: { arguments in
+                stagedStatusLaunchctlCalls.append(arguments)
+                return LoginItemCommandResult(status: 113, stderr: "Could not find service")
+            },
+            serviceState: {
+                stagedStatusServiceQueries += 1
+                return .disabled
+            },
+            registerService: { stagedStatusMutationCalls += 1 },
+            unregisterService: { stagedStatusMutationCalls += 1 }
+        )
+        tests.expectEqual(
+            stagedStatusController.state(),
+            .disabled,
+            "test16_stagedHelper_statusStillQueriesLiveState"
+        )
+        tests.expect(
+            stagedStatusLaunchctlCalls
+                == [["print", agentTarget], ["print", agentTarget]]
+                && stagedStatusServiceQueries == 1
+                && stagedStatusMutationCalls == 0,
+            "test16_stagedHelper_statusIsReadOnly"
+        )
+
+        let stagedProcessBundle = root.appendingPathComponent(
+            "staged-process/Ticker.app",
+            isDirectory: true
+        )
+        let stagedProcessHelper = stagedProcessBundle.appendingPathComponent(
+            "Contents/Helpers/ticker",
+            isDirectory: false
+        )
+        try FileManager.default.createDirectory(
+            at: stagedProcessHelper.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.copyItem(
+            atPath: test3A_builtCLIPath(),
+            toPath: stagedProcessHelper.path
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: stagedProcessHelper.path
+        )
+        let stagedProcessHome = root.appendingPathComponent(
+            "staged-process-home",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: stagedProcessHome,
+            withIntermediateDirectories: true
+        )
+        let stagedProcessEnvironment = [
+            "TICKER_TEST_LOGIN_ITEM_HOME": stagedProcessHome.path
+        ]
+        let stagedProcessPath = stagedProcessBundle
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .standardizedFileURL.path
+        let stagedProcessDiagnostic =
+            "not installed: running from \(stagedProcessPath), "
+            + "expected \(LoginItemController.installedBundlePath)\n"
+
+        let stagedProcessEnable = try test3A_runProcess(
+            stagedProcessHelper.path,
+            ["login-item", "enable"],
+            environment: stagedProcessEnvironment
+        )
+        tests.expectEqual(
+            stagedProcessEnable.status,
+            1,
+            "test16_stagedCLIProcess_enableReturnsNonzero"
+        )
+        tests.expectEqual(
+            stagedProcessEnable.stdout,
+            stagedProcessDiagnostic,
+            "test16_stagedCLIProcess_enablePrintsNotInstalledDiagnostic"
+        )
+        tests.expectEqual(
+            stagedProcessEnable.stderr,
+            "ticker: could not change the login item\n",
+            "test16_stagedCLIProcess_enableReportsRejectedMutation"
+        )
+
+        let stagedProcessDisable = try test3A_runProcess(
+            stagedProcessHelper.path,
+            ["login-item", "disable"],
+            environment: stagedProcessEnvironment
+        )
+        tests.expectEqual(
+            stagedProcessDisable.status,
+            1,
+            "test16_stagedCLIProcess_disableReturnsNonzero"
+        )
+        tests.expectEqual(
+            stagedProcessDisable.stdout,
+            stagedProcessDiagnostic,
+            "test16_stagedCLIProcess_disablePrintsNotInstalledDiagnostic"
+        )
+        tests.expectEqual(
+            stagedProcessDisable.stderr,
+            "ticker: could not change the login item\n",
+            "test16_stagedCLIProcess_disableReportsRejectedMutation"
+        )
+
+        let stagedProcessStatus = try test3A_runProcess(
+            stagedProcessHelper.path,
+            ["login-item", "status"],
+            environment: stagedProcessEnvironment
+        )
+        tests.expectEqual(
+            stagedProcessStatus.status,
+            0,
+            "test16_stagedCLIProcess_statusReturnsZero"
+        )
+        tests.expectEqual(
+            stagedProcessStatus.stdout,
+            "disabled\n",
+            "test16_stagedCLIProcess_statusRemainsReadOnly"
+        )
+        tests.expectEqual(
+            stagedProcessStatus.stderr,
+            "",
+            "test16_stagedCLIProcess_statusReportsNoError"
+        )
+
+        let stagedConflictHome = root.appendingPathComponent(
+            "staged-conflict-process-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(
+            home: stagedConflictHome,
+            arguments: [installedExecutable]
+        )
+        var stagedConflictEnvironment = stagedProcessEnvironment
+        stagedConflictEnvironment["TICKER_TEST_LOGIN_ITEM_HOME"] =
+            stagedConflictHome.path
+        stagedConflictEnvironment["TICKER_TEST_LOGIN_ITEM_AGENT_STATE"] = "live"
+        stagedConflictEnvironment["TICKER_TEST_LOGIN_ITEM_SERVICE_STATE"] = "enabled"
+        let stagedConflictStatus = try test3A_runProcess(
+            stagedProcessHelper.path,
+            ["login-item", "status"],
+            environment: stagedConflictEnvironment
+        )
+        tests.expectEqual(
+            stagedConflictStatus.status,
+            1,
+            "test16_loginCLI_conflictingMechanismsReturnNonzero"
+        )
+        tests.expectEqual(
+            stagedConflictStatus.stdout,
+            "failed: Login item conflict: LaunchAgent is live while the System Settings "
+                + "login item is enabled.\n",
+            "test16_loginCLI_conflictingMechanismsPrintConflict"
+        )
+        tests.expectEqual(
+            stagedConflictStatus.stderr,
+            "ticker: could not change the login item\n",
+            "test16_loginCLI_conflictingMechanismsReportOperationFailure"
+        )
+
+        let stagedProcessImplicitStatus = try test3A_runProcess(
+            stagedProcessHelper.path,
+            ["login-item"],
+            environment: stagedProcessEnvironment
+        )
+        tests.expectEqual(
+            stagedProcessImplicitStatus.status,
+            0,
+            "test16_loginCLI_zeroArgumentsDefaultsToStatus"
+        )
+        tests.expectEqual(
+            stagedProcessImplicitStatus.stdout,
+            "disabled\n",
+            "test16_loginCLI_zeroArgumentsReadsStatus"
+        )
+
+        let stagedProcessExtraArgument = try test3A_runProcess(
+            stagedProcessHelper.path,
+            ["login-item", "enable", "--typo"],
+            environment: stagedProcessEnvironment
+        )
+        tests.expectEqual(
+            stagedProcessExtraArgument.status,
+            2,
+            "test16_loginCLI_extraArgumentReturnsUsageTwo"
+        )
+        tests.expectEqual(
+            stagedProcessExtraArgument.stdout,
+            "",
+            "test16_loginCLI_extraArgumentProducesNoStateOutput"
+        )
+        tests.expectEqual(
+            stagedProcessExtraArgument.stderr,
+            "ticker: login-item accepts no arguments or exactly one of status, enable, or disable\n"
+                + "Run 'ticker --help' for usage.\n",
+            "test16_loginCLI_extraArgumentReportsUsage"
+        )
+        tests.expectEqual(
+            try FileManager.default.contentsOfDirectory(atPath: stagedProcessHome.path),
+            [],
+            "test16_loginCLI_extraArgumentLeavesMutationHomeUntouched"
+        )
+
+        func assertStalePlistRepair(
+            homeName: String,
+            staleExecutable: String,
+            testName: String
+        ) throws {
+            let home = root.appendingPathComponent(homeName, isDirectory: true)
+            try writeFallbackPlist(home: home, arguments: [staleExecutable])
+            var loadedExecutable: String? = staleExecutable
+            var calls: [[String]] = []
+            let controller = LoginItemController(
+                bundlePath: LoginItemController.installedBundlePath,
+                homeDirectory: home,
+                launchctl: { arguments in
+                    calls.append(arguments)
+                    switch arguments.first {
+                    case "bootstrap":
+                        loadedExecutable = installedExecutable
+                        return LoginItemCommandResult(status: 0)
+                    case "bootout":
+                        loadedExecutable = nil
+                        return LoginItemCommandResult(status: 0)
+                    case "print":
+                        guard let loadedExecutable else {
+                            return absentAgentResult()
+                        }
+                        return LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: loadedExecutable)
+                        )
+                    default:
+                        return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                    }
+                },
+                serviceState: { .disabled },
+                registerService: {},
+                unregisterService: {}
+            )
+
+            tests.expectEqual(
+                controller.enable(),
+                .enabled(mechanism: .launchAgent),
+                "\(testName)_returnsEnabledAfterReplacement"
+            )
+            tests.expect(
+                calls.contains(["bootout", agentTarget]),
+                "\(testName)_bootsOutStaleService"
+            )
+            tests.expect(
+                calls.contains(["bootstrap", "gui/\(getuid())", fallbackPlistURL(for: home).path]),
+                "\(testName)_bootstrapsReplacementPlist"
+            )
+            let installedData = try Data(contentsOf: fallbackPlistURL(for: home))
+            let installedPropertyList = try PropertyListSerialization.propertyList(
+                from: installedData,
+                options: [],
+                format: nil
+            )
+            let installedDictionary = installedPropertyList as? [String: Any]
+            tests.expect(
+                installedDictionary?["Label"] as? String == "com.suchintan.ticker.login"
+                    && installedDictionary?["ProgramArguments"] as? [String]
+                        == [installedExecutable],
+                "\(testName)_writesExactInstalledTarget"
+            )
+        }
+
+        let bootstrapFailureHome = root.appendingPathComponent(
+            "bootstrap-failure-home",
+            isDirectory: true
+        )
+        var bootstrapFailureCalls: [[String]] = []
+        var bootstrapFailureAgentIsLoaded = false
+        let bootstrapFailureController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: bootstrapFailureHome,
+            launchctl: { arguments in
+                bootstrapFailureCalls.append(arguments)
+                switch arguments.first {
+                case "bootstrap":
+                    bootstrapFailureAgentIsLoaded = true
+                    return LoginItemCommandResult(status: 5, stderr: "permission denied")
+                case "bootout":
+                    bootstrapFailureAgentIsLoaded = false
+                    return LoginItemCommandResult(status: 0)
+                case "print":
+                    return bootstrapFailureAgentIsLoaded
+                        ? LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: installedExecutable)
+                        )
+                        : absentAgentResult()
+                default:
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let bootstrapFailureState = bootstrapFailureController.enable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = bootstrapFailureState else { return false }
+                return reason.contains("bootstrap failed with exit status 5")
+                    && reason.contains("permission denied")
+            }(),
+            "test16_loginFallback_bootstrapFailureReturnsFailure"
+        )
+        let bootstrapFailurePlist = bootstrapFailureHome
+            .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+            .appendingPathComponent("com.suchintan.ticker.login.plist")
+        tests.expect(
+            !FileManager.default.fileExists(atPath: bootstrapFailurePlist.path),
+            "test16_loginFallback_bootstrapFailureRemovesUnusablePlist"
+        )
+        tests.expect(
+            bootstrapFailureCalls.contains(["bootout", agentTarget]),
+            "test16_loginFallback_bootstrapFailureUnloadsUnusableService"
+        )
+
+        let verificationCleanupHome = root.appendingPathComponent(
+            "verification-cleanup-failure-home",
+            isDirectory: true
+        )
+        var verificationCleanupAgentIsLoaded = false
+        var verificationCleanupBootoutCalls = 0
+        var verificationCleanupCalls: [[String]] = []
+        let verificationCleanupController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: verificationCleanupHome,
+            launchctl: { arguments in
+                verificationCleanupCalls.append(arguments)
+                switch arguments.first {
+                case "bootstrap":
+                    verificationCleanupAgentIsLoaded = true
+                    return LoginItemCommandResult(status: 0)
+                case "bootout":
+                    verificationCleanupBootoutCalls += 1
+                    return LoginItemCommandResult(status: 5, stderr: "injected compensation denial")
+                case "print":
+                    return verificationCleanupAgentIsLoaded
+                        ? LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: "/usr/local/bin/not-ticker")
+                        )
+                        : absentAgentResult()
+                default:
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let verificationCleanupState = verificationCleanupController.enable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = verificationCleanupState else { return false }
+                return reason.contains("did not report exact executable")
+                    && reason.contains("also could not remove the unusable fallback")
+                    && reason.contains("bootout failed with exit status 5")
+                    && reason.contains("remains loaded")
+            }(),
+            "test16_loginFallback_verificationAndCompensationFailuresAreCombined"
+        )
+        tests.expect(
+            verificationCleanupAgentIsLoaded
+                && verificationCleanupBootoutCalls == 3
+                && verificationCleanupCalls.contains { $0.first == "bootstrap" }
+                && !FileManager.default.fileExists(
+                    atPath: fallbackPlistURL(for: verificationCleanupHome).path
+                ),
+            "test16_loginFallback_failedVerificationCannotClaimProvenRemoval"
+        )
+
+        let verifiedHome = root.appendingPathComponent("verified-home", isDirectory: true)
+        var verifiedCalls: [[String]] = []
+        var verifiedAgentIsLoaded = false
+        let verifiedController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: verifiedHome,
+            launchctl: { arguments in
+                verifiedCalls.append(arguments)
+                switch arguments.first {
+                case "bootstrap":
+                    verifiedAgentIsLoaded = true
+                    return LoginItemCommandResult(status: 0)
+                case "bootout":
+                    verifiedAgentIsLoaded = false
+                    return LoginItemCommandResult(status: 0)
+                case "print":
+                    return verifiedAgentIsLoaded
+                        ? LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: installedExecutable)
+                        )
+                        : absentAgentResult()
+                default:
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        tests.expectEqual(
+            verifiedController.enable(),
+            .enabled(mechanism: .launchAgent),
+            "test16_loginFallback_verifiedBootstrapReturnsEnabled"
+        )
+        tests.expectEqual(
+            verifiedController.state(),
+            .enabled(mechanism: .launchAgent),
+            "test16_loginFallback_stateReadsVerifiedLiveService"
+        )
+        tests.expect(
+            verifiedCalls.contains(["print", agentTarget]),
+            "test16_loginFallback_verifiesExactLaunchctlTarget"
+        )
+        let exactTargetHome = root.appendingPathComponent(
+            "exact-target-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: exactTargetHome, arguments: [installedExecutable])
+        var exactTargetCalls: [[String]] = []
+        let exactTargetController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: exactTargetHome,
+            launchctl: { arguments in
+                exactTargetCalls.append(arguments)
+                if arguments.first == "print" {
+                    return LoginItemCommandResult(
+                        status: 0,
+                        stdout: liveServiceOutput(executable: installedExecutable)
+                    )
+                }
+                return LoginItemCommandResult(status: 0)
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        tests.expectEqual(
+            exactTargetController.state(),
+            .enabled(mechanism: .launchAgent),
+            "test16_loginFallback_exactPlistAndLoadedTargetAreEnabled"
+        )
+        tests.expect(
+            !exactTargetCalls.contains { $0.first == "bootstrap" || $0.first == "bootout" },
+            "test16_loginFallback_exactTargetNeedsNoReplacement"
+        )
+
+        let conflictServiceStates: [(LoginItemServiceState, String)] = [
+            (.enabled, "enabled"),
+            (.requiresApproval, "registered and requiring approval"),
+            (.indeterminate, "indeterminate"),
+        ]
+        for (index, conflictServiceState) in conflictServiceStates.enumerated() {
+            let conflictHome = root.appendingPathComponent(
+                "live-agent-conflict-\(index)",
+                isDirectory: true
+            )
+            try writeFallbackPlist(
+                home: conflictHome,
+                arguments: [installedExecutable]
+            )
+            var conflictServiceQueries = 0
+            let conflictController = LoginItemController(
+                bundlePath: LoginItemController.installedBundlePath,
+                homeDirectory: conflictHome,
+                launchctl: { arguments in
+                    arguments.first == "print"
+                        ? LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: installedExecutable)
+                        )
+                        : LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                },
+                serviceState: {
+                    conflictServiceQueries += 1
+                    return conflictServiceState.0
+                },
+                registerService: {},
+                unregisterService: {}
+            )
+            let conflictState = conflictController.state()
+            tests.expect(
+                {
+                    guard case .failed(let reason) = conflictState else { return false }
+                    return reason.contains("Login item conflict")
+                        && reason.contains(conflictServiceState.1)
+                }(),
+                "test16_loginState_liveLaunchAgentConflict\(index)ReturnsFailure"
+            )
+            tests.expectEqual(
+                conflictServiceQueries,
+                1,
+                "test16_loginState_liveLaunchAgentConflict\(index)UsesFreshServiceRead"
+            )
+        }
+
+        let absentToLiveHome = root.appendingPathComponent(
+            "state-absent-to-live-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: absentToLiveHome, arguments: [installedExecutable])
+        let exactLiveResult = LoginItemCommandResult(
+            status: 0,
+            stdout: liveServiceOutput(executable: installedExecutable)
+        )
+        var absentToLivePrintResults = [
+            absentAgentResult(),
+            exactLiveResult,
+            exactLiveResult,
+            exactLiveResult,
+        ]
+        var absentToLiveServiceReads = 0
+        let absentToLiveController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: absentToLiveHome,
+            launchctl: { arguments in
+                guard arguments == ["print", agentTarget],
+                      !absentToLivePrintResults.isEmpty
+                else {
+                    return LoginItemCommandResult(
+                        status: -1,
+                        stderr: "unexpected command or extra probe"
+                    )
+                }
+                return absentToLivePrintResults.removeFirst()
+            },
+            serviceState: {
+                absentToLiveServiceReads += 1
+                return .disabled
+            },
+            registerService: {},
+            unregisterService: {}
+        )
+        tests.expectEqual(
+            absentToLiveController.state(),
+            .enabled(mechanism: .launchAgent),
+            "test16_loginState_absentToLiveRetriesUntilLaunchAgentObservationIsStable"
+        )
+        tests.expect(
+            absentToLivePrintResults.isEmpty && absentToLiveServiceReads == 2,
+            "test16_loginState_absentToLiveUsesTwoBoundedPairedObservations"
+        )
+
+        let liveToStoppedHome = root.appendingPathComponent(
+            "state-live-to-stopped-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: liveToStoppedHome, arguments: [installedExecutable])
+        var liveToStoppedPrintResults = [
+            exactLiveResult,
+            absentAgentResult(),
+            absentAgentResult(),
+            absentAgentResult(),
+        ]
+        var liveToStoppedServiceStates = [
+            LoginItemServiceState.disabled,
+            LoginItemServiceState.enabled,
+        ]
+        let liveToStoppedController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: liveToStoppedHome,
+            launchctl: { arguments in
+                guard arguments == ["print", agentTarget],
+                      !liveToStoppedPrintResults.isEmpty
+                else {
+                    return LoginItemCommandResult(
+                        status: -1,
+                        stderr: "unexpected command or extra probe"
+                    )
+                }
+                return liveToStoppedPrintResults.removeFirst()
+            },
+            serviceState: {
+                guard !liveToStoppedServiceStates.isEmpty else {
+                    return .indeterminate
+                }
+                return liveToStoppedServiceStates.removeFirst()
+            },
+            registerService: {},
+            unregisterService: {}
+        )
+        tests.expectEqual(
+            liveToStoppedController.state(),
+            .enabled(mechanism: .serviceManagement),
+            "test16_loginState_liveToStoppedRetriesAndMapsStableAbsenceToFreshServiceState"
+        )
+        tests.expect(
+            liveToStoppedPrintResults.isEmpty && liveToStoppedServiceStates.isEmpty,
+            "test16_loginState_liveToStoppedDoesNotReturnStaleLaunchAgentSuccess"
+        )
+
+        let changingTargetHome = root.appendingPathComponent(
+            "state-changing-target-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: changingTargetHome, arguments: [installedExecutable])
+        var changingTargetPrintResults = [
+            absentAgentResult(),
+            exactLiveResult,
+            exactLiveResult,
+            absentAgentResult(),
+            absentAgentResult(),
+            exactLiveResult,
+        ]
+        var changingTargetServiceReads = 0
+        let changingTargetController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: changingTargetHome,
+            launchctl: { arguments in
+                guard arguments == ["print", agentTarget],
+                      !changingTargetPrintResults.isEmpty
+                else {
+                    return LoginItemCommandResult(
+                        status: -1,
+                        stderr: "unexpected command or extra probe"
+                    )
+                }
+                return changingTargetPrintResults.removeFirst()
+            },
+            serviceState: {
+                changingTargetServiceReads += 1
+                return .disabled
+            },
+            registerService: {},
+            unregisterService: {}
+        )
+        let changingTargetState = changingTargetController.state()
+        tests.expect(
+            {
+                guard case .failed(let reason) = changingTargetState else { return false }
+                return reason.contains("did not converge after 3 paired observation attempts")
+                    && reason.contains(
+                        "exact LaunchAgent target changed between reads"
+                    )
+            }(),
+            "test16_loginState_changingTargetReturnsBoundedExhaustionDiagnostic"
+        )
+        tests.expect(
+            changingTargetPrintResults.isEmpty && changingTargetServiceReads == 3,
+            "test16_loginState_changingTargetStopsAtThreePairedObservations"
+        )
+
+        func assertFinalLaunchAgentProofReconcilesServiceTransition(
+            _ transition: LoginItemServiceState,
+            startsLoaded: Bool,
+            expected: LoginItemState,
+            testName: String
+        ) throws {
+            let home = root.appendingPathComponent(testName, isDirectory: true)
+            if startsLoaded {
+                try writeFallbackPlist(home: home, arguments: [installedExecutable])
+            }
+            var agentIsLoaded = startsLoaded
+            var service = LoginItemServiceState.disabled
+            var printCalls = 0
+            var didTransition = false
+            var events: [String] = []
+            let transitionPrintCall = startsLoaded ? 2 : 5
+            let controller = LoginItemController(
+                bundlePath: LoginItemController.installedBundlePath,
+                homeDirectory: home,
+                launchctl: { arguments in
+                    events.append(arguments.joined(separator: " "))
+                    switch arguments.first {
+                    case "bootstrap":
+                        agentIsLoaded = true
+                        return LoginItemCommandResult(status: 0)
+                    case "bootout":
+                        agentIsLoaded = false
+                        return LoginItemCommandResult(status: 0)
+                    case "print":
+                        printCalls += 1
+                        if agentIsLoaded
+                            && printCalls == transitionPrintCall
+                            && !didTransition {
+                            didTransition = true
+                            service = transition
+                            events.append("service-transition")
+                        }
+                        return agentIsLoaded
+                            ? LoginItemCommandResult(
+                                status: 0,
+                                stdout: liveServiceOutput(executable: installedExecutable)
+                            )
+                            : absentAgentResult()
+                    default:
+                        return LoginItemCommandResult(
+                            status: -1,
+                            stderr: "unexpected command"
+                        )
+                    }
+                },
+                serviceState: {
+                    events.append("service-read-\(service)")
+                    return service
+                },
+                registerService: {},
+                unregisterService: {
+                    events.append("unregister-service")
+                    service = .disabled
+                }
+            )
+
+            tests.expectEqual(
+                controller.enable(),
+                expected,
+                "\(testName)_returnsReconciledMechanism"
+            )
+            tests.expect(
+                didTransition,
+                "\(testName)_changesServiceDuringExactFinalLaunchAgentProbe"
+            )
+            let transitionIndex = events.firstIndex(of: "service-transition")
+            let followingServiceReadIndex = events.indices.first {
+                guard let transitionIndex else { return false }
+                return $0 > transitionIndex && events[$0].hasPrefix("service-read-")
+            }
+            tests.expect(
+                transitionIndex != nil && followingServiceReadIndex != nil,
+                "\(testName)_feedsPostLaunchAgentServiceReadBackIntoReconciliation"
+            )
+            switch expected {
+            case .enabled(mechanism: .serviceManagement):
+                tests.expect(
+                    !agentIsLoaded
+                        && !FileManager.default.fileExists(
+                            atPath: fallbackPlistURL(for: home).path
+                        ),
+                    "\(testName)_removesLaunchAgentWhenServiceWins"
+                )
+            case .enabled(mechanism: .launchAgent):
+                tests.expect(
+                    agentIsLoaded
+                        && service == .disabled
+                        && FileManager.default.fileExists(
+                            atPath: fallbackPlistURL(for: home).path
+                        ),
+                    "\(testName)_restoresOnlyLaunchAgentAfterServiceCleanup"
+                )
+            default:
+                tests.expect(false, "\(testName)_hasSupportedExpectedState")
+            }
+        }
+
+        for startsLoaded in [true, false] {
+            let pathName = startsLoaded ? "existing" : "activated"
+            try assertFinalLaunchAgentProofReconcilesServiceTransition(
+                .enabled,
+                startsLoaded: startsLoaded,
+                expected: .enabled(mechanism: .serviceManagement),
+                testName: "test16_fixedPoint_\(pathName)LAEnabledTransition"
+            )
+            try assertFinalLaunchAgentProofReconcilesServiceTransition(
+                .requiresApproval,
+                startsLoaded: startsLoaded,
+                expected: .enabled(mechanism: .launchAgent),
+                testName: "test16_fixedPoint_\(pathName)LAPendingTransition"
+            )
+            try assertFinalLaunchAgentProofReconcilesServiceTransition(
+                .indeterminate,
+                startsLoaded: startsLoaded,
+                expected: .enabled(mechanism: .launchAgent),
+                testName: "test16_fixedPoint_\(pathName)LAIndeterminateTransition"
+            )
+        }
+
+        let unloadedExactPlistHome = root.appendingPathComponent(
+            "unloaded-exact-plist-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(
+            home: unloadedExactPlistHome,
+            arguments: [installedExecutable]
+        )
+        let unloadedExactPlistController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: unloadedExactPlistHome,
+            launchctl: { arguments in
+                arguments.first == "print"
+                    ? absentAgentResult()
+                    : LoginItemCommandResult(status: -1, stderr: "unexpected command")
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        tests.expectEqual(
+            unloadedExactPlistController.state(),
+            .disabled,
+            "test16_loginFallback_plistPresenceCannotOverrideLiveServiceAbsence"
+        )
+
+        let enabledServiceDormantPlistHome = root.appendingPathComponent(
+            "enabled-service-dormant-plist-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(
+            home: enabledServiceDormantPlistHome,
+            arguments: [installedExecutable]
+        )
+        var enabledServiceDormantPlistCalls: [[String]] = []
+        var enabledServiceDormantPlistRegisterWasCalled = false
+        let enabledServiceDormantPlistController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: enabledServiceDormantPlistHome,
+            launchctl: { arguments in
+                enabledServiceDormantPlistCalls.append(arguments)
+                return arguments.first == "print"
+                    ? absentAgentResult()
+                    : LoginItemCommandResult(status: -1, stderr: "unexpected mutation")
+            },
+            serviceState: { .enabled },
+            registerService: { enabledServiceDormantPlistRegisterWasCalled = true },
+            unregisterService: {}
+        )
+        tests.expectEqual(
+            enabledServiceDormantPlistController.enable(),
+            .enabled(mechanism: .serviceManagement),
+            "test16_loginEnable_enabledServiceWinsOverDormantLaunchAgentPlist"
+        )
+        tests.expect(
+            enabledServiceDormantPlistCalls.filter { $0.first == "print" }.count == 5
+                && enabledServiceDormantPlistCalls.filter { $0.first == "bootout" }.count == 1
+                && !enabledServiceDormantPlistRegisterWasCalled
+                && !FileManager.default.fileExists(
+                    atPath: fallbackPlistURL(for: enabledServiceDormantPlistHome).path
+                ),
+            "test16_loginEnable_enabledServiceRemovesDormantLaunchAgentSource"
+        )
+
+        let enabledToPendingHome = root.appendingPathComponent(
+            "loaded-agent-enabled-service-becomes-pending-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: enabledToPendingHome, arguments: [installedExecutable])
+        var enabledToPendingAgentIsLoaded = true
+        var enabledToPendingServiceState = LoginItemServiceState.enabled
+        var enabledToPendingEvents: [String] = []
+        var enabledToPendingUnregisterCalls = 0
+        var enabledToPendingRegisterCalls = 0
+        let enabledToPendingController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: enabledToPendingHome,
+            launchctl: { arguments in
+                enabledToPendingEvents.append(arguments.joined(separator: " "))
+                switch arguments.first {
+                case "bootstrap":
+                    enabledToPendingAgentIsLoaded = true
+                    return LoginItemCommandResult(status: 0)
+                case "bootout":
+                    enabledToPendingAgentIsLoaded = false
+                    if enabledToPendingServiceState == .enabled {
+                        enabledToPendingServiceState = .requiresApproval
+                    }
+                    return LoginItemCommandResult(status: 0)
+                case "print":
+                    return enabledToPendingAgentIsLoaded
+                        ? LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: installedExecutable)
+                        )
+                        : absentAgentResult()
+                default:
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+            },
+            serviceState: { enabledToPendingServiceState },
+            registerService: { enabledToPendingRegisterCalls += 1 },
+            unregisterService: {
+                enabledToPendingEvents.append("unregister-service")
+                enabledToPendingUnregisterCalls += 1
+                enabledToPendingServiceState = .disabled
+            }
+        )
+        tests.expectEqual(
+            enabledToPendingController.enable(),
+            .enabled(mechanism: .launchAgent),
+            "test16_loginEnable_postRemovalPendingServiceEstablishesFallback"
+        )
+        let enabledToPendingUnregisterIndex = enabledToPendingEvents.firstIndex(
+            of: "unregister-service"
+        )
+        let enabledToPendingBootstrapIndex = enabledToPendingEvents.firstIndex {
+            $0.hasPrefix("bootstrap ")
+        }
+        tests.expect(
+            enabledToPendingUnregisterCalls == 1
+                && enabledToPendingRegisterCalls == 0
+                && enabledToPendingUnregisterIndex != nil
+                && enabledToPendingBootstrapIndex != nil
+                && enabledToPendingUnregisterIndex! < enabledToPendingBootstrapIndex!
+                && enabledToPendingServiceState == .disabled
+                && enabledToPendingAgentIsLoaded
+                && FileManager.default.fileExists(
+                    atPath: fallbackPlistURL(for: enabledToPendingHome).path
+                ),
+            "test16_loginEnable_loadedAgentEnabledToPendingTransitionKeepsOneProvenMechanism"
+        )
+
+        let disappearingExistingAgentHome = root.appendingPathComponent(
+            "existing-agent-disappears-during-service-read-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(
+            home: disappearingExistingAgentHome,
+            arguments: [installedExecutable]
+        )
+        var disappearingExistingAgentIsLoaded = true
+        var disappearingExistingAgentPrintCalls = 0
+        var disappearingExistingAgentBootstrapCalls = 0
+        let disappearingExistingAgentController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: disappearingExistingAgentHome,
+            launchctl: { arguments in
+                switch arguments.first {
+                case "print":
+                    disappearingExistingAgentPrintCalls += 1
+                    if disappearingExistingAgentPrintCalls == 2 {
+                        disappearingExistingAgentIsLoaded = false
+                        return absentAgentResult()
+                    }
+                    return disappearingExistingAgentIsLoaded
+                        ? LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: installedExecutable)
+                        )
+                        : absentAgentResult()
+                case "bootout":
+                    disappearingExistingAgentIsLoaded = false
+                    return LoginItemCommandResult(status: 0)
+                case "bootstrap":
+                    disappearingExistingAgentBootstrapCalls += 1
+                    disappearingExistingAgentIsLoaded = true
+                    return LoginItemCommandResult(status: 0)
+                default:
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        tests.expectEqual(
+            disappearingExistingAgentController.enable(),
+            .enabled(mechanism: .launchAgent),
+            "test16_fixedPoint_existingLaunchAgentDisappearanceReestablishesFallback"
+        )
+        tests.expect(
+            disappearingExistingAgentPrintCalls == 8
+                && disappearingExistingAgentBootstrapCalls == 1
+                && disappearingExistingAgentIsLoaded
+                && FileManager.default.fileExists(
+                    atPath: fallbackPlistURL(for: disappearingExistingAgentHome).path
+                ),
+            "test16_fixedPoint_existingLaunchAgentSuccessUsesFreshExactProbe"
+        )
+
+        let terminalObservationDisappearanceHome = root.appendingPathComponent(
+            "launch-agent-disappears-during-terminal-service-read-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(
+            home: terminalObservationDisappearanceHome,
+            arguments: [installedExecutable]
+        )
+        var terminalObservationAgentIsLoaded = true
+        var terminalObservationPrintCalls = 0
+        var terminalObservationServiceReads = 0
+        let terminalObservationDisappearanceController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: terminalObservationDisappearanceHome,
+            launchctl: { arguments in
+                guard arguments == ["print", agentTarget] else {
+                    return LoginItemCommandResult(
+                        status: -1,
+                        stderr: "unexpected mutation"
+                    )
+                }
+                terminalObservationPrintCalls += 1
+                return terminalObservationAgentIsLoaded
+                    ? LoginItemCommandResult(
+                        status: 0,
+                        stdout: liveServiceOutput(executable: installedExecutable)
+                    )
+                    : absentAgentResult()
+            },
+            serviceState: {
+                terminalObservationServiceReads += 1
+                if terminalObservationServiceReads == 3 {
+                    terminalObservationAgentIsLoaded = false
+                }
+                return .disabled
+            },
+            registerService: {},
+            unregisterService: {}
+        )
+        let terminalObservationDisappearanceState =
+            terminalObservationDisappearanceController.enable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = terminalObservationDisappearanceState else {
+                    return false
+                }
+                return reason.contains("bounded paired LaunchAgent/System Settings observer")
+                    && reason.contains("reached disabled")
+            }(),
+            "test16_terminalObserver_LADisappearanceDuringSMReadCannotReturnEnabled"
+        )
+        tests.expect(
+            terminalObservationPrintCalls == 6
+                && terminalObservationServiceReads == 4
+                && !terminalObservationAgentIsLoaded,
+            "test16_terminalObserver_LADisappearanceRetriesToFreshStableAbsence"
+        )
+
+        let pendingDormantHome = root.appendingPathComponent(
+            "pending-service-dormant-plist-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: pendingDormantHome, arguments: [installedExecutable])
+        var pendingDormantServiceState = LoginItemServiceState.requiresApproval
+        var pendingDormantAgentIsLoaded = false
+        var pendingDormantEvents: [String] = []
+        var pendingDormantRegisterCalls = 0
+        var pendingDormantUnregisterCalls = 0
+        let pendingDormantController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: pendingDormantHome,
+            launchctl: { arguments in
+                pendingDormantEvents.append(arguments.joined(separator: " "))
+                switch arguments.first {
+                case "print":
+                    return pendingDormantAgentIsLoaded
+                        ? LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: installedExecutable)
+                        )
+                        : absentAgentResult()
+                case "bootstrap":
+                    pendingDormantAgentIsLoaded = true
+                    return LoginItemCommandResult(status: 0)
+                case "bootout":
+                    pendingDormantAgentIsLoaded = false
+                    return LoginItemCommandResult(status: 0)
+                default:
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+            },
+            serviceState: { pendingDormantServiceState },
+            registerService: { pendingDormantRegisterCalls += 1 },
+            unregisterService: {
+                pendingDormantEvents.append("unregister-service")
+                pendingDormantUnregisterCalls += 1
+                pendingDormantServiceState = .disabled
+            }
+        )
+        tests.expectEqual(
+            pendingDormantController.enable(),
+            .enabled(mechanism: .launchAgent),
+            "test16_loginEnable_pendingServiceDormantFallbackReconcilesToLaunchAgent"
+        )
+        let pendingDormantUnregisterIndex = pendingDormantEvents.firstIndex(
+            of: "unregister-service"
+        )
+        let pendingDormantBootstrapIndex = pendingDormantEvents.firstIndex {
+            $0.hasPrefix("bootstrap ")
+        }
+        tests.expect(
+            pendingDormantUnregisterCalls == 1
+                && pendingDormantRegisterCalls == 0
+                && pendingDormantUnregisterIndex != nil
+                && pendingDormantBootstrapIndex != nil
+                && pendingDormantUnregisterIndex! < pendingDormantBootstrapIndex!
+                && pendingDormantServiceState == .disabled
+                && pendingDormantAgentIsLoaded,
+            "test16_loginEnable_pendingServiceIsProvenDisabledBeforeDormantFallbackLoads"
+        )
+
+        let unregisterFailureHome = root.appendingPathComponent(
+            "pending-service-unregister-failure-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: unregisterFailureHome, arguments: [installedExecutable])
+        var unregisterFailureLaunchctlCalls: [[String]] = []
+        var unregisterFailureCalls = 0
+        let unregisterFailureController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: unregisterFailureHome,
+            launchctl: { arguments in
+                unregisterFailureLaunchctlCalls.append(arguments)
+                return arguments.first == "print"
+                    ? absentAgentResult()
+                    : LoginItemCommandResult(status: -1, stderr: "unexpected mutation")
+            },
+            serviceState: { .requiresApproval },
+            registerService: {},
+            unregisterService: {
+                unregisterFailureCalls += 1
+                throw NSError(
+                    domain: "TickerTests.LoginItem",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "injected unregister denial"]
+                )
+            }
+        )
+        let unregisterFailureState = unregisterFailureController.enable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = unregisterFailureState else { return false }
+                return reason.contains("could not be unregistered")
+                    && reason.contains("injected unregister denial")
+                    && reason.contains("fallback was removed")
+            }(),
+            "test16_loginEnable_unregisterFailureIsObservable"
+        )
+        tests.expect(
+            unregisterFailureCalls == 1
+                && unregisterFailureLaunchctlCalls.filter { $0.first == "print" }.count == 3
+                && unregisterFailureLaunchctlCalls.filter { $0.first == "bootout" }.count == 1
+                && !FileManager.default.fileExists(
+                    atPath: fallbackPlistURL(for: unregisterFailureHome).path
+                ),
+            "test16_loginEnable_unregisterFailureRemovesDormantFallbackWithoutActivation"
+        )
+
+        let postActivationChangeHome = root.appendingPathComponent(
+            "post-activation-service-change-home",
+            isDirectory: true
+        )
+        var postActivationAgentIsLoaded = false
+        var postActivationServiceProbeCount = 0
+        var postActivationLaunchctlCalls: [[String]] = []
+        var postActivationRegisterCalls = 0
+        let postActivationChangeController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: postActivationChangeHome,
+            launchctl: { arguments in
+                postActivationLaunchctlCalls.append(arguments)
+                switch arguments.first {
+                case "print":
+                    return postActivationAgentIsLoaded
+                        ? LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: installedExecutable)
+                        )
+                        : absentAgentResult()
+                case "bootstrap":
+                    postActivationAgentIsLoaded = true
+                    return LoginItemCommandResult(status: 0)
+                case "bootout":
+                    postActivationAgentIsLoaded = false
+                    return LoginItemCommandResult(status: 0)
+                default:
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+            },
+            serviceState: {
+                defer { postActivationServiceProbeCount += 1 }
+                return postActivationServiceProbeCount < 2 ? .disabled : .enabled
+            },
+            registerService: { postActivationRegisterCalls += 1 },
+            unregisterService: {}
+        )
+        tests.expectEqual(
+            postActivationChangeController.enable(),
+            .enabled(mechanism: .serviceManagement),
+            "test16_loginEnable_postActivationEnabledServiceWins"
+        )
+        tests.expectEqual(
+            postActivationChangeController.state(),
+            .enabled(mechanism: .serviceManagement),
+            "test16_loginEnable_postActivationEnabledServiceHasExactFinalState"
+        )
+        tests.expect(
+            !postActivationAgentIsLoaded
+                && postActivationRegisterCalls == 1
+                && postActivationLaunchctlCalls.contains { $0.first == "bootstrap" }
+                && postActivationLaunchctlCalls.filter { $0.first == "bootout" }.count == 3
+                && !FileManager.default.fileExists(
+                    atPath: fallbackPlistURL(for: postActivationChangeHome).path
+                ),
+            "test16_loginEnable_postActivationEnabledServiceProvesLaunchAgentAbsence"
+        )
+
+        let postActivationPendingHome = root.appendingPathComponent(
+            "post-activation-pending-service-home",
+            isDirectory: true
+        )
+        var postActivationPendingAgentIsLoaded = false
+        var postActivationPendingServiceState = LoginItemServiceState.disabled
+        var postActivationPendingServiceProbeCount = 0
+        var postActivationPendingUnregisterCalls = 0
+        var postActivationPendingBootstrapCalls = 0
+        let postActivationPendingController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: postActivationPendingHome,
+            launchctl: { arguments in
+                switch arguments.first {
+                case "print":
+                    return postActivationPendingAgentIsLoaded
+                        ? LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: installedExecutable)
+                        )
+                        : absentAgentResult()
+                case "bootout":
+                    postActivationPendingAgentIsLoaded = false
+                    return LoginItemCommandResult(status: 0)
+                case "bootstrap":
+                    postActivationPendingBootstrapCalls += 1
+                    postActivationPendingAgentIsLoaded = true
+                    return LoginItemCommandResult(status: 0)
+                default:
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+            },
+            serviceState: {
+                defer { postActivationPendingServiceProbeCount += 1 }
+                if postActivationPendingServiceProbeCount == 2 {
+                    postActivationPendingServiceState = .requiresApproval
+                }
+                return postActivationPendingServiceState
+            },
+            registerService: {},
+            unregisterService: {
+                postActivationPendingUnregisterCalls += 1
+                postActivationPendingServiceState = .disabled
+            }
+        )
+        tests.expectEqual(
+            postActivationPendingController.enable(),
+            .enabled(mechanism: .launchAgent),
+            "test16_fixedPoint_postActivationPendingServiceReconcilesToFallback"
+        )
+        tests.expect(
+            postActivationPendingUnregisterCalls == 1
+                && postActivationPendingBootstrapCalls == 2
+                && postActivationPendingServiceState == .disabled
+                && postActivationPendingAgentIsLoaded
+                && FileManager.default.fileExists(
+                    atPath: fallbackPlistURL(for: postActivationPendingHome).path
+                ),
+            "test16_fixedPoint_pendingServiceIsDisabledBeforeLaunchAgentRemains"
+        )
+
+        let indeterminateProbeHome = root.appendingPathComponent(
+            "indeterminate-probe-home",
+            isDirectory: true
+        )
+        var indeterminateProbeCalls: [[String]] = []
+        let indeterminateProbeController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: indeterminateProbeHome,
+            launchctl: { arguments in
+                indeterminateProbeCalls.append(arguments)
+                return LoginItemCommandResult(status: 5, stderr: "permission denied")
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let indeterminateState = indeterminateProbeController.state()
+        tests.expect(
+            {
+                guard case .failed(let reason) = indeterminateState else { return false }
+                return reason.contains("exact target query failed with exit status 5")
+                    && reason.contains("permission denied")
+            }(),
+            "test16_loginState_positivePermissionErrorIsIndeterminate"
+        )
+        tests.expect(
+            indeterminateProbeCalls
+                == [["print", agentTarget], ["print", agentTarget]],
+            "test16_loginState_indeterminateProbeDoesNotMutateLoginItems"
+        )
+        let wrongStatusController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: root.appendingPathComponent("wrong-absence-status-home"),
+            launchctl: { _ in
+                LoginItemCommandResult(status: 5, stderr: "Could not find service")
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let wrongStatusEnableState = wrongStatusController.enable()
+        tests.expect(
+            {
+                guard case .failed = wrongStatusEnableState else { return false }
+                return true
+            }(),
+            "test16_loginEnable_serviceNotFoundMessageWithWrongStatusIsIndeterminate"
+        )
+
+        let indeterminateServiceHome = root.appendingPathComponent(
+            "indeterminate-service-home",
+            isDirectory: true
+        )
+        var indeterminateServiceLaunchctlCalls: [[String]] = []
+        var indeterminateServiceRegisterWasCalled = false
+        var indeterminateServiceUnregisterCalls = 0
+        let indeterminateServiceController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: indeterminateServiceHome,
+            launchctl: { arguments in
+                indeterminateServiceLaunchctlCalls.append(arguments)
+                return LoginItemCommandResult(status: 113, stderr: "Could not find service")
+            },
+            serviceState: { .indeterminate },
+            registerService: { indeterminateServiceRegisterWasCalled = true },
+            unregisterService: { indeterminateServiceUnregisterCalls += 1 }
+        )
+        let indeterminateServiceReadState = indeterminateServiceController.state()
+        tests.expect(
+            {
+                guard case .failed(let reason) = indeterminateServiceReadState else { return false }
+                return reason.contains("status is indeterminate")
+            }(),
+            "test16_loginState_indeterminateServiceStatusReturnsFailure"
+        )
+        let indeterminateServiceEnableState = indeterminateServiceController.enable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = indeterminateServiceEnableState else { return false }
+                return reason.contains("is indeterminate")
+                    && reason.contains("disabled state was not proven")
+            }(),
+            "test16_loginEnable_indeterminateServiceStatusReturnsFailure"
+        )
+        tests.expect(
+            !indeterminateServiceRegisterWasCalled
+                && indeterminateServiceUnregisterCalls == 1
+                && !indeterminateServiceLaunchctlCalls.contains { $0.first == "bootstrap" }
+                && indeterminateServiceLaunchctlCalls.filter { $0.first == "bootout" }.count == 1,
+            "test16_loginEnable_indeterminateServiceCompensatesWithoutFallbackActivation"
+        )
+
+        let postRegistrationIndeterminateHome = root.appendingPathComponent(
+            "post-registration-indeterminate-service-home",
+            isDirectory: true
+        )
+        var postRegistrationServiceProbeCount = 0
+        var postRegistrationRegisterWasCalled = false
+        var postRegistrationLaunchctlCalls: [[String]] = []
+        var postRegistrationUnregisterCalls = 0
+        let postRegistrationIndeterminateController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: postRegistrationIndeterminateHome,
+            launchctl: { arguments in
+                postRegistrationLaunchctlCalls.append(arguments)
+                return LoginItemCommandResult(status: 113, stderr: "Could not find service")
+            },
+            serviceState: {
+                defer { postRegistrationServiceProbeCount += 1 }
+                return postRegistrationServiceProbeCount == 0 ? .disabled : .indeterminate
+            },
+            registerService: { postRegistrationRegisterWasCalled = true },
+            unregisterService: { postRegistrationUnregisterCalls += 1 }
+        )
+        let postRegistrationIndeterminateState = postRegistrationIndeterminateController.enable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = postRegistrationIndeterminateState else {
+                    return false
+                }
+                return reason.contains("is indeterminate")
+                    && reason.contains("disabled state was not proven")
+            }(),
+            "test16_loginEnable_postRegistrationIndeterminateStatusReturnsFailure"
+        )
+        tests.expect(
+            postRegistrationRegisterWasCalled
+                && postRegistrationUnregisterCalls == 1
+                && !postRegistrationLaunchctlCalls.contains { $0.first == "bootstrap" }
+                && postRegistrationLaunchctlCalls.filter { $0.first == "bootout" }.count == 1,
+            "test16_loginEnable_postRegistrationIndeterminateCompensatesWithoutFallbackActivation"
+        )
+
+        try assertStalePlistRepair(
+            homeName: "old-build-home",
+            staleExecutable: "/private/tmp/Ticker-build/Ticker",
+            testName: "test16_loginFallback_oldBuildTarget"
+        )
+        try assertStalePlistRepair(
+            homeName: "foreign-executable-home",
+            staleExecutable: "/Applications/Foreign.app/Contents/MacOS/Foreign",
+            testName: "test16_loginFallback_foreignExecutable"
+        )
+
+        let malformedHome = root.appendingPathComponent(
+            "malformed-plist-home",
+            isDirectory: true
+        )
+        let malformedPlist = fallbackPlistURL(for: malformedHome)
+        try FileManager.default.createDirectory(
+            at: malformedPlist.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("<?xml version=\"1.0\"?><plist><dict>".utf8).write(to: malformedPlist)
+        var malformedPrintCount = 0
+        let malformedController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: malformedHome,
+            launchctl: { arguments in
+                if arguments.first == "print" {
+                    malformedPrintCount += 1
+                }
+                return LoginItemCommandResult(status: 0)
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let malformedState = malformedController.state()
+        tests.expect(
+            {
+                guard case .failed(let reason) = malformedState else { return false }
+                return reason.contains("plist is malformed")
+            }(),
+            "test16_loginFallback_malformedPlistIsRejected"
+        )
+        tests.expectEqual(
+            malformedPrintCount,
+            2,
+            "test16_loginFallback_malformedPlistStillProbesExactTarget"
+        )
+
+        let symlinkHome = root.appendingPathComponent(
+            "symlink-plist-home",
+            isDirectory: true
+        )
+        let symlinkPlist = fallbackPlistURL(for: symlinkHome)
+        let symlinkTarget = root.appendingPathComponent("valid-fallback-target.plist")
+        try writeFallbackPlist(home: root, arguments: [installedExecutable])
+        try FileManager.default.moveItem(
+            at: fallbackPlistURL(for: root),
+            to: symlinkTarget
+        )
+        try FileManager.default.createDirectory(
+            at: symlinkPlist.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: symlinkPlist,
+            withDestinationURL: symlinkTarget
+        )
+        var symlinkPrintCount = 0
+        let symlinkController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: symlinkHome,
+            launchctl: { arguments in
+                if arguments.first == "print" {
+                    symlinkPrintCount += 1
+                }
+                return LoginItemCommandResult(status: 0)
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let symlinkState = symlinkController.state()
+        tests.expect(
+            {
+                guard case .failed(let reason) = symlinkState else { return false }
+                return reason.contains("must not be a symbolic link")
+            }(),
+            "test16_loginFallback_symlinkPlistIsRejected"
+        )
+        tests.expectEqual(
+            symlinkPrintCount,
+            2,
+            "test16_loginFallback_symlinkPlistStillProbesExactTarget"
+        )
+
+        let nonregularHome = root.appendingPathComponent(
+            "nonregular-plist-home",
+            isDirectory: true
+        )
+        let nonregularPlist = fallbackPlistURL(for: nonregularHome)
+        try FileManager.default.createDirectory(
+            at: nonregularPlist,
+            withIntermediateDirectories: true
+        )
+        var nonregularPrintCount = 0
+        let nonregularController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: nonregularHome,
+            launchctl: { arguments in
+                if arguments.first == "print" {
+                    nonregularPrintCount += 1
+                }
+                return LoginItemCommandResult(status: 0)
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let nonregularState = nonregularController.state()
+        tests.expect(
+            {
+                guard case .failed(let reason) = nonregularState else { return false }
+                return reason.contains("must be a regular file")
+            }(),
+            "test16_loginFallback_nonregularPlistIsRejected"
+        )
+        tests.expectEqual(
+            nonregularPrintCount,
+            2,
+            "test16_loginFallback_nonregularPlistStillProbesExactTarget"
+        )
+        let nonregularSentinel = nonregularPlist.appendingPathComponent("sentinel")
+        try Data("keep".utf8).write(to: nonregularSentinel)
+        let nonregularEnableState = nonregularController.enable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = nonregularEnableState else { return false }
+                return reason.contains("refusing nonrecursive removal")
+            }(),
+            "test16_loginInstall_directoryFallbackIsRejectedWithoutRecursiveDeletion"
+        )
+        tests.expect(
+            FileManager.default.fileExists(atPath: nonregularSentinel.path),
+            "test16_loginInstall_directoryFallbackContentsArePreserved"
+        )
+
+        let extraArgumentsHome = root.appendingPathComponent(
+            "extra-arguments-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(
+            home: extraArgumentsHome,
+            arguments: [installedExecutable, "--unexpected"]
+        )
+        var extraArgumentsPrintCount = 0
+        let extraArgumentsController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: extraArgumentsHome,
+            launchctl: { arguments in
+                if arguments.first == "print" {
+                    extraArgumentsPrintCount += 1
+                }
+                return LoginItemCommandResult(status: 0)
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let extraArgumentsState = extraArgumentsController.state()
+        tests.expect(
+            {
+                guard case .failed(let reason) = extraArgumentsState else { return false }
+                return reason.contains("only exact executable")
+            }(),
+            "test16_loginFallback_extraProgramArgumentsAreRejected"
+        )
+        tests.expectEqual(
+            extraArgumentsPrintCount,
+            2,
+            "test16_loginFallback_extraArgumentsStillProbeExactTarget"
+        )
+
+        let extraProgramHome = root.appendingPathComponent(
+            "extra-program-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(
+            home: extraProgramHome,
+            arguments: [installedExecutable],
+            program: "/usr/local/bin/not-ticker"
+        )
+        var extraProgramPrintCount = 0
+        let extraProgramController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: extraProgramHome,
+            launchctl: { arguments in
+                if arguments.first == "print" {
+                    extraProgramPrintCount += 1
+                }
+                return LoginItemCommandResult(status: 0)
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let extraProgramState = extraProgramController.state()
+        tests.expect(
+            {
+                guard case .failed(let reason) = extraProgramState else { return false }
+                return reason.contains("unsupported Program value")
+            }(),
+            "test16_loginFallback_extraProgramIsRejected"
+        )
+        tests.expectEqual(
+            extraProgramPrintCount,
+            2,
+            "test16_loginFallback_extraProgramStillProbesExactTarget"
+        )
+
+        let loadedMismatchHome = root.appendingPathComponent(
+            "loaded-mismatch-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: loadedMismatchHome, arguments: [installedExecutable])
+        let foreignLoadedExecutable = "/usr/local/bin/not-ticker"
+        var loadedExecutable: String? = foreignLoadedExecutable
+        var loadedMismatchCalls: [[String]] = []
+        let loadedMismatchController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: loadedMismatchHome,
+            launchctl: { arguments in
+                loadedMismatchCalls.append(arguments)
+                switch arguments.first {
+                case "bootstrap":
+                    loadedExecutable = installedExecutable
+                    return LoginItemCommandResult(status: 0)
+                case "bootout":
+                    loadedExecutable = nil
+                    return LoginItemCommandResult(status: 0)
+                case "print":
+                    guard let loadedExecutable else {
+                        return absentAgentResult()
+                    }
+                    return LoginItemCommandResult(
+                        status: 0,
+                        stdout: liveServiceOutput(executable: loadedExecutable)
+                    )
+                default:
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let loadedMismatchState = loadedMismatchController.state()
+        tests.expect(
+            {
+                guard case .failed(let reason) = loadedMismatchState else { return false }
+                return reason.contains("did not report exact executable")
+            }(),
+            "test16_loginFallback_matchingLabelWithDifferentLoadedProgramIsRejected"
+        )
+        tests.expectEqual(
+            loadedMismatchController.enable(),
+            .enabled(mechanism: .launchAgent),
+            "test16_loginFallback_loadedProgramMismatchIsReplaced"
+        )
+        tests.expect(
+            loadedMismatchCalls.contains(["bootout", agentTarget])
+                && loadedMismatchCalls.contains([
+                    "bootstrap",
+                    "gui/\(getuid())",
+                    fallbackPlistURL(for: loadedMismatchHome).path,
+                ]),
+            "test16_loginFallback_loadedProgramMismatchUsesBootoutAndBootstrap"
+        )
+
+        let headerOnlyHome = root.appendingPathComponent(
+            "header-only-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: headerOnlyHome, arguments: [installedExecutable])
+        let headerOnlyController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: headerOnlyHome,
+            launchctl: { arguments in
+                guard arguments.first == "print" else {
+                    return LoginItemCommandResult(status: 0)
+                }
+                return LoginItemCommandResult(
+                    status: 0,
+                    stdout: "\(agentTarget) = {\n}\n"
+                )
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let headerOnlyState = headerOnlyController.state()
+        tests.expect(
+            {
+                guard case .failed(let reason) = headerOnlyState else { return false }
+                return reason.contains("did not report exact live state")
+            }(),
+            "test16_loginFallback_headerOnlyLaunchctlOutputIsRejected"
+        )
+
+        let nestedProgramHome = root.appendingPathComponent(
+            "nested-program-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: nestedProgramHome, arguments: [installedExecutable])
+        let nestedProgramController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: nestedProgramHome,
+            launchctl: { arguments in
+                guard arguments.first == "print" else {
+                    return LoginItemCommandResult(status: 0)
+                }
+                return LoginItemCommandResult(
+                    status: 0,
+                    stdout: """
+                    \(agentTarget) = {
+                        state = running
+                        metadata = {
+                            program = \(installedExecutable)
+                        }
+                    }
+                    """
+                )
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let nestedProgramState = nestedProgramController.state()
+        tests.expect(
+            {
+                guard case .failed(let reason) = nestedProgramState else { return false }
+                return reason.contains("did not report exact executable")
+            }(),
+            "test16_loginFallback_nestedProgramCannotSpoofLoadedTarget"
+        )
+
+        let incompletePrintHome = root.appendingPathComponent(
+            "incomplete-print-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: incompletePrintHome, arguments: [installedExecutable])
+        let incompletePrintController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: incompletePrintHome,
+            launchctl: { arguments in
+                guard arguments.first == "print" else {
+                    return LoginItemCommandResult(status: 0)
+                }
+                return LoginItemCommandResult(
+                    status: 0,
+                    stdout: """
+                    \(agentTarget) = {
+                        state = running
+                        program = \(installedExecutable)
+                    """
+                )
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let incompletePrintState = incompletePrintController.state()
+        tests.expect(
+            {
+                guard case .failed(let reason) = incompletePrintState else { return false }
+                return reason.contains("complete exact service block")
+            }(),
+            "test16_loginFallback_incompleteLaunchctlOutputIsRejected"
+        )
+
+        let wrongServiceHome = root.appendingPathComponent(
+            "wrong-service-home",
+            isDirectory: true
+        )
+        var wrongServiceIsLoaded = true
+        let wrongServiceController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: wrongServiceHome,
+            launchctl: { arguments in
+                switch arguments.first {
+                case "bootstrap":
+                    wrongServiceIsLoaded = true
+                    return LoginItemCommandResult(status: 0)
+                case "bootout":
+                    wrongServiceIsLoaded = false
+                    return LoginItemCommandResult(status: 0)
+                case "print":
+                    return wrongServiceIsLoaded
+                        ? LoginItemCommandResult(
+                            status: 0,
+                            stdout: "gui/\(getuid())/com.example.other = {\n}\n"
+                        )
+                        : absentAgentResult()
+                default:
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let wrongServiceState = wrongServiceController.enable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = wrongServiceState else { return false }
+                return reason.contains("did not identify exact service")
+            }(),
+            "test16_loginFallback_rejectsWrongPrintedService"
+        )
+        let wrongServicePlist = wrongServiceHome
+            .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
+            .appendingPathComponent("com.suchintan.ticker.login.plist")
+        tests.expect(
+            !FileManager.default.fileExists(atPath: wrongServicePlist.path),
+            "test16_loginFallback_wrongPrintedServiceRemovesPlist"
+        )
+
+        func absentAgentResult() -> LoginItemCommandResult {
+            LoginItemCommandResult(status: 113, stderr: "Could not find service")
+        }
+
+        let missingPlistHome = root.appendingPathComponent(
+            "disable-loaded-missing-plist-home",
+            isDirectory: true
+        )
+        var missingPlistAgentIsLoaded = true
+        var missingPlistDisableCalls: [[String]] = []
+        let missingPlistController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: missingPlistHome,
+            launchctl: { arguments in
+                missingPlistDisableCalls.append(arguments)
+                switch arguments.first {
+                case "print":
+                    return missingPlistAgentIsLoaded
+                        ? LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: installedExecutable)
+                        )
+                        : absentAgentResult()
+                case "bootout":
+                    missingPlistAgentIsLoaded = false
+                    return LoginItemCommandResult(status: 0)
+                default:
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        tests.expectEqual(
+            missingPlistController.state(),
+            .enabled(mechanism: .launchAgent),
+            "test16_loginState_liveExactAgentWithMissingPlistIsEnabled"
+        )
+        tests.expectEqual(
+            missingPlistController.disable(),
+            .disabled,
+            "test16_loginDisable_loadedExactAgentWithMissingPlist_isDisabled"
+        )
+        tests.expect(
+            missingPlistDisableCalls.contains(["bootout", agentTarget])
+                && missingPlistDisableCalls.filter { $0 == ["print", agentTarget] }.count == 6,
+            "test16_loginDisable_loadedExactAgentWithMissingPlist_isBootedOutAndVerified"
+        )
+
+        let lateLoadHome = root.appendingPathComponent(
+            "disable-absent-to-present-late-load-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: lateLoadHome, arguments: [installedExecutable])
+        var lateLoadAgentIsLoaded = false
+        var lateLoadPrintCalls = 0
+        var lateLoadBootoutCalls = 0
+        let lateLoadController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: lateLoadHome,
+            launchctl: { arguments in
+                switch arguments.first {
+                case "bootout":
+                    lateLoadBootoutCalls += 1
+                    lateLoadAgentIsLoaded = false
+                    return LoginItemCommandResult(status: 0)
+                case "print":
+                    lateLoadPrintCalls += 1
+                    if lateLoadPrintCalls == 1 {
+                        lateLoadAgentIsLoaded = true
+                        return absentAgentResult()
+                    }
+                    return lateLoadAgentIsLoaded
+                        ? LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: installedExecutable)
+                        )
+                        : absentAgentResult()
+                default:
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        tests.expectEqual(
+            lateLoadController.disable(),
+            .disabled,
+            "test16_loginDisable_absentToPresentLateLoadIsDisabled"
+        )
+        tests.expect(
+            lateLoadPrintCalls == 4
+                && lateLoadBootoutCalls == 2
+                && !lateLoadAgentIsLoaded
+                && !FileManager.default.fileExists(atPath: fallbackPlistURL(for: lateLoadHome).path),
+            "test16_loginDisable_lateLoadUsesSecondBootoutAndFinalAbsenceProof"
+        )
+
+        let orderingBarrierHome = root.appendingPathComponent(
+            "disable-post-unlink-ordering-barrier-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: orderingBarrierHome, arguments: [installedExecutable])
+        var orderingBarrierAgentIsLoaded = false
+        var orderingBarrierLoadIsQueued = false
+        var orderingBarrierPrintCalls = 0
+        var orderingBarrierBootoutCalls = 0
+        var orderingBarrierSawUnlinkedSource = false
+        let orderingBarrierController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: orderingBarrierHome,
+            launchctl: { arguments in
+                switch arguments.first {
+                case "print":
+                    orderingBarrierPrintCalls += 1
+                    if orderingBarrierPrintCalls == 1 {
+                        orderingBarrierLoadIsQueued = true
+                        return absentAgentResult()
+                    }
+                    return orderingBarrierAgentIsLoaded
+                        ? LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: installedExecutable)
+                        )
+                        : absentAgentResult()
+                case "bootout":
+                    orderingBarrierBootoutCalls += 1
+                    if orderingBarrierLoadIsQueued {
+                        orderingBarrierAgentIsLoaded = true
+                        orderingBarrierLoadIsQueued = false
+                    }
+                    orderingBarrierSawUnlinkedSource =
+                        orderingBarrierSawUnlinkedSource
+                        || !FileManager.default.fileExists(
+                            atPath: fallbackPlistURL(for: orderingBarrierHome).path
+                        )
+                    if orderingBarrierAgentIsLoaded {
+                        orderingBarrierAgentIsLoaded = false
+                        return LoginItemCommandResult(status: 0)
+                    }
+                    return LoginItemCommandResult(
+                        status: 3,
+                        stderr: "Boot-out failed: 3: No such process"
+                    )
+                default:
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        tests.expectEqual(
+            orderingBarrierController.disable(),
+            .disabled,
+            "test16_fixedPoint_postUnlinkBootoutClosesQueuedLoadRace"
+        )
+        tests.expect(
+            orderingBarrierBootoutCalls == 2
+                && orderingBarrierSawUnlinkedSource
+                && !orderingBarrierAgentIsLoaded
+                && !FileManager.default.fileExists(
+                    atPath: fallbackPlistURL(for: orderingBarrierHome).path
+                ),
+            "test16_fixedPoint_bootoutNotFoundStillEndsInExactAbsence"
+        )
+
+        let liveAfterBootoutFailureHome = root.appendingPathComponent(
+            "disable-bootout-failure-live-home",
+            isDirectory: true
+        )
+        let liveAfterBootoutFailureController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: liveAfterBootoutFailureHome,
+            launchctl: { arguments in
+                if arguments.first == "bootout" {
+                    return LoginItemCommandResult(status: 5, stderr: "permission denied")
+                }
+                return LoginItemCommandResult(
+                    status: 0,
+                    stdout: liveServiceOutput(executable: installedExecutable)
+                )
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let liveAfterBootoutFailureState = liveAfterBootoutFailureController.disable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = liveAfterBootoutFailureState else { return false }
+                return reason.contains("bootout failed with exit status 5")
+                    && reason.contains("remains loaded")
+            }(),
+            "test16_loginDisable_bootoutFailureWithLiveService_returnsFailure"
+        )
+
+        let absentAfterBootoutFailureHome = root.appendingPathComponent(
+            "disable-bootout-failure-absent-home",
+            isDirectory: true
+        )
+        var absentAfterBootoutFailurePrintCount = 0
+        let absentAfterBootoutFailureController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: absentAfterBootoutFailureHome,
+            launchctl: { arguments in
+                if arguments.first == "print" {
+                    absentAfterBootoutFailurePrintCount += 1
+                    if absentAfterBootoutFailurePrintCount == 1 {
+                        return LoginItemCommandResult(
+                            status: 0,
+                            stdout: liveServiceOutput(executable: installedExecutable)
+                        )
+                    }
+                    return absentAgentResult()
+                }
+                if arguments.first == "bootout" {
+                    return LoginItemCommandResult(status: 5, stderr: "service exited concurrently")
+                }
+                return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        tests.expectEqual(
+            absentAfterBootoutFailureController.disable(),
+            .disabled,
+            "test16_loginDisable_nonzeroBootoutWithSubsequentExactAbsence_isDisabled"
+        )
+
+        let finalIPCFailureHome = root.appendingPathComponent(
+            "disable-final-ipc-failure-home",
+            isDirectory: true
+        )
+        var finalIPCFailurePrintCount = 0
+        let finalIPCFailureController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: finalIPCFailureHome,
+            launchctl: { arguments in
+                guard arguments.first == "print" else {
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+                finalIPCFailurePrintCount += 1
+                return finalIPCFailurePrintCount == 1
+                    ? absentAgentResult()
+                    : LoginItemCommandResult(status: 113, stderr: "IPC unavailable")
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let finalIPCFailureState = finalIPCFailureController.disable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = finalIPCFailureState else { return false }
+                return reason.contains("absence could not be verified with exit status 113")
+                    && reason.contains("IPC unavailable")
+            }(),
+            "test16_loginDisable_positiveFinalIPCErrorIsIndeterminate"
+        )
+
+        let directoryFallbackHome = root.appendingPathComponent(
+            "disable-directory-fallback-home",
+            isDirectory: true
+        )
+        let directoryFallback = fallbackPlistURL(for: directoryFallbackHome)
+        try FileManager.default.createDirectory(
+            at: directoryFallback,
+            withIntermediateDirectories: true
+        )
+        let directorySentinel = directoryFallback.appendingPathComponent("sentinel")
+        try Data("preserve".utf8).write(to: directorySentinel)
+        let directoryFallbackController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: directoryFallbackHome,
+            launchctl: { arguments in
+                arguments.first == "print"
+                    ? absentAgentResult()
+                    : LoginItemCommandResult(status: -1, stderr: "unexpected command")
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let directoryFallbackState = directoryFallbackController.disable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = directoryFallbackState else { return false }
+                return reason.contains("directory")
+                    && reason.contains("refusing nonrecursive removal")
+            }(),
+            "test16_loginDisable_directoryFallbackIsRejected"
+        )
+        tests.expect(
+            FileManager.default.fileExists(atPath: directorySentinel.path),
+            "test16_loginDisable_directoryFallbackIsNotRecursivelyDeleted"
+        )
+
+        let fifoFallbackHome = root.appendingPathComponent(
+            "disable-fifo-fallback-home",
+            isDirectory: true
+        )
+        let fifoFallback = fallbackPlistURL(for: fifoFallbackHome)
+        try FileManager.default.createDirectory(
+            at: fifoFallback.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        guard Darwin.mkfifo(fifoFallback.path, 0o600) == 0 else {
+            throw FixtureError.missing("test16 FIFO fallback fixture")
+        }
+        let fifoFallbackController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: fifoFallbackHome,
+            launchctl: { arguments in
+                arguments.first == "print"
+                    ? absentAgentResult()
+                    : LoginItemCommandResult(status: -1, stderr: "unexpected command")
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let fifoFallbackState = fifoFallbackController.disable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = fifoFallbackState else { return false }
+                return reason.contains("FIFO")
+                    && reason.contains("refusing nonrecursive removal")
+            }(),
+            "test16_loginDisable_nonregularFallbackIsRejected"
+        )
+        var fifoInformation = stat()
+        tests.expect(
+            Darwin.lstat(fifoFallback.path, &fifoInformation) == 0,
+            "test16_loginDisable_nonregularFallbackIsPreserved"
+        )
+
+        let symlinkRemovalHome = root.appendingPathComponent(
+            "disable-symlink-removal-home",
+            isDirectory: true
+        )
+        let symlinkRemovalPath = fallbackPlistURL(for: symlinkRemovalHome)
+        let symlinkRemovalTarget = root.appendingPathComponent("symlink-removal-target")
+        try Data("target remains".utf8).write(to: symlinkRemovalTarget)
+        try FileManager.default.createDirectory(
+            at: symlinkRemovalPath.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: symlinkRemovalPath,
+            withDestinationURL: symlinkRemovalTarget
+        )
+        let symlinkRemovalController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: symlinkRemovalHome,
+            launchctl: { arguments in
+                arguments.first == "print"
+                    ? absentAgentResult()
+                    : LoginItemCommandResult(status: -1, stderr: "unexpected command")
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        tests.expectEqual(
+            symlinkRemovalController.disable(),
+            .disabled,
+            "test16_loginDisable_symlinkFallbackUnlinksOnlySymlink"
+        )
+        tests.expect(
+            !FileManager.default.fileExists(atPath: symlinkRemovalPath.path)
+                && FileManager.default.fileExists(atPath: symlinkRemovalTarget.path),
+            "test16_loginDisable_symlinkTargetIsPreserved"
+        )
+
+        let recreatedFallbackHome = root.appendingPathComponent(
+            "disable-recreated-fallback-home",
+            isDirectory: true
+        )
+        try writeFallbackPlist(home: recreatedFallbackHome, arguments: [installedExecutable])
+        var recreatedFallbackPrintCount = 0
+        var recreatedFallbackError: Error?
+        let recreatedFallbackController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: recreatedFallbackHome,
+            launchctl: { arguments in
+                guard arguments.first == "print" else {
+                    return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                }
+                recreatedFallbackPrintCount += 1
+                if recreatedFallbackPrintCount == 2 {
+                    do {
+                        try writeFallbackPlist(
+                            home: recreatedFallbackHome,
+                            arguments: [installedExecutable]
+                        )
+                    } catch {
+                        recreatedFallbackError = error
+                    }
+                }
+                return absentAgentResult()
+            },
+            serviceState: { .disabled },
+            registerService: {},
+            unregisterService: {}
+        )
+        let recreatedFallbackState = recreatedFallbackController.disable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = recreatedFallbackState else { return false }
+                return reason.contains("may have been recreated")
+            }(),
+            "test16_loginDisable_postRemovalRecreationReturnsFailure"
+        )
+        tests.expect(
+            recreatedFallbackError == nil
+                && !FileManager.default.fileExists(
+                    atPath: fallbackPlistURL(for: recreatedFallbackHome).path
+                ),
+            "test16_loginDisable_postRemovalRecreationIsRemovedByFinalAbsenceCheck"
+        )
+
+        func assertLateDisableServiceTransition(
+            _ transitionState: LoginItemServiceState,
+            homeName: String,
+            testName: String
+        ) {
+            let home = root.appendingPathComponent(homeName, isDirectory: true)
+            var lateServiceState = LoginItemServiceState.disabled
+            var lateServiceReadCount = 0
+            var unregisterCalls = 0
+            let controller = LoginItemController(
+                bundlePath: LoginItemController.installedBundlePath,
+                homeDirectory: home,
+                launchctl: { arguments in
+                    switch arguments.first {
+                    case "print", "bootout":
+                        return absentAgentResult()
+                    default:
+                        return LoginItemCommandResult(status: -1, stderr: "unexpected command")
+                    }
+                },
+                serviceState: {
+                    lateServiceReadCount += 1
+                    if lateServiceReadCount == 2 {
+                        lateServiceState = transitionState
+                    }
+                    return lateServiceState
+                },
+                registerService: {},
+                unregisterService: {
+                    unregisterCalls += 1
+                    lateServiceState = .disabled
+                }
+            )
+
+            tests.expectEqual(
+                controller.disable(),
+                .disabled,
+                "\(testName)_returnsDisabled"
+            )
+            tests.expectEqual(
+                controller.state(),
+                .disabled,
+                "\(testName)_hasExactFinalState"
+            )
+            tests.expect(
+                unregisterCalls == 1 && lateServiceState == .disabled,
+                "\(testName)_compensatesFinalObservedServiceTransition"
+            )
+        }
+
+        assertLateDisableServiceTransition(
+            .enabled,
+            homeName: "disable-late-enabled-service-home",
+            testName: "test16_fixedPoint_disableLateEnabledService"
+        )
+        assertLateDisableServiceTransition(
+            .requiresApproval,
+            homeName: "disable-late-pending-service-home",
+            testName: "test16_fixedPoint_disableLatePendingService"
+        )
+
+        let enabledServiceHome = root.appendingPathComponent(
+            "disable-service-still-enabled-home",
+            isDirectory: true
+        )
+        var enabledServiceUnregisterWasCalled = false
+        let enabledServiceController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: enabledServiceHome,
+            launchctl: { arguments in
+                arguments.first == "print"
+                    ? absentAgentResult()
+                    : LoginItemCommandResult(status: -1, stderr: "unexpected command")
+            },
+            serviceState: { .enabled },
+            registerService: {},
+            unregisterService: { enabledServiceUnregisterWasCalled = true }
+        )
+        let enabledServiceState = enabledServiceController.disable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = enabledServiceState else { return false }
+                return reason.contains("login item remains enabled")
+            }(),
+            "test16_loginDisable_serviceStillEnabled_returnsFailure"
+        )
+        tests.expect(
+            enabledServiceUnregisterWasCalled,
+            "test16_loginDisable_serviceStillEnabled_attemptsUnregister"
+        )
+
+        let initiallyIndeterminateServiceHome = root.appendingPathComponent(
+            "disable-initially-indeterminate-service-home",
+            isDirectory: true
+        )
+        var initiallyIndeterminateServiceUnregisterWasCalled = false
+        let initiallyIndeterminateServiceController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: initiallyIndeterminateServiceHome,
+            launchctl: { arguments in
+                arguments.first == "print"
+                    ? absentAgentResult()
+                    : LoginItemCommandResult(status: -1, stderr: "unexpected command")
+            },
+            serviceState: { .indeterminate },
+            registerService: {},
+            unregisterService: {
+                initiallyIndeterminateServiceUnregisterWasCalled = true
+            }
+        )
+        let initiallyIndeterminateServiceState = initiallyIndeterminateServiceController.disable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = initiallyIndeterminateServiceState else {
+                    return false
+                }
+                return reason.contains("did not converge after 3 reconciliation attempts")
+                    && reason.contains("remains indeterminate")
+            }(),
+            "test16_loginDisable_initialIndeterminateServiceReturnsBoundedFailure"
+        )
+        tests.expect(
+            initiallyIndeterminateServiceUnregisterWasCalled,
+            "test16_loginDisable_initialIndeterminateServiceAttemptsUnregister"
+        )
+
+        let finallyIndeterminateServiceHome = root.appendingPathComponent(
+            "disable-finally-indeterminate-service-home",
+            isDirectory: true
+        )
+        var finallyIndeterminateServiceProbeCount = 0
+        var finallyIndeterminateServiceUnregisterWasCalled = false
+        let finallyIndeterminateServiceController = LoginItemController(
+            bundlePath: LoginItemController.installedBundlePath,
+            homeDirectory: finallyIndeterminateServiceHome,
+            launchctl: { arguments in
+                arguments.first == "print"
+                    ? absentAgentResult()
+                    : LoginItemCommandResult(status: -1, stderr: "unexpected command")
+            },
+            serviceState: {
+                defer { finallyIndeterminateServiceProbeCount += 1 }
+                return finallyIndeterminateServiceProbeCount == 0 ? .enabled : .indeterminate
+            },
+            registerService: {},
+            unregisterService: { finallyIndeterminateServiceUnregisterWasCalled = true }
+        )
+        let finallyIndeterminateServiceState = finallyIndeterminateServiceController.disable()
+        tests.expect(
+            {
+                guard case .failed(let reason) = finallyIndeterminateServiceState else { return false }
+                return reason.contains("did not converge after 3 reconciliation attempts")
+                    && reason.contains("remains indeterminate")
+            }(),
+            "test16_loginDisable_finalIndeterminateServiceReturnsBoundedFailure"
+        )
+        tests.expect(
+            finallyIndeterminateServiceUnregisterWasCalled,
+            "test16_loginDisable_finalIndeterminateServiceAttemptsUnregister"
+        )
+
+        tests.expect(
+            !FileManager.default.fileExists(atPath: agentPlist.path),
+            "test16_loginFallback_doesNotWriteOutsideInjectedHome"
+        )
+    }
+
+    try withTemporaryDirectory("round16-installer-transaction") { root in
+        let repository = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let requiresApprovalLoginState =
+            "requires approval — approve Ticker in System Settings › General › Login Items"
+
+        func writeExecutable(_ contents: String, to url: URL) throws {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: url.path
+            )
+        }
+
+        func writeBundle(_ bundle: URL, version: String) throws {
+            if FileManager.default.fileExists(atPath: bundle.path) {
+                try FileManager.default.removeItem(at: bundle)
+            }
+            let contents = bundle.appendingPathComponent("Contents", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: contents,
+                withIntermediateDirectories: true
+            )
+            try """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                <key>CFBundleExecutable</key>
+                <string>Ticker</string>
+                <key>CFBundleIdentifier</key>
+                <string>com.suchintan.ticker</string>
+                <key>CFBundlePackageType</key>
+                <string>APPL</string>
+                <key>CFBundleVersion</key>
+                <string>1</string>
+            </dict>
+            </plist>
+            """.write(
+                to: contents.appendingPathComponent("Info.plist"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try writeExecutable(
+                "#!/bin/sh\nexit 0\n",
+                to: contents.appendingPathComponent("MacOS/Ticker")
+            )
+            try writeExecutable(
+                """
+                #!/bin/sh
+                set -eu
+                action="${2:-${1:-}}"
+                if [ "\(version)" = "legacy" ] && [ "${1:-}" = "login-item" ]; then
+                  printf '%s\n' "$action" >> "${TICKER_TEST_LOGIN_CALLS}"
+                  printf 'login %s\n' "$action" >> "${TICKER_TEST_PROCESS_CALLS}"
+                  printf '%s\n' "ticker: Unknown command 'login-item'. Run 'ticker --help' for usage." >&2
+                  exit 2
+                fi
+                case "$action" in
+                  enable)
+                    printf '%s\n' "$action" >> "${TICKER_TEST_LOGIN_CALLS}"
+                    printf 'login %s\n' "$action" >> "${TICKER_TEST_PROCESS_CALLS}"
+                    if [ "${TICKER_TEST_LOGIN_ENABLE_FAIL:-0}" = "1" ]; then
+                      printf '%s\n' 'injected enable failure' >&2
+                      exit 70
+                    fi
+                    if [ ! -s "${TICKER_TEST_LOGIN_STATE}" ]; then
+                      printf '%s\n' 'enabled via LaunchAgent' > "${TICKER_TEST_LOGIN_STATE}"
+                    fi
+                    if [ "$(cat "${TICKER_TEST_LOGIN_STATE}")" = "enabled via LaunchAgent" ]; then
+                      printf 'running\n' > "${TICKER_TEST_PROCESS_STATE}"
+                    fi
+                    signal="${TICKER_TEST_LOGIN_SIGNAL_AFTER_ENABLE:-0}"
+                    case "$signal" in
+                      0|'') ;;
+                      1) kill -TERM "${TICKER_INSTALL_TRANSACTION_PID}" ;;
+                      HUP|INT|QUIT|TERM) kill "-$signal" "${TICKER_INSTALL_TRANSACTION_PID}" ;;
+                      *) exit 64 ;;
+                    esac
+                    cat "${TICKER_TEST_LOGIN_STATE}"
+                    ;;
+                  disable)
+                    printf '%s\n' "$action" >> "${TICKER_TEST_LOGIN_CALLS}"
+                    printf 'login %s\n' "$action" >> "${TICKER_TEST_PROCESS_CALLS}"
+                    rm -f "${TICKER_TEST_LOGIN_STATE}"
+                    signal="${TICKER_TEST_LOGIN_SIGNAL_DURING_DISABLE:-0}"
+                    case "$signal" in
+                      0|'') ;;
+                      1) kill -TERM "${TICKER_INSTALL_TRANSACTION_PID}" ;;
+                      HUP|INT|QUIT|TERM) kill "-$signal" "${TICKER_INSTALL_TRANSACTION_PID}" ;;
+                      *) exit 64 ;;
+                    esac
+                    printf '%s\n' 'disabled'
+                    ;;
+                  status)
+                    printf '%s\n' "$action" >> "${TICKER_TEST_LOGIN_CALLS}"
+                    printf 'login %s\n' "$action" >> "${TICKER_TEST_PROCESS_CALLS}"
+                    status_count=0
+                    if [ -f "${TICKER_TEST_LOGIN_STATUS_CALLS}" ]; then
+                      status_count="$(cat "${TICKER_TEST_LOGIN_STATUS_CALLS}")"
+                    fi
+                    status_count=$((status_count + 1))
+                    printf '%s\n' "$status_count" > "${TICKER_TEST_LOGIN_STATUS_CALLS}"
+                    if [ "${TICKER_TEST_START_PROCESS_ON_LOGIN_STATUS_AT:-0}" = "$status_count" ]; then
+                      printf 'running\n' > "${TICKER_TEST_PROCESS_STATE}"
+                    fi
+                    if [ "${TICKER_TEST_LOGIN_STATUS_FAIL_AT:-0}" = "$status_count" ]; then
+                      printf '%s\n' "${TICKER_TEST_LOGIN_STATUS_FAILURE_MESSAGE:-injected status failure}" >&2
+                      exit "${TICKER_TEST_LOGIN_STATUS_FAILURE_CODE:-75}"
+                    fi
+                    if [ -s "${TICKER_TEST_LOGIN_STATE}" ]; then
+                      state="$(cat "${TICKER_TEST_LOGIN_STATE}")"
+                    else
+                      state="disabled"
+                    fi
+                    if [ "$state" = "enabled via LaunchAgent" ] \
+                        && [ ! -f "${TICKER_TEST_PROCESS_STATE}" ]; then
+                      printf '%s\n' 'failed: exact LaunchAgent target is loaded but not running' >&2
+                      exit 1
+                    fi
+                    printf '%s\n' "$state"
+                    ;;
+                  probe)
+                    printf '%s\n' '\(version)'
+                    ;;
+                  *)
+                    exit 64
+                    ;;
+                esac
+                """,
+                to: contents.appendingPathComponent("Helpers/ticker")
+            )
+            try version.write(
+                to: bundle.appendingPathComponent("version.txt"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+
+        func writeCommand(_ contents: String, named name: String, in directory: URL) throws -> URL {
+            let command = directory.appendingPathComponent(name)
+            try writeExecutable(contents, to: command)
+            return command
+        }
+
+        func makeFixture(
+            _ name: String,
+            priorVersion: String? = "old"
+        ) throws -> (
+            directory: URL,
+            sourceBundle: URL,
+            installedBundle: URL,
+            cliLink: URL,
+            loginState: URL,
+            loginCalls: URL,
+            processState: URL,
+            processCalls: URL,
+            environment: [String: String]
+        ) {
+            let directory = root.appendingPathComponent(name, isDirectory: true)
+            let sourceBundle = directory.appendingPathComponent(
+                "source/Ticker.app",
+                isDirectory: true
+            )
+            let installedBundle = directory.appendingPathComponent(
+                "installed/Ticker.app",
+                isDirectory: true
+            )
+            let cliLink = directory.appendingPathComponent("bin/ticker")
+            let loginState = directory.appendingPathComponent("login-state.txt")
+            let loginCalls = directory.appendingPathComponent("login-calls.txt")
+            let loginStatusCalls = directory.appendingPathComponent("login-status-calls.txt")
+            let pgrepCalls = directory.appendingPathComponent("pgrep-calls.txt")
+            let processState = directory.appendingPathComponent("process-state.txt")
+            let processCalls = directory.appendingPathComponent("process-calls.txt")
+
+            try writeBundle(sourceBundle, version: "new")
+            if let priorVersion {
+                try writeBundle(installedBundle, version: priorVersion)
+            }
+            try FileManager.default.createDirectory(
+                at: cliLink.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let pgrepCommand = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                version="missing"
+                if [ -f "${TICKER_INSTALL_BUNDLE}/version.txt" ]; then
+                  version="$(cat "${TICKER_INSTALL_BUNDLE}/version.txt")"
+                fi
+                call_count=0
+                if [ -f "${TICKER_TEST_PGREP_CALLS}" ]; then
+                  call_count="$(cat "${TICKER_TEST_PGREP_CALLS}")"
+                fi
+                call_count=$((call_count + 1))
+                printf '%s\n' "$call_count" > "${TICKER_TEST_PGREP_CALLS}"
+                printf 'pgrep %s %s\n' "$version" "$*" >> "${TICKER_TEST_PROCESS_CALLS}"
+                if [ "${TICKER_TEST_PGREP_ERROR:-0}" = "1" ]; then
+                  exit 70
+                fi
+                process_was_running=0
+                if [ -f "${TICKER_TEST_PROCESS_STATE}" ]; then
+                  process_was_running=1
+                fi
+                if [ "${TICKER_TEST_START_PROCESS_AFTER_PGREP_AT:-0}" = "$call_count" ]; then
+                  printf 'process-start %s\n' "$version" >> "${TICKER_TEST_PROCESS_CALLS}"
+                  printf 'running\n' > "${TICKER_TEST_PROCESS_STATE}"
+                fi
+                [ "$process_was_running" = "1" ]
+                """,
+                named: "fake-pgrep.sh",
+                in: directory
+            )
+            let pkillCommand = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                version="missing"
+                if [ -f "${TICKER_INSTALL_BUNDLE}/version.txt" ]; then
+                  version="$(cat "${TICKER_INSTALL_BUNDLE}/version.txt")"
+                fi
+                printf 'pkill %s %s\n' "$version" "$*" >> "${TICKER_TEST_PROCESS_CALLS}"
+                if [ "${TICKER_TEST_PKILL_FAIL:-0}" = "1" ]; then
+                  exit 71
+                fi
+                if [ "${TICKER_TEST_STUBBORN_PROCESS:-0}" != "1" ]; then
+                  rm -f "${TICKER_TEST_PROCESS_STATE}"
+                fi
+                """,
+                named: "fake-pkill.sh",
+                in: directory
+            )
+            let openCommand = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                version="$(cat "$1/version.txt")"
+                printf 'open %s\n' "$version" >> "${TICKER_TEST_PROCESS_CALLS}"
+                if [ "${TICKER_TEST_OPEN_FAIL_VERSION:-}" = "$version" ]; then
+                  exit 72
+                fi
+                if [ "${TICKER_TEST_OPEN_NO_START_VERSION:-}" != "$version" ]; then
+                  printf 'running\n' > "${TICKER_TEST_PROCESS_STATE}"
+                fi
+                if [ "${TICKER_TEST_LOGIN_TRANSITION_AFTER_OPEN_VERSION:-}" = "$version" ]; then
+                  printf '%s\n' "${TICKER_TEST_LOGIN_STATE_AFTER_OPEN}" > "${TICKER_TEST_LOGIN_STATE}"
+                fi
+                """,
+                named: "fake-open.sh",
+                in: directory
+            )
+            let launchctlCommand = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                printf 'launchctl %s\n' "$*" >> "${TICKER_TEST_PROCESS_CALLS}"
+                case "${1:-}" in
+                  kickstart)
+                    if [ "$#" -ne 3 ] || [ "${2:-}" != "-k" ] \
+                        || [ "${3:-}" != "${TICKER_TEST_AGENT_TARGET}" ]; then
+                      printf 'unexpected kickstart target\n' >&2
+                      exit 64
+                    fi
+                    if [ ! -s "${TICKER_TEST_LOGIN_STATE}" ] \
+                        || [ "$(cat "${TICKER_TEST_LOGIN_STATE}")" != "enabled via LaunchAgent" ]; then
+                      printf 'Could not find service\n' >&2
+                      exit 113
+                    fi
+                    version="$(cat "${TICKER_INSTALL_BUNDLE}/version.txt")"
+                    if [ "${TICKER_TEST_KICKSTART_FAIL_VERSION:-}" = "$version" ]; then
+                      printf 'injected kickstart failure for %s\n' "$version" >&2
+                      exit 73
+                    fi
+                    if [ "${TICKER_TEST_KICKSTART_NO_START_VERSION:-}" != "$version" ]; then
+                      printf 'running\n' > "${TICKER_TEST_PROCESS_STATE}"
+                    fi
+                    ;;
+                  print)
+                    if [ "$#" -ne 2 ] || [ "${2:-}" != "${TICKER_TEST_AGENT_TARGET}" ]; then
+                      printf 'unexpected print target\n' >&2
+                      exit 64
+                    fi
+                    result="${TICKER_TEST_LEGACY_LAUNCHCTL_RESULT:-auto}"
+                    if [ "$result" = "auto" ]; then
+                      if [ -s "${TICKER_TEST_LOGIN_STATE}" ] \
+                          && [ "$(cat "${TICKER_TEST_LOGIN_STATE}")" = "enabled via LaunchAgent" ]; then
+                        result="present"
+                      else
+                        result="absent"
+                      fi
+                    fi
+                    case "$result" in
+                      present)
+                        if [ -f "${TICKER_TEST_PROCESS_STATE}" ]; then
+                          printf 'gui/test = { state = running; }\n'
+                        else
+                          printf 'gui/test = { state = exited; }\n'
+                        fi
+                        ;;
+                      absent)
+                        printf 'Could not find service\n' >&2
+                        exit 113
+                        ;;
+                      indeterminate)
+                        printf 'permission denied\n' >&2
+                        exit 5
+                        ;;
+                      *)
+                        exit 64
+                        ;;
+                    esac
+                    ;;
+                  *)
+                    printf 'unexpected launchctl command\n' >&2
+                    exit 64
+                    ;;
+                esac
+                """,
+                named: "fake-launchctl.sh",
+                in: directory
+            )
+            let linkCommand = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                printf 'link %s\n' "$*" >> "${TICKER_TEST_PROCESS_CALLS}"
+                exec /bin/ln "$@"
+                """,
+                named: "fake-ln.sh",
+                in: directory
+            )
+
+            return (
+                directory: directory,
+                sourceBundle: sourceBundle,
+                installedBundle: installedBundle,
+                cliLink: cliLink,
+                loginState: loginState,
+                loginCalls: loginCalls,
+                processState: processState,
+                processCalls: processCalls,
+                environment: [
+                    "HOME": directory.appendingPathComponent("home", isDirectory: true).path,
+                    "TICKER_INSTALL_SOURCE_BUNDLE": sourceBundle.path,
+                    "TICKER_INSTALL_BUNDLE": installedBundle.path,
+                    "TICKER_INSTALL_CLI_LINK": cliLink.path,
+                    "TICKER_INSTALL_CODESIGN": "/usr/bin/true",
+                    "TICKER_INSTALL_CODESIGN_CHECK_ENABLED": "1",
+                    "TICKER_INSTALL_PLUTIL": "/usr/bin/plutil",
+                    "TICKER_INSTALL_LAUNCHCTL": launchctlCommand.path,
+                    "TICKER_INSTALL_COPY": "/bin/cp",
+                    "TICKER_INSTALL_REMOVE": "/bin/rm",
+                    "TICKER_INSTALL_LINK": linkCommand.path,
+                    "TICKER_INSTALL_PGREP": pgrepCommand.path,
+                    "TICKER_INSTALL_PKILL": pkillCommand.path,
+                    "TICKER_INSTALL_OPEN": openCommand.path,
+                    "TICKER_INSTALL_SLEEP": "/usr/bin/true",
+                    "TICKER_INSTALL_STOP_CHECK_ATTEMPTS": "3",
+                    "TICKER_INSTALL_START_CHECK_ATTEMPTS": "3",
+                    "TICKER_TEST_PROCESS_STATE": processState.path,
+                    "TICKER_TEST_PROCESS_CALLS": processCalls.path,
+                    "TICKER_TEST_PGREP_CALLS": pgrepCalls.path,
+                    "TICKER_TEST_PGREP_ERROR": "0",
+                    "TICKER_TEST_PKILL_FAIL": "0",
+                    "TICKER_TEST_START_PROCESS_AFTER_PGREP_AT": "0",
+                    "TICKER_TEST_STUBBORN_PROCESS": "0",
+                    "TICKER_TEST_OPEN_FAIL_VERSION": "",
+                    "TICKER_TEST_OPEN_NO_START_VERSION": "",
+                    "TICKER_TEST_LOGIN_TRANSITION_AFTER_OPEN_VERSION": "",
+                    "TICKER_TEST_LOGIN_STATE_AFTER_OPEN": "",
+                    "TICKER_TEST_LOGIN_STATE": loginState.path,
+                    "TICKER_TEST_LOGIN_CALLS": loginCalls.path,
+                    "TICKER_TEST_LOGIN_STATUS_CALLS": loginStatusCalls.path,
+                    "TICKER_TEST_LOGIN_ENABLE_FAIL": "0",
+                    "TICKER_TEST_LOGIN_SIGNAL_AFTER_ENABLE": "0",
+                    "TICKER_TEST_LOGIN_SIGNAL_DURING_DISABLE": "0",
+                    "TICKER_TEST_LOGIN_STATUS_FAIL_AT": "0",
+                    "TICKER_TEST_LOGIN_STATUS_FAILURE_MESSAGE": "injected status failure",
+                    "TICKER_TEST_LOGIN_STATUS_FAILURE_CODE": "75",
+                    "TICKER_TEST_START_PROCESS_ON_LOGIN_STATUS_AT": "0",
+                    "TICKER_TEST_LEGACY_LAUNCHCTL_RESULT": "auto",
+                    "TICKER_TEST_AGENT_TARGET": "gui/\(getuid())/com.suchintan.ticker.login",
+                    "TICKER_TEST_KICKSTART_FAIL_VERSION": "",
+                    "TICKER_TEST_KICKSTART_NO_START_VERSION": "",
+                ]
+            )
+        }
+
+        func runInstaller(environment: [String: String]) throws -> test3A_ProcessResult {
+            try test3A_runProcess(
+                "/bin/bash",
+                ["Scripts/install.sh"],
+                environment: environment,
+                removingEnvironmentKeys: ["TICKER_INSTALL_LEGACY_LOGIN_STATE"],
+                currentDirectory: repository
+            )
+        }
+
+        func startInstaller(
+            environment overrides: [String: String],
+            stdout: URL,
+            stderr: URL
+        ) throws -> Process {
+            try Data().write(to: stdout)
+            try Data().write(to: stderr)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = ["Scripts/install.sh"]
+            process.currentDirectoryURL = repository
+            var environment = ProcessInfo.processInfo.environment
+            environment.removeValue(forKey: "TICKER_INSTALL_LEGACY_LOGIN_STATE")
+            for (key, value) in overrides {
+                environment[key] = value
+            }
+            process.environment = environment
+            process.standardOutput = try FileHandle(forWritingTo: stdout)
+            process.standardError = try FileHandle(forWritingTo: stderr)
+            try process.run()
+            return process
+        }
+
+        func installedVersion(_ bundle: URL) -> String? {
+            try? String(
+                contentsOf: bundle.appendingPathComponent("version.txt"),
+                encoding: .utf8
+            )
+        }
+
+        func pathInode(_ url: URL) throws -> ino_t {
+            var value = stat()
+            guard Darwin.lstat(url.path, &value) == 0 else {
+                throw FixtureError.missing(
+                    "installer lstat \(url.path): \(String(cString: strerror(errno)))"
+                )
+            }
+            return value.st_ino
+        }
+
+        func lockIdentity(_ url: URL) throws -> String {
+            var value = stat()
+            guard Darwin.lstat(url.path, &value) == 0 else {
+                throw FixtureError.missing(
+                    "installer lstat \(url.path): \(String(cString: strerror(errno)))"
+                )
+            }
+            return "\(UInt64(value.st_dev)):\(UInt64(value.st_ino)):\(UInt(value.st_uid))"
+        }
+
+        func loginActions(_ calls: URL) -> [String] {
+            guard let contents = try? String(contentsOf: calls, encoding: .utf8) else {
+                return []
+            }
+            return contents.split(separator: "\n").map(String.init)
+        }
+
+        func processActions(_ calls: URL) -> [String] {
+            guard let contents = try? String(contentsOf: calls, encoding: .utf8) else {
+                return []
+            }
+            return contents.split(separator: "\n").map(String.init)
+        }
+
+        func transactionArtifacts(for installedBundle: URL) -> [String] {
+            let parent = installedBundle.deletingLastPathComponent()
+            let prefix = installedBundle.lastPathComponent
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: parent.path)) ?? []
+            // Proven released-custody records are bounded audit artifacts, not
+            // active transaction state. They are asserted separately below.
+            return names.filter {
+                $0.hasPrefix("\(prefix).staging.")
+                    || $0.hasPrefix("\(prefix).backup.")
+                    || $0.hasPrefix("\(prefix).failed.")
+                    || $0 == "\(prefix).install.lock"
+                    || $0.hasPrefix("\(prefix).install.lock.custody.")
+                    || $0.hasPrefix(".ticker-rename-swap-")
+            }
+        }
+
+        func releasedCustodyRecords(for installedBundle: URL) -> [URL] {
+            let parent = installedBundle.deletingLastPathComponent()
+            let prefix = "\(installedBundle.lastPathComponent).install.lock.released."
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: parent.path)) ?? []
+            return names.filter { $0.hasPrefix(prefix) }.sorted().map {
+                parent.appendingPathComponent($0, isDirectory: true)
+            }
+        }
+
+        func releasedLockDirectoryIsProven(_ lockDirectory: URL) -> Bool {
+            let marker = lockDirectory.appendingPathComponent("released-custody")
+            guard
+                let expectedIdentity = try? lockIdentity(lockDirectory),
+                let recordedIdentity = try? String(contentsOf: marker, encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            else {
+                return false
+            }
+            return recordedIdentity == expectedIdentity
+        }
+
+        func releasedCustodyRecordIsProven(_ record: URL) -> Bool {
+            releasedLockDirectoryIsProven(
+                record.appendingPathComponent("lock", isDirectory: true)
+            )
+        }
+
+        func startInstalledHelperProbe(
+            bundle: URL,
+            ready: URL,
+            stop: URL,
+            failure: URL,
+            samples: URL
+        ) throws -> Process {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = [
+                "-c",
+                """
+                : > "$2"
+                count=0
+                while [ ! -e "$3" ]; do
+                  if value="$("$1/Contents/Helpers/ticker" probe 2>/dev/null)"; then
+                    case "$value" in
+                      old|new) ;;
+                      *) printf 'unexpected helper output: %s\n' "$value" > "$4"; exit 1 ;;
+                    esac
+                  else
+                    printf 'installed helper was unavailable\n' > "$4"
+                    exit 1
+                  fi
+                  count=$((count + 1))
+                done
+                printf '%s\n' "$count" > "$5"
+                """,
+                "installed-helper-probe",
+                bundle.path,
+                ready.path,
+                stop.path,
+                failure.path,
+                samples.path,
+            ]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+
+            let deadline = Date().addingTimeInterval(2)
+            while !FileManager.default.fileExists(atPath: ready.path), Date() < deadline {
+                usleep(1_000)
+            }
+            guard FileManager.default.fileExists(atPath: ready.path) else {
+                process.terminate()
+                process.waitUntilExit()
+                throw FixtureError.missing("installer helper probe did not become ready")
+            }
+            return process
+        }
+
+        do {
+            let fixture = try makeFixture("overlapping-installers")
+            let copyReady = fixture.directory.appendingPathComponent("copy-ready")
+            let copyRelease = fixture.directory.appendingPathComponent("copy-release")
+            let firstStdout = fixture.directory.appendingPathComponent("first-stdout.txt")
+            let firstStderr = fixture.directory.appendingPathComponent("first-stderr.txt")
+            let statCalls = fixture.directory.appendingPathComponent("stat-calls.txt")
+            let recordingStat = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                printf 'stat %s\n' "$*" >> "${TICKER_TEST_STAT_CALLS}"
+                exec /usr/bin/stat "$@"
+                """,
+                named: "recording-stat.sh",
+                in: fixture.directory
+            )
+            let blockingCopy = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                : > "${TICKER_TEST_COPY_READY}"
+                while [ ! -e "${TICKER_TEST_COPY_RELEASE}" ]; do
+                  /bin/sleep 0.01
+                done
+                exec /bin/cp "$@"
+                """,
+                named: "blocking-copy.sh",
+                in: fixture.directory
+            )
+            var overlapEnvironment = fixture.environment
+            overlapEnvironment["TICKER_INSTALL_STAT"] = recordingStat.path
+            overlapEnvironment["TICKER_TEST_STAT_CALLS"] = statCalls.path
+            var firstEnvironment = overlapEnvironment
+            firstEnvironment["TICKER_INSTALL_COPY"] = blockingCopy.path
+            firstEnvironment["TICKER_TEST_COPY_READY"] = copyReady.path
+            firstEnvironment["TICKER_TEST_COPY_RELEASE"] = copyRelease.path
+            let priorInode = try pathInode(fixture.installedBundle)
+            let first = try startInstaller(
+                environment: firstEnvironment,
+                stdout: firstStdout,
+                stderr: firstStderr
+            )
+            defer {
+                try? Data().write(to: copyRelease)
+                if first.isRunning {
+                    first.terminate()
+                    first.waitUntilExit()
+                }
+            }
+
+            let readyDeadline = Date().addingTimeInterval(2)
+            while !FileManager.default.fileExists(atPath: copyReady.path), Date() < readyDeadline {
+                usleep(1_000)
+            }
+            guard FileManager.default.fileExists(atPath: copyReady.path) else {
+                throw FixtureError.missing("first overlapping installer did not reach copy seam")
+            }
+            let processCallsBeforeSecond = processActions(fixture.processCalls)
+            let loginCallsBeforeSecond = loginActions(fixture.loginCalls)
+            let statCallsBeforeSecond = try String(contentsOf: statCalls, encoding: .utf8)
+
+            let second = try runInstaller(environment: overlapEnvironment)
+            tests.expect(second.status != 0, "test16_installer_overlapSecondFails")
+            tests.expect(
+                second.stderr.contains("another installer owns")
+                    && second.stderr.contains("remove the lock directory manually"),
+                "test16_installer_overlapReportsOwnerAndManualRecovery"
+            )
+            tests.expectEqual(
+                processActions(fixture.processCalls),
+                processCallsBeforeSecond,
+                "test16_installer_overlapSecondFailsBeforeAppCapture"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                loginCallsBeforeSecond,
+                "test16_installer_overlapSecondFailsBeforeLoginCapture"
+            )
+            tests.expectEqual(
+                try String(contentsOf: statCalls, encoding: .utf8),
+                statCallsBeforeSecond,
+                "test16_installer_overlapSecondFailsBeforePathStateCapture"
+            )
+            tests.expectEqual(
+                try pathInode(fixture.installedBundle),
+                priorInode,
+                "test16_installer_overlapLeavesFirstInstalledIdentityIntact"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.cliLink.path),
+                "test16_installer_overlapDoesNotMutateCLI"
+            )
+
+            try Data().write(to: copyRelease)
+            let finishDeadline = Date().addingTimeInterval(5)
+            while first.isRunning, Date() < finishDeadline {
+                usleep(1_000)
+            }
+            if first.isRunning {
+                first.terminate()
+                first.waitUntilExit()
+            }
+            tests.expectEqual(
+                first.terminationStatus,
+                0,
+                "test16_installer_overlapFirstCompletesAfterSecondFails"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "new",
+                "test16_installer_overlapFirstCommitsItsReplacement"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_overlapFirstReleasesOwnedLockAfterCleanup"
+            )
+            let releaseRecords = releasedCustodyRecords(for: fixture.installedBundle)
+            tests.expectEqual(
+                releaseRecords.count,
+                1,
+                "test16_installer_overlapRetainsOneBoundedCustodyRecordForOwner"
+            )
+            tests.expect(
+                releaseRecords.allSatisfy(releasedCustodyRecordIsProven),
+                "test16_installer_overlapCustodyRecordProvesReleasedOwnership"
+            )
+        }
+
+        let lockSignalCases: [(name: String, status: Int32)] = [
+            ("HUP", 129),
+            ("QUIT", 131),
+        ]
+        let lockSignalPhases = [
+            ("after-mkdir", "after-mkdir"),
+            ("after-inode", "after-inode-capture"),
+            ("between-metadata", "between-metadata-writes"),
+        ]
+        for signalCase in lockSignalCases {
+            for (fixtureSuffix, signalPhase) in lockSignalPhases {
+                let fixture = try makeFixture(
+                    "lock-signal-\(signalCase.name.lowercased())-\(fixtureSuffix)"
+                )
+                var environment = fixture.environment
+                environment["TICKER_INSTALL_LOCK_SIGNAL_PHASE"] = signalPhase
+                environment["TICKER_INSTALL_LOCK_SIGNAL"] = signalCase.name
+
+                let result = try runInstaller(environment: environment)
+                tests.expectEqual(
+                    result.status,
+                    signalCase.status,
+                    "test16_installer_\(signalCase.name)_\(signalPhase)_returnsDeferredSignalStatus"
+                )
+                tests.expect(
+                    result.stderr.contains("received \(signalCase.name)"),
+                    "test16_installer_\(signalCase.name)_\(signalPhase)_restoresSignalMaskAndHandler"
+                )
+                tests.expectEqual(
+                    installedVersion(fixture.installedBundle),
+                    "old",
+                    "test16_installer_\(signalCase.name)_\(signalPhase)_doesNotEnterInstallTransaction"
+                )
+                tests.expectEqual(
+                    processActions(fixture.processCalls),
+                    [],
+                    "test16_installer_\(signalCase.name)_\(signalPhase)_precedesAppStateCapture"
+                )
+                tests.expectEqual(
+                    loginActions(fixture.loginCalls),
+                    [],
+                    "test16_installer_\(signalCase.name)_\(signalPhase)_precedesLoginStateCapture"
+                )
+                tests.expectEqual(
+                    transactionArtifacts(for: fixture.installedBundle),
+                    [],
+                    "test16_installer_\(signalCase.name)_\(signalPhase)_releasesPublicLock"
+                )
+                let interruptedRecords = releasedCustodyRecords(
+                    for: fixture.installedBundle
+                )
+                tests.expectEqual(
+                    interruptedRecords.count,
+                    1,
+                    "test16_installer_\(signalCase.name)_\(signalPhase)_retainsOneCustodyRecord"
+                )
+                tests.expect(
+                    interruptedRecords.allSatisfy(releasedCustodyRecordIsProven),
+                    "test16_installer_\(signalCase.name)_\(signalPhase)_marksReleasedCustody"
+                )
+
+                let retry = try runInstaller(environment: fixture.environment)
+                tests.expectEqual(
+                    retry.status,
+                    0,
+                    "test16_installer_\(signalCase.name)_\(signalPhase)_allowsSafeRetry"
+                )
+                tests.expectEqual(
+                    installedVersion(fixture.installedBundle),
+                    "new",
+                    "test16_installer_\(signalCase.name)_\(signalPhase)_retryCommitsReplacement"
+                )
+                tests.expectEqual(
+                    transactionArtifacts(for: fixture.installedBundle),
+                    [],
+                    "test16_installer_\(signalCase.name)_\(signalPhase)_retryLeavesNoActiveLock"
+                )
+                let retryRecords = releasedCustodyRecords(for: fixture.installedBundle)
+                tests.expectEqual(
+                    retryRecords.count,
+                    2,
+                    "test16_installer_\(signalCase.name)_\(signalPhase)_boundsRecordsOnePerRun"
+                )
+                tests.expect(
+                    retryRecords.allSatisfy(releasedCustodyRecordIsProven),
+                    "test16_installer_\(signalCase.name)_\(signalPhase)_retryRecordsStayProven"
+                )
+            }
+        }
+
+        for signalCase in lockSignalCases {
+            let fixture = try makeFixture(
+                "lock-release-signal-\(signalCase.name.lowercased())"
+            )
+            let releaseSignalHook = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                if [ "$1" = "during-custody-release" ]; then
+                  kill "-${TICKER_TEST_LOCK_RELEASE_SIGNAL}" "$PPID"
+                fi
+                """,
+                named: "signal-during-custody-release.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LOCK_HOOK"] = releaseSignalHook.path
+            environment["TICKER_TEST_LOCK_RELEASE_SIGNAL"] = signalCase.name
+
+            let result = try runInstaller(environment: environment)
+            tests.expectEqual(
+                result.status,
+                signalCase.status,
+                "test16_installer_\(signalCase.name)_duringCustodyReleaseReturnsSignalStatus"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "received \(signalCase.name) during installer lock release"
+                ),
+                "test16_installer_\(signalCase.name)_duringCustodyReleaseReconcilesHelperStatus"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "new",
+                "test16_installer_\(signalCase.name)_duringCustodyReleaseKeepsCommittedInstall"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_\(signalCase.name)_duringCustodyReleaseLeavesPublicLockAbsent"
+            )
+            let interruptedRecords = releasedCustodyRecords(for: fixture.installedBundle)
+            tests.expectEqual(
+                interruptedRecords.count,
+                1,
+                "test16_installer_\(signalCase.name)_duringCustodyReleaseRetainsOneRecord"
+            )
+            tests.expect(
+                interruptedRecords.allSatisfy(releasedCustodyRecordIsProven),
+                "test16_installer_\(signalCase.name)_duringCustodyReleaseRestoresNativeMask"
+            )
+
+            let retry = try runInstaller(environment: fixture.environment)
+            tests.expectEqual(
+                retry.status,
+                0,
+                "test16_installer_\(signalCase.name)_duringCustodyReleaseAllowsCleanRetry"
+            )
+            tests.expectEqual(
+                releasedCustodyRecords(for: fixture.installedBundle).count,
+                2,
+                "test16_installer_\(signalCase.name)_duringCustodyReleaseBoundsOneRecordPerRun"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("lock-date-failure")
+            let failingDate = try writeCommand(
+                "#!/bin/sh\nexit 81\n",
+                named: "fail-lock-date.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_DATE"] = failingDate.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_installer_lockDateFailureIsReported")
+            tests.expect(
+                result.stderr.contains("could not obtain the installer lock timestamp"),
+                "test16_installer_lockDateFailureIsObservable"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_lockDateFailureReleasesPartialOwnedLock"
+            )
+            tests.expectEqual(
+                processActions(fixture.processCalls),
+                [],
+                "test16_installer_lockDateFailurePrecedesStateCapture"
+            )
+            tests.expectEqual(
+                releasedCustodyRecords(for: fixture.installedBundle).count,
+                1,
+                "test16_installer_lockDateFailureRetainsOnePartialReleaseRecord"
+            )
+
+            let retry = try runInstaller(environment: fixture.environment)
+            tests.expectEqual(retry.status, 0, "test16_installer_lockDateFailureAllowsRetry")
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_lockDateFailureRetryCleansArtifacts"
+            )
+            tests.expectEqual(
+                releasedCustodyRecords(for: fixture.installedBundle).count,
+                2,
+                "test16_installer_lockDateFailureBoundsOneRecordPerRun"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("lock-write-failure")
+            let writeFailureHook = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                if [ "$1" = "between-metadata-writes" ]; then
+                  chmod 0555 "$2"
+                fi
+                """,
+                named: "fail-lock-write.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LOCK_HOOK"] = writeFailureHook.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_installer_lockWriteFailureIsReported")
+            tests.expect(
+                result.stderr.contains("could not record the installer lock timestamp"),
+                "test16_installer_lockWriteFailureIsObservable"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_lockWriteFailureReleasesPartialOwnedLock"
+            )
+            tests.expectEqual(
+                processActions(fixture.processCalls),
+                [],
+                "test16_installer_lockWriteFailurePrecedesStateCapture"
+            )
+            let partialRecords = releasedCustodyRecords(for: fixture.installedBundle)
+            tests.expectEqual(
+                partialRecords.count,
+                1,
+                "test16_installer_lockWriteFailureRetainsOnePartialReleaseRecord"
+            )
+            tests.expect(
+                partialRecords.allSatisfy(releasedCustodyRecordIsProven),
+                "test16_installer_lockWriteFailureMarksOwnedPartialCustody"
+            )
+
+            let retry = try runInstaller(environment: fixture.environment)
+            tests.expectEqual(retry.status, 0, "test16_installer_lockWriteFailureAllowsRetry")
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_lockWriteFailureRetryCleansArtifacts"
+            )
+            tests.expectEqual(
+                releasedCustodyRecords(for: fixture.installedBundle).count,
+                2,
+                "test16_installer_lockWriteFailureBoundsOneRecordPerRun"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("lock-successor-acquires-during-release")
+            let lock = URL(fileURLWithPath: fixture.installedBundle.path + ".install.lock")
+            let successorInodeRecord = fixture.directory.appendingPathComponent(
+                "successor-public-lock-inode.txt"
+            )
+            let successorPID = "515151"
+            let successorTimestamp = "2099-01-02T03:04:05Z"
+            let successorAcquisitionHook = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                if [ "$1" = "last-pre-delete" ]; then
+                  /bin/mkdir "$2"
+                  printf '%s\n' "${TICKER_TEST_SUCCESSOR_LOCK_PID}" > "$2/pid"
+                  printf '%s\n' "${TICKER_TEST_SUCCESSOR_LOCK_TIMESTAMP}" > "$2/timestamp"
+                  /usr/bin/stat -f '%i' "$2" > "${TICKER_TEST_SUCCESSOR_LOCK_INODE}"
+                fi
+                """,
+                named: "acquire-successor-lock-during-release.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LOCK_HOOK"] = successorAcquisitionHook.path
+            environment["TICKER_TEST_SUCCESSOR_LOCK_INODE"] = successorInodeRecord.path
+            environment["TICKER_TEST_SUCCESSOR_LOCK_PID"] = successorPID
+            environment["TICKER_TEST_SUCCESSOR_LOCK_TIMESTAMP"] = successorTimestamp
+
+            let result = try runInstaller(environment: environment)
+            tests.expectEqual(
+                result.status,
+                0,
+                "test16_installer_successorPublicLockDuringReleaseLetsPriorOwnerSucceed"
+            )
+            tests.expect(
+                !result.stderr.contains("public installer lock path"),
+                "test16_installer_successorPublicLockIsNotClassifiedAsPriorOwnerCleanup"
+            )
+            let recordedSuccessorInode = try String(
+                contentsOf: successorInodeRecord,
+                encoding: .utf8
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            tests.expectEqual(
+                String(try pathInode(lock)),
+                recordedSuccessorInode,
+                "test16_installer_successorPublicLockPreservesExactInode"
+            )
+            tests.expectEqual(
+                try FileManager.default.contentsOfDirectory(atPath: lock.path).sorted(),
+                ["pid", "timestamp"],
+                "test16_installer_successorPublicLockPreservesExactEntries"
+            )
+            tests.expectEqual(
+                try String(
+                    contentsOf: lock.appendingPathComponent("pid"),
+                    encoding: .utf8
+                ),
+                "\(successorPID)\n",
+                "test16_installer_successorPublicLockPreservesExactPID"
+            )
+            tests.expectEqual(
+                try String(
+                    contentsOf: lock.appendingPathComponent("timestamp"),
+                    encoding: .utf8
+                ),
+                "\(successorTimestamp)\n",
+                "test16_installer_successorPublicLockPreservesExactTimestamp"
+            )
+            let releaseRecords = releasedCustodyRecords(for: fixture.installedBundle)
+            tests.expectEqual(
+                releaseRecords.count,
+                1,
+                "test16_installer_successorPublicLockKeepsOnePriorOwnerCustodyRecord"
+            )
+            tests.expect(
+                releaseRecords.allSatisfy(releasedCustodyRecordIsProven),
+                "test16_installer_successorPublicLockKeepsProvenPriorOwnerCustody"
+            )
+            tests.expect(
+                releaseRecords.allSatisfy {
+                    let releasedLock = $0.appendingPathComponent("lock", isDirectory: true)
+                    return (try? pathInode(releasedLock)) != UInt64(recordedSuccessorInode)
+                },
+                "test16_installer_successorPublicLockStaysDistinctFromPriorOwnerCustody"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "new",
+                "test16_installer_successorPublicLockDoesNotRollbackCommittedInstall"
+            )
+
+            try FileManager.default.removeItem(at: lock)
+            let retry = try runInstaller(environment: fixture.environment)
+            tests.expectEqual(
+                retry.status,
+                0,
+                "test16_installer_successorPublicLockAllowsRetryAfterSuccessorRelease"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_successorPublicLockRetryLeavesNoActiveLock"
+            )
+            tests.expectEqual(
+                releasedCustodyRecords(for: fixture.installedBundle).count,
+                2,
+                "test16_installer_successorPublicLockBoundsOneRecordPerRun"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("lock-foreign-at-former-pre-rmdir")
+            let lock = URL(fileURLWithPath: fixture.installedBundle.path + ".install.lock")
+            let heldOwnedLock = URL(fileURLWithPath: lock.path + ".custody.held")
+            let foreignInodeRecord = fixture.directory.appendingPathComponent(
+                "foreign-custody-inode.txt"
+            )
+            let foreignPathRecord = fixture.directory.appendingPathComponent(
+                "foreign-custody-path.txt"
+            )
+            let swapHook = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                if [ "$1" = "former-pre-rmdir" ]; then
+                  /bin/mv "$3" "${TICKER_TEST_LOCK_HELD_PATH}"
+                  /bin/mkdir "$3"
+                  printf '%s\n' "$3" > "${TICKER_TEST_FOREIGN_LOCK_PATH}"
+                  /usr/bin/stat -f '%i' "$3" > "${TICKER_TEST_FOREIGN_LOCK_INODE}"
+                fi
+                """,
+                named: "swap-lock-at-former-pre-rmdir.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LOCK_HOOK"] = swapHook.path
+            environment["TICKER_TEST_LOCK_HELD_PATH"] = heldOwnedLock.path
+            environment["TICKER_TEST_FOREIGN_LOCK_INODE"] = foreignInodeRecord.path
+            environment["TICKER_TEST_FOREIGN_LOCK_PATH"] = foreignPathRecord.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_installer_foreignCustodyAtFormerRmdirRequiresManualCleanup"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "foreign inode at released-custody path was preserved for manual cleanup"
+                ),
+                "test16_installer_foreignCustodyAtFormerRmdirIsClassified"
+            )
+            let recordedForeignInode = try String(
+                contentsOf: foreignInodeRecord,
+                encoding: .utf8
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            let recordedForeignPath = try String(
+                contentsOf: foreignPathRecord,
+                encoding: .utf8
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            let foreignPath = URL(
+                fileURLWithPath: recordedForeignPath
+            )
+            tests.expectEqual(
+                String(try pathInode(foreignPath)),
+                recordedForeignInode,
+                "test16_installer_foreignCustodyAtFormerRmdirPreservesExactInode"
+            )
+            tests.expect(
+                releasedLockDirectoryIsProven(heldOwnedLock),
+                "test16_installer_foreignCustodyAtFormerRmdirRetainsMarkedOwnedInode"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: lock.path),
+                "test16_installer_foreignCustodyAtFormerRmdirLeavesPublicLockReleased"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "new",
+                "test16_installer_foreignCustodyAtFormerRmdirKeepsCommittedInstall"
+            )
+
+            let retry = try runInstaller(environment: fixture.environment)
+            tests.expectEqual(
+                retry.status,
+                0,
+                "test16_installer_foreignCustodyAtFormerRmdirAllowsCleanRetry"
+            )
+            tests.expectEqual(
+                String(try pathInode(foreignPath)),
+                recordedForeignInode,
+                "test16_installer_foreignCustodySurvivesCleanRetry"
+            )
+            tests.expect(
+                releasedLockDirectoryIsProven(heldOwnedLock),
+                "test16_installer_ownedCustodySurvivesCleanRetry"
+            )
+            tests.expectEqual(
+                releasedCustodyRecords(for: fixture.installedBundle).count,
+                2,
+                "test16_installer_foreignCustodyRetryBoundsOneNamespacePerRun"
+            )
+            tests.expect(
+                transactionArtifacts(for: fixture.installedBundle).contains(
+                    heldOwnedLock.lastPathComponent
+                ),
+                "test16_installer_foreignCustodyRemainsExplicitManualArtifact"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("stale-installer-lock")
+            let lock = URL(fileURLWithPath: fixture.installedBundle.path + ".install.lock")
+            try FileManager.default.createDirectory(
+                at: lock,
+                withIntermediateDirectories: false
+            )
+            try "424242\n".write(
+                to: lock.appendingPathComponent("pid"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try "2001-01-01T00:00:00Z\n".write(
+                to: lock.appendingPathComponent("timestamp"),
+                atomically: true,
+                encoding: .utf8
+            )
+            let staleLockInode = try pathInode(lock)
+
+            let result = try runInstaller(environment: fixture.environment)
+            tests.expect(result.status != 0, "test16_installer_staleLockFailsClosed")
+            tests.expect(
+                result.stderr.contains("pid=424242")
+                    && result.stderr.contains("acquired=2001-01-01T00:00:00Z"),
+                "test16_installer_staleLockReportsRecordedOwner"
+            )
+            tests.expect(
+                FileManager.default.fileExists(atPath: lock.path),
+                "test16_installer_staleLockIsNeverStolen"
+            )
+            tests.expectEqual(
+                try pathInode(lock),
+                staleLockInode,
+                "test16_installer_staleLockPreservesExactForeignInode"
+            )
+            tests.expectEqual(
+                processActions(fixture.processCalls),
+                [],
+                "test16_installer_staleLockFailsBeforeAppCapture"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                [],
+                "test16_installer_staleLockFailsBeforeLoginCapture"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_installer_staleLockPreservesInstalledBundle"
+            )
+            tests.expectEqual(
+                releasedCustodyRecords(for: fixture.installedBundle),
+                [],
+                "test16_installer_staleForeignLockCreatesNoOwnedCustodyRecord"
+            )
+            try FileManager.default.removeItem(at: lock)
+        }
+
+        do {
+            let fixture = try makeFixture("fresh-app-path-appearance", priorVersion: nil)
+            let foreignBundle = fixture.directory.appendingPathComponent(
+                "foreign/Ticker.app",
+                isDirectory: true
+            )
+            try writeBundle(foreignBundle, version: "foreign")
+            let noReplaceCommand = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                if [ "$3" = "${TICKER_INSTALL_BUNDLE}" ]; then
+                  mkdir -p "$3"
+                  /bin/cp -R "${TICKER_TEST_FOREIGN_BUNDLE}/." "$3/"
+                fi
+                exec "${TICKER_INSTALL_NATIVE_RENAME_HELPER}" "$@"
+                """,
+                named: "app-appearance-before-no-replace.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_NO_REPLACE"] = noReplaceCommand.path
+            environment["TICKER_TEST_FOREIGN_BUNDLE"] = foreignBundle.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_freshAppAppearanceIsRejected")
+            tests.expect(
+                result.stderr.contains("no-replace publication refused to overwrite it")
+                    && result.stderr.contains("left untouched for manual recovery"),
+                "test16_freshAppAppearanceIsObservable"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "foreign",
+                "test16_freshAppAppearanceNeverOverwritesForeignBundle"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status"],
+                "test16_freshAppAppearanceDoesNotMutateLoginState"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.cliLink.path),
+                "test16_freshAppAppearanceDoesNotPublishCLI"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_freshAppAppearanceCleansOnlyOwnedArtifacts"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("fresh-cli-path-appearance")
+            let foreignTarget = fixture.directory.appendingPathComponent("foreign-cli")
+            try writeExecutable("#!/bin/sh\nexit 0\n", to: foreignTarget)
+            let noReplaceCommand = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                if [ "$3" = "${TICKER_INSTALL_CLI_LINK}" ]; then
+                  /bin/ln -s "${TICKER_TEST_FOREIGN_CLI_TARGET}" "$3"
+                fi
+                exec "${TICKER_INSTALL_NATIVE_RENAME_HELPER}" "$@"
+                """,
+                named: "cli-appearance-before-no-replace.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_NO_REPLACE"] = noReplaceCommand.path
+            environment["TICKER_TEST_FOREIGN_CLI_TARGET"] = foreignTarget.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_freshCLIAppearanceIsRejected")
+            tests.expect(
+                result.stderr.contains("CLI path appeared; no-replace publication refused")
+                    && result.stderr.contains("left the unexpected destination identity untouched"),
+                "test16_freshCLIAppearanceIsObservable"
+            )
+            tests.expectEqual(
+                try FileManager.default.destinationOfSymbolicLink(atPath: fixture.cliLink.path),
+                foreignTarget.path,
+                "test16_freshCLIAppearanceNeverOverwritesForeignPath"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_freshCLIAppearanceRollsBackBundle"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_freshCLIAppearanceRollsBackWithZeroLoginMutation"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_freshCLIAppearanceCleansOnlyOwnedArtifacts"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("copy-failure")
+            let copyCommand = try writeCommand(
+                "#!/bin/sh\nexit 71\n",
+                named: "fail-copy.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_COPY"] = copyCommand.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_installer_copyFailureIsReported")
+            tests.expect(
+                result.stderr.contains("copy to staged replacement failed"),
+                "test16_installer_copyFailureIsObservable"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_installer_copyFailurePreservesPriorBundle"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                [],
+                "test16_installer_copyFailureDoesNotTouchLoginTarget"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_copyFailureCleansStaging"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("copy-replaces-staging-inode")
+            let priorCLITarget = fixture.directory.appendingPathComponent("prior-cli")
+            try writeExecutable("#!/bin/sh\nexit 0\n", to: priorCLITarget)
+            try FileManager.default.createSymbolicLink(
+                at: fixture.cliLink,
+                withDestinationURL: priorCLITarget
+            )
+            let priorBundleInode = try pathInode(fixture.installedBundle)
+            let priorCLIInode = try pathInode(fixture.cliLink)
+            let copyIdentities = fixture.directory.appendingPathComponent(
+                "copy-staging-identities.txt"
+            )
+            let replacingCopy = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                destination="${3%/}"
+                replacement="${destination}.copied.$$"
+                before="$(/usr/bin/stat -f '%i' "$destination")"
+                /bin/mkdir "$replacement"
+                /bin/cp -R "$2" "$replacement/"
+                /bin/rm -rf "$destination"
+                /bin/mv "$replacement" "$destination"
+                after="$(/usr/bin/stat -f '%i' "$destination")"
+                printf '%s\n%s\n' "$before" "$after" > "${TICKER_TEST_COPY_IDENTITIES}"
+                """,
+                named: "replace-staging-copy.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_COPY"] = replacingCopy.path
+            environment["TICKER_TEST_COPY_IDENTITIES"] = copyIdentities.path
+            environment["TICKER_TEST_OPEN_FAIL_VERSION"] = "new"
+
+            let result = try runInstaller(environment: environment)
+            let copiedIdentities = (
+                try? String(contentsOf: copyIdentities, encoding: .utf8)
+            )?.split(separator: "\n").map(String.init) ?? []
+            tests.expect(
+                copiedIdentities.count == 2 && copiedIdentities[0] != copiedIdentities[1],
+                "test16_installer_copyFixtureReplacesStagingRootInode"
+            )
+            tests.expect(result.status != 0, "test16_installer_postCopyFailureIsReported")
+            tests.expect(
+                result.stderr.contains("replacement launch command failed")
+                    && processActions(fixture.processCalls).contains("open new"),
+                "test16_installer_postCopyFailureOccursAfterBundleAndCLIMutation"
+            )
+            tests.expectEqual(
+                try pathInode(fixture.installedBundle),
+                priorBundleInode,
+                "test16_installer_postCopyInodeReplacementRestoresPriorBundleIdentity"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_installer_postCopyInodeReplacementRestoresPriorBundleContents"
+            )
+            tests.expectEqual(
+                try pathInode(fixture.cliLink),
+                priorCLIInode,
+                "test16_installer_postCopyInodeReplacementRestoresPriorCLIIdentity"
+            )
+            tests.expectEqual(
+                try FileManager.default.destinationOfSymbolicLink(atPath: fixture.cliLink.path),
+                priorCLITarget.path,
+                "test16_installer_postCopyInodeReplacementRestoresPriorCLITarget"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_installer_postCopyInodeReplacementKeepsLoginStateReadOnly"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_postCopyInodeReplacementCleansOwnedArtifacts"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("invalid-staged-bundle")
+            try "not a property list".write(
+                to: fixture.sourceBundle.appendingPathComponent("Contents/Info.plist"),
+                atomically: true,
+                encoding: .utf8
+            )
+
+            let result = try runInstaller(environment: fixture.environment)
+            tests.expect(result.status != 0, "test16_installer_invalidStageIsRejected")
+            tests.expect(
+                result.stderr.contains("staged replacement: ERROR - Info.plist is invalid"),
+                "test16_installer_invalidStageFailureIsObservable"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_installer_invalidStagePreservesPriorBundle"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                [],
+                "test16_installer_invalidStageDoesNotTouchLoginTarget"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_invalidStageCleansStaging"
+            )
+        }
+
+        let invalidBundleIdentityCases: [(field: String, wrong: String, expected: String)] = [
+            ("CFBundleIdentifier", "com.example.not-ticker", "com.suchintan.ticker"),
+            ("CFBundleExecutable", "NotTicker", "Ticker"),
+            ("CFBundlePackageType", "BNDL", "APPL"),
+        ]
+        for invalidIdentity in invalidBundleIdentityCases {
+            let fixtureName = "invalid-\(invalidIdentity.field.lowercased())"
+            let fixture = try makeFixture(fixtureName)
+            let priorBundleInode = try pathInode(fixture.installedBundle)
+            let infoPlist = fixture.sourceBundle.appendingPathComponent("Contents/Info.plist")
+            var propertyList = try test2A_readPropertyList(infoPlist)
+            propertyList[invalidIdentity.field] = invalidIdentity.wrong
+            try writePropertyList(propertyList, to: infoPlist)
+
+            let result = try runInstaller(environment: fixture.environment)
+            tests.expect(
+                result.status != 0,
+                "test16_installer_\(invalidIdentity.field)WrongValueIsRejected"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "Info.plist \(invalidIdentity.field) must be exactly "
+                        + "'\(invalidIdentity.expected)' (found '\(invalidIdentity.wrong)')"
+                ),
+                "test16_installer_\(invalidIdentity.field)WrongValueIsObservable"
+            )
+            tests.expectEqual(
+                try pathInode(fixture.installedBundle),
+                priorBundleInode,
+                "test16_installer_\(invalidIdentity.field)RejectsBeforeBundleMutation"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_installer_\(invalidIdentity.field)PreservesPriorBundle"
+            )
+            tests.expect(
+                loginActions(fixture.loginCalls).isEmpty,
+                "test16_installer_\(invalidIdentity.field)RejectsBeforeLoginMutation"
+            )
+            tests.expect(
+                processActions(fixture.processCalls).allSatisfy { $0.hasPrefix("pgrep ") },
+                "test16_installer_\(invalidIdentity.field)RejectsBeforeProcessMutation"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.cliLink.path),
+                "test16_installer_\(invalidIdentity.field)RejectsBeforeCLIMutation"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_\(invalidIdentity.field)CleansOwnedStaging"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("signature-failure")
+            let codesignCommand = try writeCommand(
+                "#!/bin/sh\nexit 72\n",
+                named: "fail-codesign.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_CODESIGN"] = codesignCommand.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_installer_signatureFailureIsRejected")
+            tests.expect(
+                result.stderr.contains("staged replacement: ERROR - signature verification failed"),
+                "test16_installer_signatureFailureIsObservable"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_installer_signatureFailurePreservesPriorBundle"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                [],
+                "test16_installer_signatureFailureDoesNotTouchLoginTarget"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_signatureFailureCleansStaging"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("modern-login-live-launch-agent")
+            try "enabled via LaunchAgent\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+            try "running\n".write(
+                to: fixture.processState,
+                atomically: true,
+                encoding: .utf8
+            )
+
+            let result = try runInstaller(environment: fixture.environment)
+            tests.expectEqual(result.status, 0, "test16_modernLiveLaunchAgent_succeeds")
+            tests.expect(
+                result.stdout.contains(
+                    "login item: captured prior state: enabled via LaunchAgent"
+                )
+                    && result.stdout.contains(
+                        "login item: preserved prior state: enabled via LaunchAgent"
+                    )
+                    && result.stdout.contains(
+                        "login item: final preserved state: enabled via LaunchAgent"
+                    ),
+                "test16_modernLiveLaunchAgent_isCapturedAndVerifiedExactly"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "new",
+                "test16_modernLiveLaunchAgent_installsReplacement"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status", "status"],
+                "test16_modernLiveLaunchAgent_usesOnlyReadOnlyLoginProofs"
+            )
+            let modernLaunchAgentEvents = processActions(fixture.processCalls)
+            let modernKickstarts = modernLaunchAgentEvents.indices.filter {
+                modernLaunchAgentEvents[$0]
+                    == "launchctl kickstart -k gui/\(getuid())/com.suchintan.ticker.login"
+            }
+            let modernLoginStatuses = modernLaunchAgentEvents.indices.filter {
+                modernLaunchAgentEvents[$0] == "login status"
+            }
+            let modernStopIndex = modernLaunchAgentEvents.firstIndex {
+                $0.hasPrefix("pkill ")
+            }
+            let modernLinkIndex = modernLaunchAgentEvents.firstIndex {
+                $0.hasPrefix("link ")
+            }
+            tests.expect(
+                modernKickstarts.count == 1
+                    && !modernLaunchAgentEvents.contains("open new")
+                    && !modernLaunchAgentEvents.contains {
+                        $0.hasPrefix("launchctl bootstrap ")
+                    },
+                "test16_modernLiveLaunchAgent_usesOneExactKickstartAsSoleReplacementStart"
+            )
+            if modernKickstarts.count == 1,
+               modernLoginStatuses.count == 3,
+               let modernStopIndex,
+               let modernLinkIndex {
+                tests.expect(
+                    modernStopIndex < modernKickstarts[0]
+                        && modernKickstarts[0] > modernLaunchAgentEvents.startIndex
+                        && modernLaunchAgentEvents[modernKickstarts[0] - 1]
+                            .hasPrefix("pgrep new ")
+                        && modernKickstarts[0] < modernLoginStatuses[1]
+                        && modernLoginStatuses[1] < modernLinkIndex
+                        && modernLinkIndex < modernLoginStatuses[2],
+                    "test16_modernLiveLaunchAgent_startsOnlyAfterPostExchangeAbsenceProof"
+                )
+            } else {
+                tests.expect(
+                    false,
+                    "test16_modernLiveLaunchAgent_recordsCompleteRestartAndProofOrdering"
+                )
+            }
+        }
+
+        do {
+            let fixture = try makeFixture("legacy-login-live-launch-agent", priorVersion: "legacy")
+            try "enabled via LaunchAgent\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+            try "running\n".write(
+                to: fixture.processState,
+                atomically: true,
+                encoding: .utf8
+            )
+
+            let result = try runInstaller(environment: fixture.environment)
+            tests.expectEqual(result.status, 0, "test16_legacyLiveLaunchAgent_succeeds")
+            tests.expect(
+                result.stdout.contains(
+                    "prior helper lacks login-item; using the legacy launchctl/plist read contract"
+                )
+                    && result.stdout.contains(
+                        "login item: captured prior state: enabled via LaunchAgent"
+                    )
+                    && result.stdout.contains(
+                        "login item: preserved prior state: enabled via LaunchAgent"
+                    )
+                    && result.stdout.contains(
+                        "login item: final preserved state: enabled via LaunchAgent"
+                    ),
+                "test16_legacyLiveLaunchAgent_isCapturedAndVerifiedExactly"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "new",
+                "test16_legacyLiveLaunchAgent_installsReplacement"
+            )
+            tests.expectEqual(
+                try String(contentsOf: fixture.loginState, encoding: .utf8),
+                "enabled via LaunchAgent\n",
+                "test16_legacyLiveLaunchAgent_preservesMechanism"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status", "status", "status"],
+                "test16_legacyLiveLaunchAgent_usesReadOnlyCaptureAndInstalledVerification"
+            )
+            let legacyLaunchAgentEvents = processActions(fixture.processCalls)
+            let legacyKickstarts = legacyLaunchAgentEvents.indices.filter {
+                legacyLaunchAgentEvents[$0]
+                    == "launchctl kickstart -k gui/\(getuid())/com.suchintan.ticker.login"
+            }
+            let legacyLoginStatuses = legacyLaunchAgentEvents.indices.filter {
+                legacyLaunchAgentEvents[$0] == "login status"
+            }
+            let legacyStopIndex = legacyLaunchAgentEvents.firstIndex {
+                $0.hasPrefix("pkill ")
+            }
+            let legacyLinkIndex = legacyLaunchAgentEvents.firstIndex {
+                $0.hasPrefix("link ")
+            }
+            let legacyReplacementOpen = legacyLaunchAgentEvents.contains("open new")
+            tests.expect(
+                legacyKickstarts.count == 1
+                    && !legacyReplacementOpen
+                    && !legacyLaunchAgentEvents.contains {
+                        $0.hasPrefix("launchctl bootstrap ")
+                    },
+                "test16_legacyLiveLaunchAgent_usesOneExactKickstartAsSoleReplacementStart"
+            )
+            if legacyKickstarts.count == 1,
+               legacyLoginStatuses.count == 4,
+               let legacyStopIndex,
+               let legacyLinkIndex {
+                tests.expect(
+                    legacyStopIndex < legacyKickstarts[0]
+                        && legacyKickstarts[0] > legacyLaunchAgentEvents.startIndex
+                        && legacyLaunchAgentEvents[legacyKickstarts[0] - 1]
+                            .hasPrefix("pgrep new ")
+                        && legacyKickstarts[0] < legacyLoginStatuses[2]
+                        && legacyLoginStatuses[2] < legacyLinkIndex
+                        && legacyLinkIndex < legacyLoginStatuses[3],
+                    "test16_legacyLiveLaunchAgent_startsOnlyAfterPostExchangeAbsenceProof"
+                )
+            } else {
+                tests.expect(
+                    false,
+                    "test16_legacyLiveLaunchAgent_recordsCompleteRestartAndProofOrdering"
+                )
+            }
+        }
+
+        do {
+            let fixture = try makeFixture("launch-agent-kickstart-failure-rollback")
+            try "enabled via LaunchAgent\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+            try "running\n".write(
+                to: fixture.processState,
+                atomically: true,
+                encoding: .utf8
+            )
+            var environment = fixture.environment
+            environment["TICKER_TEST_KICKSTART_FAIL_VERSION"] = "new"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_launchAgentKickstartFailure_failsTransaction"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "replacement exact LaunchAgent kickstart failed "
+                        + "(launchctl status 73): injected kickstart failure for new"
+                )
+                    && result.stdout.contains(
+                        "app: restored app exact LaunchAgent restart verified"
+                    )
+                    && result.stderr.contains(
+                        "login item: restored exact prior state: enabled via LaunchAgent"
+                    ),
+                "test16_launchAgentKickstartFailure_reportsFailureAndVerifiedRollback"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_launchAgentKickstartFailure_restoresPriorBundle"
+            )
+            tests.expect(
+                FileManager.default.fileExists(atPath: fixture.processState.path),
+                "test16_launchAgentKickstartFailure_restoresRunningProcess"
+            )
+            tests.expectEqual(
+                try String(contentsOf: fixture.loginState, encoding: .utf8),
+                "enabled via LaunchAgent\n",
+                "test16_launchAgentKickstartFailure_restoresExactPriorMechanism"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.cliLink.path),
+                "test16_launchAgentKickstartFailure_restoresPriorCLIAbsence"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_launchAgentKickstartFailure_reprovesRestoredExactLoginState"
+            )
+            let rollbackEvents = processActions(fixture.processCalls)
+            let rollbackKickstarts = rollbackEvents.indices.filter {
+                rollbackEvents[$0]
+                    == "launchctl kickstart -k gui/\(getuid())/com.suchintan.ticker.login"
+            }
+            let rollbackStateProof = rollbackEvents.lastIndex(of: "login status")
+            tests.expect(
+                rollbackKickstarts.count == 2
+                    && rollbackStateProof != nil
+                    && rollbackKickstarts[1] < rollbackStateProof!
+                    && !rollbackEvents.contains("open old")
+                    && !rollbackEvents.contains {
+                        $0.hasPrefix("launchctl bootstrap ")
+                    },
+                "test16_launchAgentKickstartFailure_rollsBackThroughExactTargetBeforeProof"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_launchAgentKickstartFailure_cleansAfterProvenRollback"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "launch-agent-process-appears-during-login-capture-rollback"
+            )
+            try "enabled via LaunchAgent\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+            var environment = fixture.environment
+            environment["TICKER_TEST_START_PROCESS_ON_LOGIN_STATUS_AT"] = "1"
+            environment["TICKER_TEST_LOGIN_STATUS_FAIL_AT"] = "3"
+            environment["TICKER_TEST_LOGIN_STATUS_FAILURE_MESSAGE"] =
+                "injected late final login proof failure"
+
+            let result = try runInstaller(environment: environment)
+
+            tests.expect(
+                result.status != 0,
+                "test16_reinstallCustody_lateProcessThenFailureRollsBack"
+            )
+            tests.expect(
+                result.stdout.contains("app: captured prior state: not running")
+                    && result.stdout.contains(
+                        "login item: captured prior state: enabled via LaunchAgent"
+                    )
+                    && result.stderr.contains("injected late final login proof failure")
+                    && result.stdout.contains(
+                        "app: restored app exact LaunchAgent restart verified"
+                    )
+                    && result.stderr.contains(
+                        "login item: restored exact prior state: enabled via LaunchAgent"
+                    ),
+                "test16_reinstallCustody_rollbackProvesCapturedLaunchAgentAndProcess"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_reinstallCustody_restoresPriorBundle"
+            )
+            tests.expect(
+                FileManager.default.fileExists(atPath: fixture.processState.path),
+                "test16_reinstallCustody_restartsProcessStoppedAfterEarliestSnapshot"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status", "status", "status"],
+                "test16_reinstallCustody_reprovesCapturedLaunchAgentAfterRollback"
+            )
+            let custodyEvents = processActions(fixture.processCalls)
+            let custodyKickstarts = custodyEvents.indices.filter {
+                custodyEvents[$0]
+                    == "launchctl kickstart -k gui/\(getuid())/com.suchintan.ticker.login"
+            }
+            let custodyStops = custodyEvents.filter { $0.hasPrefix("pkill ") }
+            let firstLoginStatus = custodyEvents.firstIndex(of: "login status")
+            let firstStop = custodyEvents.firstIndex { $0.hasPrefix("pkill ") }
+            let rollbackStatus = custodyEvents.lastIndex(of: "login status")
+            tests.expect(
+                custodyKickstarts.count == 2
+                    && custodyStops.count == 2
+                    && firstLoginStatus != nil
+                    && firstStop != nil
+                    && firstLoginStatus! < firstStop!
+                    && rollbackStatus != nil
+                    && custodyKickstarts[1] < rollbackStatus!
+                    && !custodyEvents.contains("open old")
+                    && !custodyEvents.contains("open new"),
+                "test16_reinstallCustody_ordersLateStopAndExactRollbackKickstart"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_reinstallCustody_cleansAfterProvenRollback"
+            )
+        }
+
+        let preStartRollbackScenarios: [(name: String, startsLateOldProcess: Bool)] = [
+            ("late-old-process", true),
+            ("no-process-control", false),
+        ]
+        for scenario in preStartRollbackScenarios {
+            let fixture = try makeFixture(
+                "pre-start-rollback-\(scenario.name)"
+            )
+            let codesignCalls = fixture.directory.appendingPathComponent(
+                "codesign-calls.txt"
+            )
+            let failInstalledValidation = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                call_count=0
+                if [ -f "${TICKER_TEST_CODESIGN_CALLS}" ]; then
+                  call_count="$(cat "${TICKER_TEST_CODESIGN_CALLS}")"
+                fi
+                call_count=$((call_count + 1))
+                printf '%s\n' "$call_count" > "${TICKER_TEST_CODESIGN_CALLS}"
+                if [ "$call_count" -eq 2 ]; then
+                  printf 'injected installed replacement validation failure\n' >&2
+                  exit 74
+                fi
+                """,
+                named: "fail-installed-validation-\(scenario.name).sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_CODESIGN"] = failInstalledValidation.path
+            environment["TICKER_TEST_CODESIGN_CALLS"] = codesignCalls.path
+            if scenario.startsLateOldProcess {
+                environment["TICKER_TEST_START_PROCESS_AFTER_PGREP_AT"] = "2"
+            }
+
+            let result = try runInstaller(environment: environment)
+            let events = processActions(fixture.processCalls)
+            let exactKickstart =
+                "launchctl kickstart -k gui/\(getuid())/com.suchintan.ticker.login"
+
+            tests.expect(
+                result.status != 0
+                    && result.stdout.contains("app: captured prior state: not running")
+                    && result.stdout.contains("application replacement exchanged atomically")
+                    && result.stderr.contains(
+                        "installed replacement: ERROR - signature verification failed"
+                    )
+                    && !events.contains("open new")
+                    && !events.contains(exactKickstart),
+                "test16_preStartRollback_\(scenario.name)_failsAfterExchangeBeforeReplacementStart"
+            )
+            tests.expectEqual(
+                try String(contentsOf: codesignCalls, encoding: .utf8),
+                "3\n",
+                "test16_preStartRollback_\(scenario.name)_validatesStageFailureAndRestoredBundle"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_preStartRollback_\(scenario.name)_restoresPriorBundle"
+            )
+
+            if scenario.startsLateOldProcess {
+                let lateStartIndex = events.firstIndex(of: "process-start old")
+                let rollbackStopIndex = events.firstIndex { $0.hasPrefix("pkill ") }
+                let restoredOpenIndex = events.firstIndex(of: "open old")
+                if let lateStartIndex,
+                   let rollbackStopIndex,
+                   let restoredOpenIndex {
+                    tests.expect(
+                        lateStartIndex > events.startIndex
+                            && events[lateStartIndex - 1].hasPrefix("pgrep old ")
+                            && lateStartIndex < rollbackStopIndex
+                            && events[rollbackStopIndex].hasPrefix("pkill new ")
+                            && rollbackStopIndex < restoredOpenIndex,
+                        "test16_preStartRollback_lateOldProcess_stopsThenReopensRestoredApp"
+                    )
+                } else {
+                    tests.expect(
+                        false,
+                        "test16_preStartRollback_lateOldProcess_recordsStartStopAndRestoreOpen"
+                    )
+                }
+                tests.expect(
+                    FileManager.default.fileExists(atPath: fixture.processState.path)
+                        && events.filter { $0.hasPrefix("pkill ") }.count == 1,
+                    "test16_preStartRollback_lateOldProcess_restoresRunningState"
+                )
+            } else {
+                tests.expect(
+                    !FileManager.default.fileExists(atPath: fixture.processState.path)
+                        && !events.contains { $0.hasPrefix("process-start ") }
+                        && !events.contains { $0.hasPrefix("pkill ") }
+                        && !events.contains("open old"),
+                    "test16_preStartRollback_noProcessControl_preservesStoppedState"
+                )
+            }
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_preStartRollback_\(scenario.name)_cleansAfterProvenRollback"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "late-old-process-after-pre-exchange-absence"
+            )
+            var environment = fixture.environment
+            environment["TICKER_TEST_START_PROCESS_AFTER_PGREP_AT"] = "2"
+            environment["TICKER_TEST_LOGIN_STATUS_FAIL_AT"] = "3"
+            environment["TICKER_TEST_LOGIN_STATUS_FAILURE_MESSAGE"] =
+                "injected failure after replacement launch"
+
+            let result = try runInstaller(environment: environment)
+
+            tests.expect(
+                result.status != 0
+                    && result.stdout.contains("app: captured prior state: not running")
+                    && result.stderr.contains("injected failure after replacement launch")
+                    && result.stdout.contains("app: restored app launch verified"),
+                "test16_postExchangeBarrier_lateOldProcessFailureRestartsRestoredApp"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_postExchangeBarrier_lateOldProcessFailureRestoresPriorBundle"
+            )
+            tests.expect(
+                FileManager.default.fileExists(atPath: fixture.processState.path),
+                "test16_postExchangeBarrier_lateOldProcessFailureRestoresRunningState"
+            )
+            let lateProcessEvents = processActions(fixture.processCalls)
+            let lateStartIndex = lateProcessEvents.firstIndex(of: "process-start old")
+            let lateStopIndices = lateProcessEvents.indices.filter {
+                lateProcessEvents[$0].hasPrefix("pkill ")
+            }
+            let replacementOpenIndex = lateProcessEvents.firstIndex(of: "open new")
+            let restoredOpenIndex = lateProcessEvents.firstIndex(of: "open old")
+            if let lateStartIndex,
+               lateStopIndices.count == 2,
+               let replacementOpenIndex,
+               let restoredOpenIndex {
+                tests.expect(
+                    lateStartIndex > lateProcessEvents.startIndex
+                        && lateProcessEvents[lateStartIndex - 1].hasPrefix("pgrep old ")
+                        && lateStartIndex < lateStopIndices[0]
+                        && lateProcessEvents[lateStopIndices[0]].hasPrefix("pkill new ")
+                        && replacementOpenIndex > lateProcessEvents.startIndex
+                        && lateProcessEvents[replacementOpenIndex - 1].hasPrefix("pgrep new ")
+                        && lateStopIndices[0] < replacementOpenIndex
+                        && replacementOpenIndex < lateStopIndices[1]
+                        && lateStopIndices[1] < restoredOpenIndex,
+                    "test16_postExchangeBarrier_stopsDisplacedOldImageBeforeReplacementStart"
+                )
+            } else {
+                tests.expect(
+                    false,
+                    "test16_postExchangeBarrier_recordsLateStartStopAndRollbackOrdering"
+                )
+            }
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_postExchangeBarrier_lateOldProcessRollbackCleans"
+            )
+        }
+
+        let stoppedPriorScenarios: [(name: String, loginState: String?)] = [
+            ("disabled", nil),
+            ("system-settings", "enabled via System Settings login item\n"),
+        ]
+        for scenario in stoppedPriorScenarios {
+            let fixture = try makeFixture(
+                "stopped-\(scenario.name)-post-launch-failure-rollback"
+            )
+            if let loginState = scenario.loginState {
+                try loginState.write(
+                    to: fixture.loginState,
+                    atomically: true,
+                    encoding: .utf8
+                )
+            }
+            var environment = fixture.environment
+            environment["TICKER_TEST_LOGIN_STATUS_FAIL_AT"] = "3"
+            environment["TICKER_TEST_LOGIN_STATUS_FAILURE_MESSAGE"] =
+                "injected post-launch final status failure"
+
+            let result = try runInstaller(environment: environment)
+
+            tests.expect(
+                result.status != 0
+                    && result.stderr.contains("injected post-launch final status failure"),
+                "test16_reinstallCustody_\(scenario.name)ReplacementFailureRollsBack"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_reinstallCustody_\(scenario.name)RestoresPriorBundle"
+            )
+            let stoppedRollbackEvents = processActions(fixture.processCalls)
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.processState.path)
+                    && stoppedRollbackEvents.contains("open new")
+                    && stoppedRollbackEvents.filter { $0.hasPrefix("pkill ") }.count == 1
+                    && !stoppedRollbackEvents.contains("open old"),
+                "test16_reinstallCustody_\(scenario.name)ReplacementStopTakesNoPriorCustody"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_reinstallCustody_\(scenario.name)ReplacementRollbackCleans"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("legacy-login-absence-ambiguous", priorVersion: "legacy")
+
+            let result = try runInstaller(environment: fixture.environment)
+            tests.expect(
+                result.status != 0,
+                "test16_legacyLaunchAgentAbsence_withoutExplicitStateFailsClosed"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "exact legacy LaunchAgent absence is ambiguous; "
+                        + "set TICKER_INSTALL_LEGACY_LOGIN_STATE to disabled, "
+                        + "system-settings, or requires-approval"
+                ),
+                "test16_legacyLaunchAgentAbsence_reportsExplicitStateContract"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "legacy",
+                "test16_legacyLaunchAgentAbsence_failsBeforeBundleMutation"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status"],
+                "test16_legacyLaunchAgentAbsence_isReadOnly"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("legacy-login-explicit-disabled", priorVersion: "legacy")
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LEGACY_LOGIN_STATE"] = "disabled"
+
+            let result = try runInstaller(environment: environment)
+            tests.expectEqual(result.status, 0, "test16_legacyExplicitDisabled_succeeds")
+            tests.expect(
+                result.stdout.contains("login item: captured prior state: disabled")
+                    && result.stdout.contains("login item: preserved prior state: disabled"),
+                "test16_legacyExplicitDisabled_isVerifiedAfterExchange"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "new",
+                "test16_legacyExplicitDisabled_installsReplacement"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.loginState.path),
+                "test16_legacyExplicitDisabled_preservesDisabledState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status", "status"],
+                "test16_legacyExplicitDisabled_performsNoLoginMutation"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "legacy-login-explicit-system-settings",
+                priorVersion: "legacy"
+            )
+            try "enabled via System Settings login item\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LEGACY_LOGIN_STATE"] = "system-settings"
+
+            let result = try runInstaller(environment: environment)
+            tests.expectEqual(result.status, 0, "test16_legacyExplicitSystemSettings_succeeds")
+            tests.expect(
+                result.stdout.contains(
+                    "login item: captured prior state: enabled via System Settings login item"
+                )
+                    && result.stdout.contains(
+                        "login item: preserved prior state: enabled via System Settings login item"
+                    ),
+                "test16_legacyExplicitSystemSettings_isVerifiedAfterExchange"
+            )
+            tests.expectEqual(
+                try String(contentsOf: fixture.loginState, encoding: .utf8),
+                "enabled via System Settings login item\n",
+                "test16_legacyExplicitSystemSettings_preservesMechanism"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status", "status"],
+                "test16_legacyExplicitSystemSettings_performsNoLoginMutation"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "fresh-login-requires-approval",
+                priorVersion: nil
+            )
+            try "\(requiresApprovalLoginState)\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+
+            let result = try runInstaller(environment: fixture.environment)
+            tests.expect(
+                result.status != 0,
+                "test16_freshRequiresApproval_isRejected"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "a fresh install requires a disabled prior login item"
+                ),
+                "test16_freshRequiresApproval_reportsDisabledStateRequirement"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.installedBundle.path),
+                "test16_freshRequiresApproval_precedesBundleMutation"
+            )
+            tests.expectEqual(
+                try String(contentsOf: fixture.loginState, encoding: .utf8),
+                "\(requiresApprovalLoginState)\n",
+                "test16_freshRequiresApproval_preservesObservedState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status"],
+                "test16_freshRequiresApproval_performsReadOnlyInspection"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("modern-login-requires-approval")
+            try "\(requiresApprovalLoginState)\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+
+            let result = try runInstaller(environment: fixture.environment)
+            tests.expectEqual(result.status, 0, "test16_modernRequiresApproval_succeeds")
+            tests.expect(
+                result.stdout.contains(
+                    "login item: captured prior state: \(requiresApprovalLoginState)"
+                )
+                    && result.stdout.contains(
+                        "login item: preserved prior state: \(requiresApprovalLoginState)"
+                    )
+                    && result.stdout.contains(
+                        "login item: final preserved state: \(requiresApprovalLoginState)"
+                    )
+                    && result.stdout.contains(
+                        "done. Approval remains required — approve Ticker in "
+                            + "System Settings › General › Login Items."
+                    ),
+                "test16_modernRequiresApproval_reportsPreservedPendingStateTruthfully"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "new",
+                "test16_modernRequiresApproval_installsReplacement"
+            )
+            tests.expectEqual(
+                try String(contentsOf: fixture.loginState, encoding: .utf8),
+                "\(requiresApprovalLoginState)\n",
+                "test16_modernRequiresApproval_preservesExactState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status", "status"],
+                "test16_modernRequiresApproval_performsReadOnlyCaptureAndVerification"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "legacy-login-explicit-requires-approval",
+                priorVersion: "legacy"
+            )
+            try "\(requiresApprovalLoginState)\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LEGACY_LOGIN_STATE"] = "requires-approval"
+
+            let result = try runInstaller(environment: environment)
+            tests.expectEqual(result.status, 0, "test16_legacyRequiresApproval_succeeds")
+            tests.expect(
+                result.stdout.contains(
+                    "login item: captured prior state: \(requiresApprovalLoginState)"
+                )
+                    && result.stdout.contains(
+                        "login item: preserved prior state: \(requiresApprovalLoginState)"
+                    )
+                    && result.stdout.contains(
+                        "login item: final preserved state: \(requiresApprovalLoginState)"
+                    )
+                    && result.stdout.contains("Approval remains required"),
+                "test16_legacyRequiresApproval_isAttestedVerifiedAndReported"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "new",
+                "test16_legacyRequiresApproval_installsReplacement"
+            )
+            tests.expectEqual(
+                try String(contentsOf: fixture.loginState, encoding: .utf8),
+                "\(requiresApprovalLoginState)\n",
+                "test16_legacyRequiresApproval_preservesExactState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status", "status"],
+                "test16_legacyRequiresApproval_performsNoLoginMutation"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("modern-requires-approval-late-transition")
+            try "\(requiresApprovalLoginState)\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+            var environment = fixture.environment
+            environment["TICKER_TEST_LOGIN_TRANSITION_AFTER_OPEN_VERSION"] = "new"
+            environment["TICKER_TEST_LOGIN_STATE_AFTER_OPEN"] =
+                "enabled via System Settings login item"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_modernLateLoginTransitionFailsBeforeCommit"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "installed login state changed before commit: "
+                        + "enabled via System Settings login item; "
+                        + "expected \(requiresApprovalLoginState)"
+                )
+                    && result.stderr.contains(
+                        "atomically exchanging the prior bundle back into place"
+                    ),
+                "test16_modernLateLoginTransitionIsDetectedAndRolledBack"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_modernLateLoginTransitionRestoresPriorBundle"
+            )
+            tests.expectEqual(
+                try String(contentsOf: fixture.loginState, encoding: .utf8),
+                "enabled via System Settings login item\n",
+                "test16_modernLateLoginTransitionDoesNotMutateObservedLoginState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status", "status"],
+                "test16_modernLateLoginTransitionUsesFinalReadWithoutLoginMutation"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.cliLink.path),
+                "test16_modernLateLoginTransitionRestoresPriorCLIState"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_modernLateLoginTransitionCleansTransaction"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "legacy-requires-approval-late-transition",
+                priorVersion: "legacy"
+            )
+            try "\(requiresApprovalLoginState)\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LEGACY_LOGIN_STATE"] = "requires-approval"
+            environment["TICKER_TEST_LOGIN_TRANSITION_AFTER_OPEN_VERSION"] = "new"
+            environment["TICKER_TEST_LOGIN_STATE_AFTER_OPEN"] =
+                "enabled via System Settings login item"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_legacyLateLoginTransitionFailsBeforeCommit"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "installed login state changed before commit: "
+                        + "enabled via System Settings login item; "
+                        + "expected \(requiresApprovalLoginState)"
+                )
+                    && result.stderr.contains(
+                        "atomically exchanging the prior bundle back into place"
+                    ),
+                "test16_legacyLateLoginTransitionIsDetectedAndRolledBack"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "legacy",
+                "test16_legacyLateLoginTransitionRestoresAttestedBundle"
+            )
+            tests.expectEqual(
+                try String(contentsOf: fixture.loginState, encoding: .utf8),
+                "enabled via System Settings login item\n",
+                "test16_legacyLateLoginTransitionDoesNotMutateObservedLoginState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status", "status"],
+                "test16_legacyLateLoginTransitionUsesFinalReadWithoutLoginMutation"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.cliLink.path),
+                "test16_legacyLateLoginTransitionRestoresPriorCLIState"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_legacyLateLoginTransitionCleansTransaction"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "legacy-login-requires-approval-mismatch",
+                priorVersion: "legacy"
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LEGACY_LOGIN_STATE"] = "requires-approval"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_legacyRequiresApprovalMismatch_failsClosed"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "replacement changed the prior login state: disabled; "
+                        + "expected \(requiresApprovalLoginState)"
+                )
+                    && result.stderr.contains(
+                        "atomically exchanging the prior bundle back into place"
+                    ),
+                "test16_legacyRequiresApprovalMismatch_isDetectedAndRolledBack"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "legacy",
+                "test16_legacyRequiresApprovalMismatch_restoresPriorBundle"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_legacyRequiresApprovalMismatch_performsNoLoginMutation"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.cliLink.path),
+                "test16_legacyRequiresApprovalMismatch_precedesCLIMutation"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("modern-requires-approval-later-failure")
+            try "\(requiresApprovalLoginState)\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LINK"] = "/usr/bin/false"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_modernRequiresApprovalLaterFailure_reportsFailure"
+            )
+            tests.expect(
+                result.stdout.contains(
+                    "login item: preserved prior state: \(requiresApprovalLoginState)"
+                )
+                    && result.stderr.contains(
+                        "atomically exchanging the prior bundle back into place"
+                    ),
+                "test16_modernRequiresApprovalLaterFailure_rollsBackAfterVerification"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_modernRequiresApprovalLaterFailure_restoresPriorBundle"
+            )
+            tests.expectEqual(
+                try String(contentsOf: fixture.loginState, encoding: .utf8),
+                "\(requiresApprovalLoginState)\n",
+                "test16_modernRequiresApprovalLaterFailure_preservesExactState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_modernRequiresApprovalLaterFailure_rollsBackWithoutLoginMutation"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "legacy-login-explicit-state-mismatch",
+                priorVersion: "legacy"
+            )
+            let cliMutation = fixture.directory.appendingPathComponent("cli-mutation")
+            let linkCommand = try writeCommand(
+                """
+                #!/bin/sh
+                : > "${TICKER_TEST_CLI_MUTATION}"
+                exit 99
+                """,
+                named: "record-cli-mutation.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LEGACY_LOGIN_STATE"] = "system-settings"
+            environment["TICKER_INSTALL_LINK"] = linkCommand.path
+            environment["TICKER_TEST_CLI_MUTATION"] = cliMutation.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_legacyExplicitStateMismatch_failsClosed"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "replacement changed the prior login state: disabled; "
+                        + "expected enabled via System Settings login item"
+                )
+                    && result.stderr.contains(
+                        "atomically exchanging the prior bundle back into place"
+                    ),
+                "test16_legacyExplicitStateMismatch_rollsBackBundleObservably"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "legacy",
+                "test16_legacyExplicitStateMismatch_restoresPriorBundle"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: cliMutation.path)
+                    && !FileManager.default.fileExists(atPath: fixture.cliLink.path),
+                "test16_legacyExplicitStateMismatch_precedesCLIMutation"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_legacyExplicitStateMismatch_performsNoLoginMutation"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("modern-login-explicit-state", priorVersion: "old")
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LEGACY_LOGIN_STATE"] = "disabled"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_modernHelper_rejectsExplicitLegacyState"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "TICKER_INSTALL_LEGACY_LOGIN_STATE is only valid for "
+                        + "an unsupported legacy helper with no live exact LaunchAgent"
+                ),
+                "test16_modernHelper_reportsExplicitLegacyStateInapplicable"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status"],
+                "test16_modernHelper_rejectsExplicitLegacyStateBeforeMutation"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_modernHelper_explicitLegacyStatePreservesBundle"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("legacy-login-invalid-explicit-state", priorVersion: "legacy")
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LEGACY_LOGIN_STATE"] = "enabled"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_legacyInvalidExplicitState_isRejected"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "TICKER_INSTALL_LEGACY_LOGIN_STATE must be disabled, "
+                        + "system-settings, or requires-approval"
+                ),
+                "test16_legacyInvalidExplicitState_reportsAllowedValues"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                [],
+                "test16_legacyInvalidExplicitState_failsBeforeLoginInspection"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "legacy-live-launch-agent-explicit-state",
+                priorVersion: "legacy"
+            )
+            try "enabled via LaunchAgent\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+            try "running\n".write(
+                to: fixture.processState,
+                atomically: true,
+                encoding: .utf8
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LEGACY_LOGIN_STATE"] = "disabled"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_legacyLiveLaunchAgent_rejectsExplicitState"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "TICKER_INSTALL_LEGACY_LOGIN_STATE is not valid "
+                        + "when the exact legacy LaunchAgent is live"
+                ),
+                "test16_legacyLiveLaunchAgent_reportsExplicitStateInapplicable"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_legacyLiveLaunchAgent_rejectsExplicitStateReadOnly"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("unrelated-login-helper-failure")
+            var environment = fixture.environment
+            environment["TICKER_TEST_LOGIN_STATUS_FAIL_AT"] = "1"
+            environment["TICKER_TEST_LOGIN_STATUS_FAILURE_MESSAGE"] =
+                "ticker: Unknown command 'login-item'. Run 'ticker --help' for usage."
+            environment["TICKER_TEST_LOGIN_STATUS_FAILURE_CODE"] = "1"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_loginCapture_unrelatedHelperFailureIsRejected"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "could not capture prior state (helper status 1): "
+                        + "ticker: Unknown command 'login-item'. "
+                        + "Run 'ticker --help' for usage."
+                )
+                    && !result.stdout.contains("prior helper lacks login-item"),
+                "test16_loginCapture_requiresUnsupportedCommandExitStatus"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_loginCapture_unrelatedHelperFailurePreservesPriorBundle"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status"],
+                "test16_loginCapture_unrelatedHelperFailureDoesNotQueryFallback"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "legacy-login-indeterminate",
+                priorVersion: "legacy"
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LEGACY_LOGIN_STATE"] = "disabled"
+            environment["TICKER_TEST_LEGACY_LAUNCHCTL_RESULT"] = "indeterminate"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_legacyLoginCapture_indeterminateFailsClosed")
+            tests.expect(
+                result.stderr.contains(
+                    "legacy LaunchAgent query failed (launchctl status 5): permission denied"
+                ),
+                "test16_legacyLoginCapture_indeterminateRejectsExplicitState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status"],
+                "test16_legacyLoginCapture_indeterminateIsReadOnly"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "legacy",
+                "test16_legacyLoginCapture_indeterminatePreservesPriorBundle"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "legacy-login-malformed-plist",
+                priorVersion: "legacy"
+            )
+            let plist = fixture.directory
+                .appendingPathComponent("home/Library/LaunchAgents", isDirectory: true)
+                .appendingPathComponent("com.suchintan.ticker.login.plist")
+            try FileManager.default.createDirectory(
+                at: plist.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("<?xml version=\"1.0\"?><plist><dict>".utf8).write(to: plist)
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LEGACY_LOGIN_STATE"] = "disabled"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_legacyLoginCapture_malformedFailsClosed")
+            tests.expect(
+                result.stderr.contains("legacy LaunchAgent plist is malformed"),
+                "test16_legacyLoginCapture_malformedRejectsExplicitState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status"],
+                "test16_legacyLoginCapture_malformedIsReadOnly"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "legacy",
+                "test16_legacyLoginCapture_malformedPreservesPriorBundle"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "legacy-login-live-target-mismatch",
+                priorVersion: "legacy"
+            )
+            try "enabled via LaunchAgent\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LEGACY_LOGIN_STATE"] = "disabled"
+            environment["TICKER_TEST_LOGIN_STATUS_FAIL_AT"] = "1"
+            environment["TICKER_TEST_LOGIN_STATUS_FAILURE_MESSAGE"] =
+                "failed: LaunchAgent verification did not report exact executable"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_legacyLoginCapture_mismatchFailsClosed")
+            tests.expect(
+                result.stderr.contains(
+                    "legacy live LaunchAgent validation failed: failed: "
+                        + "LaunchAgent verification did not report exact executable"
+                ),
+                "test16_legacyLoginCapture_mismatchRejectsExplicitState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_legacyLoginCapture_mismatchIsReadOnly"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "legacy",
+                "test16_legacyLoginCapture_mismatchPreservesPriorBundle"
+            )
+            tests.expect(
+                !processActions(fixture.processCalls).contains { $0.hasPrefix("pkill ") },
+                "test16_legacyLoginCapture_mismatchPrecedesAppMutation"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "legacy-disabled-later-failure",
+                priorVersion: "legacy"
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LEGACY_LOGIN_STATE"] = "disabled"
+            environment["TICKER_INSTALL_LINK"] = "/usr/bin/false"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_legacyLaterFailure_reportsFailure"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "legacy",
+                "test16_legacyLaterFailure_restoresPriorBundle"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.loginState.path),
+                "test16_legacyLaterFailure_preservesDisabledState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_legacyLaterFailure_rollsBackWithZeroLoginMutation"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_legacyLaterFailure_cleansTransaction"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("atomic-exchange-unavailable")
+            let exchangeCalls = fixture.directory.appendingPathComponent("exchange-calls.txt")
+            let exchangeCommand = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                printf 'attempted\n' >> "${TICKER_TEST_EXCHANGE_CALLS}"
+                exit 76
+                """,
+                named: "unavailable-exchange.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_EXCHANGE"] = exchangeCommand.path
+            environment["TICKER_TEST_EXCHANGE_CALLS"] = exchangeCalls.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_installer_unavailableAtomicExchangeIsReported"
+            )
+            tests.expect(
+                result.stderr.contains("atomic exchange preflight failed"),
+                "test16_installer_unavailableAtomicExchangeIsObservable"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_installer_unavailableAtomicExchangePreservesPriorBundle"
+            )
+            tests.expect(
+                !processActions(fixture.processCalls).contains { $0.hasPrefix("pkill ") },
+                "test16_installer_unavailableAtomicExchangeFailsBeforeStoppingApp"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status"],
+                "test16_installer_unavailableAtomicExchangeOnlyCapturesLoginState"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_unavailableAtomicExchangeCleansStaging"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("stubborn-running-app")
+            try "running\n".write(
+                to: fixture.processState,
+                atomically: true,
+                encoding: .utf8
+            )
+            let priorInode = try pathInode(fixture.installedBundle)
+            var environment = fixture.environment
+            environment["TICKER_TEST_STUBBORN_PROCESS"] = "1"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_installer_stubbornProcessIsRejected")
+            tests.expect(
+                result.stderr.contains("was not proven stopped after 3 checks"),
+                "test16_installer_stubbornProcessFailureIsClassified"
+            )
+            tests.expectEqual(
+                try pathInode(fixture.installedBundle),
+                priorInode,
+                "test16_installer_stubbornProcessAbortsBeforeBundleMutation"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_installer_stubbornProcessPreservesPriorBundle"
+            )
+            tests.expect(
+                FileManager.default.fileExists(atPath: fixture.processState.path)
+                    && processActions(fixture.processCalls).contains { $0.hasPrefix("pkill ") }
+                    && !processActions(fixture.processCalls).contains { $0.hasPrefix("open ") },
+                "test16_installer_stubbornProcessIsNeverTreatedAsStopped"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status"],
+                "test16_installer_stubbornProcessDoesNotMutateLoginState"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.cliLink.path),
+                "test16_installer_stubbornProcessDoesNotMutateCLI"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_stubbornProcessCleansUnpublishedReplacement"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("unexpected-bundle-displaced-by-swap")
+            let foreignBundle = fixture.directory.appendingPathComponent(
+                "foreign/Ticker.app",
+                isDirectory: true
+            )
+            let parkedPrior = fixture.directory.appendingPathComponent(
+                "externally-parked-prior/Ticker.app",
+                isDirectory: true
+            )
+            let injected = fixture.directory.appendingPathComponent("foreign-injected")
+            try writeBundle(foreignBundle, version: "foreign")
+            try FileManager.default.createDirectory(
+                at: parkedPrior.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let exchangeCommand = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                if [ "$1" = "${TICKER_INSTALL_BUNDLE}" ] && [ ! -e "${TICKER_TEST_FOREIGN_INJECTED}" ]; then
+                  : > "${TICKER_TEST_FOREIGN_INJECTED}"
+                  /bin/mv "$1" "${TICKER_TEST_PARKED_PRIOR}"
+                  mkdir -p "$1"
+                  /bin/cp -R "${TICKER_TEST_FOREIGN_BUNDLE}/." "$1/"
+                fi
+                exec "${TICKER_INSTALL_NATIVE_EXCHANGE_HELPER}" "$@"
+                """,
+                named: "inject-foreign-before-swap.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_EXCHANGE"] = exchangeCommand.path
+            environment["TICKER_TEST_FOREIGN_BUNDLE"] = foreignBundle.path
+            environment["TICKER_TEST_FOREIGN_INJECTED"] = injected.path
+            environment["TICKER_TEST_PARKED_PRIOR"] = parkedPrior.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_unexpectedSwapIdentityIsRejected")
+            tests.expect(
+                result.stderr.contains("atomically exchanging it back")
+                    && result.stderr.contains("left untouched for manual recovery"),
+                "test16_unexpectedSwapIdentityIsRestoredBeforeAbort"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "foreign",
+                "test16_unexpectedSwapIdentityIsNeverStranded"
+            )
+            tests.expectEqual(
+                installedVersion(parkedPrior),
+                "old",
+                "test16_unexpectedSwapPreservesExternallyMovedPriorBundle"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status"],
+                "test16_unexpectedSwapFailsBeforeLoginMutation"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_unexpectedSwapCleansOnlyOwnedReplacement"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("atomic-exchange-failure")
+            let exchangeFailure = fixture.directory.appendingPathComponent("exchange-failed.txt")
+            let exchangeCommand = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                if [ "$1" = "${TICKER_INSTALL_BUNDLE}" ] && [ ! -e "${TICKER_TEST_EXCHANGE_FAILURE}" ]; then
+                  : > "${TICKER_TEST_EXCHANGE_FAILURE}"
+                  exit 73
+                fi
+                exec "${TICKER_INSTALL_NATIVE_EXCHANGE_HELPER}" "$@"
+                """,
+                named: "fail-application-exchange.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_EXCHANGE"] = exchangeCommand.path
+            environment["TICKER_TEST_EXCHANGE_FAILURE"] = exchangeFailure.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_installer_exchangeFailureIsReported")
+            tests.expect(
+                result.stderr.contains("atomic replacement exchange failed")
+                    && result.stderr.contains("restored and verified prior bundle"),
+                "test16_installer_exchangeFailureRestoresObservably"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_installer_exchangeFailurePreservesPriorBundle"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status"],
+                "test16_installer_exchangeFailureDoesNotMutateLoginState"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_exchangeFailureCleansAfterVerifiedRestore"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("post-swap-verification-failure")
+            let codesignCalls = fixture.directory.appendingPathComponent("codesign-calls.txt")
+            let codesignCommand = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                count=0
+                if [ -f "${TICKER_TEST_CODESIGN_CALLS}" ]; then
+                  count="$(cat "${TICKER_TEST_CODESIGN_CALLS}")"
+                fi
+                count=$((count + 1))
+                printf '%s\n' "$count" > "${TICKER_TEST_CODESIGN_CALLS}"
+                if [ "$count" -eq 2 ]; then
+                  exit 74
+                fi
+                exit 0
+                """,
+                named: "fail-second-codesign.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_CODESIGN"] = codesignCommand.path
+            environment["TICKER_TEST_CODESIGN_CALLS"] = codesignCalls.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_installer_postSwapVerificationFailureIsReported"
+            )
+            tests.expect(
+                result.stderr.contains("installed replacement: ERROR - signature verification failed")
+                    && result.stderr.contains("restored and verified prior bundle"),
+                "test16_installer_postSwapVerificationFailureRestoresObservably"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_installer_postSwapVerificationFailurePreservesPriorBundle"
+            )
+            tests.expectEqual(
+                try String(contentsOf: codesignCalls, encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                "3",
+                "test16_installer_postSwapFailureVerifiesRestoredBundle"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status"],
+                "test16_installer_postSwapFailureOnlyCapturesLoginState"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_postSwapFailureCleansAfterVerifiedRestore"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("login-enable-failure", priorVersion: nil)
+            var environment = fixture.environment
+            environment["TICKER_TEST_LOGIN_ENABLE_FAIL"] = "1"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_freshInstall_loginEnableFailureIsReported")
+            tests.expect(
+                result.stderr.contains("login item: ERROR - enable failed")
+                    && result.stderr.contains("login item: restored prior state: disabled"),
+                "test16_freshInstall_loginEnableFailureRestoresObservably"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.installedBundle.path),
+                "test16_freshInstall_loginEnableFailureRemovesFailedBundle"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "enable", "disable", "status"],
+                "test16_freshInstall_loginEnableFailureCompensatesAndVerifies"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_freshInstall_loginEnableFailureCleansTransaction"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("replacement-launch-failure-restores-running-old-app")
+            try "running\n".write(
+                to: fixture.processState,
+                atomically: true,
+                encoding: .utf8
+            )
+            var environment = fixture.environment
+            environment["TICKER_TEST_OPEN_FAIL_VERSION"] = "new"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_replacementLaunchFailureIsReported")
+            tests.expect(
+                result.stderr.contains("replacement launch command failed")
+                    && result.stdout.contains("restored app launch verified"),
+                "test16_replacementLaunchFailureIsClassifiedBeforeOldRelaunch"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_replacementLaunchFailureRestoresPriorBundle"
+            )
+            tests.expect(
+                FileManager.default.fileExists(atPath: fixture.processState.path)
+                    && processActions(fixture.processCalls).contains("open new")
+                    && processActions(fixture.processCalls).contains("open old"),
+                "test16_replacementLaunchFailureVerifiesOldAppRelaunch"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_replacementLaunchFailurePerformsNoLoginMutation"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.cliLink.path),
+                "test16_replacementLaunchFailureRestoresCLIBeforeOldRelaunch"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_replacementLaunchFailureCleansAfterVerifiedOldRelaunch"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("restored-app-relaunch-verification-failure")
+            try "running\n".write(
+                to: fixture.processState,
+                atomically: true,
+                encoding: .utf8
+            )
+            var environment = fixture.environment
+            environment["TICKER_TEST_OPEN_FAIL_VERSION"] = "new"
+            environment["TICKER_TEST_OPEN_NO_START_VERSION"] = "old"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_restoredAppRelaunchFailureIsReported")
+            tests.expect(
+                result.stderr.contains("restored app launch verification failed"),
+                "test16_restoredAppRelaunchFailureIsClassified"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_restoredAppRelaunchFailureStillRestoresPriorBundle"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_restoredAppRelaunchFailurePerformsNoLoginMutation"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.processState.path)
+                    && processActions(fixture.processCalls).contains("open old"),
+                "test16_restoredAppRelaunchFailureIsProvenNotRunning"
+            )
+            tests.expect(
+                transactionArtifacts(for: fixture.installedBundle).contains {
+                    $0.hasPrefix("Ticker.app.staging.")
+                },
+                "test16_restoredAppRelaunchFailureRetainsTransactionArtifact"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("fresh-login-status-failure", priorVersion: nil)
+            var environment = fixture.environment
+            environment["TICKER_TEST_LOGIN_STATUS_FAIL_AT"] = "2"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_freshInstall_enableThenStatusFailureIsReported"
+            )
+            tests.expect(
+                result.stderr.contains("login item: ERROR - live-state verification failed")
+                    && result.stderr.contains("login item: restored prior state: disabled"),
+                "test16_freshInstall_enableThenStatusFailureCompensatesObservably"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.installedBundle.path),
+                "test16_freshInstall_enableThenStatusFailureRemovesFailedAppAfterDisable"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.loginState.path),
+                "test16_freshInstall_enableThenStatusFailureEndsDisabled"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "enable", "status", "disable", "status"],
+                "test16_freshInstall_enableThenStatusFailureVerifiesCompensation"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.cliLink.path),
+                "test16_freshInstall_enableThenStatusFailureDoesNotCreateCLILink"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_freshInstall_enableThenStatusFailureCleansTransaction"
+            )
+        }
+
+        let rollbackSignalCases: [
+            (name: String, status: Int32, cleanupSignal: String)
+        ] = [
+            ("HUP", 129, "QUIT"),
+            ("QUIT", 131, "HUP"),
+            ("TERM", 143, "QUIT"),
+        ]
+        for signalCase in rollbackSignalCases {
+            let fixture = try makeFixture(
+                "signal-\(signalCase.name.lowercased())-during-transaction-rollback",
+                priorVersion: nil
+            )
+            var environment = fixture.environment
+            environment["TICKER_TEST_LOGIN_SIGNAL_AFTER_ENABLE"] = signalCase.name
+            environment["TICKER_TEST_LOGIN_SIGNAL_DURING_DISABLE"] =
+                signalCase.cleanupSignal
+
+            let result = try runInstaller(environment: environment)
+            tests.expectEqual(
+                result.status,
+                signalCase.status,
+                "test16_installer_\(signalCase.name)_duringTransactionReturnsSignalStatus"
+            )
+            tests.expect(
+                result.stderr.contains("received \(signalCase.name)")
+                    && result.stderr.contains("login item: restored prior state: disabled"),
+                "test16_installer_\(signalCase.name)_usesFreshLoginCompensation"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.installedBundle.path),
+                "test16_installer_\(signalCase.name)_removesFailedFreshBundle"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.loginState.path),
+                "test16_installer_\(signalCase.name)_restoresDisabledLoginState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "enable", "disable", "status"],
+                "test16_installer_\(signalCase.name)_suppressesCleanupSignalAndVerifiesCompensation"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_\(signalCase.name)_cleansTransactionAndPublicLock"
+            )
+            let rollbackRecords = releasedCustodyRecords(for: fixture.installedBundle)
+            tests.expectEqual(
+                rollbackRecords.count,
+                1,
+                "test16_installer_\(signalCase.name)_rollbackRetainsOneCustodyRecord"
+            )
+            tests.expect(
+                rollbackRecords.allSatisfy(releasedCustodyRecordIsProven),
+                "test16_installer_\(signalCase.name)_rollbackCustodyIsProvenReleased"
+            )
+
+            let retry = try runInstaller(environment: fixture.environment)
+            tests.expectEqual(
+                retry.status,
+                0,
+                "test16_installer_\(signalCase.name)_rollbackAllowsCleanRetry"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "new",
+                "test16_installer_\(signalCase.name)_rollbackRetryCommitsReplacement"
+            )
+            tests.expectEqual(
+                releasedCustodyRecords(for: fixture.installedBundle).count,
+                2,
+                "test16_installer_\(signalCase.name)_rollbackBoundsOneRecordPerRun"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("disabled-reinstall-login-status-failure")
+            var environment = fixture.environment
+            environment["TICKER_TEST_LOGIN_STATUS_FAIL_AT"] = "2"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_disabledReinstall_verificationFailureIsReported"
+            )
+            tests.expect(
+                result.stderr.contains("login item: ERROR - reinstall state verification failed"),
+                "test16_disabledReinstall_verificationFailureIsObservable"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_disabledReinstall_verificationFailureRestoresPriorBundle"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.loginState.path),
+                "test16_disabledReinstall_verificationFailurePreservesState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_disabledReinstall_verificationFailurePerformsNoLoginMutation"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_disabledReinstall_verificationFailureCleansTransaction"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("enabled-reinstall-login-status-failure")
+            try "enabled via System Settings login item\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+            var environment = fixture.environment
+            environment["TICKER_TEST_LOGIN_STATUS_FAIL_AT"] = "2"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_enabledReinstall_verificationFailureIsReported"
+            )
+            tests.expect(
+                result.stderr.contains("login item: ERROR - reinstall state verification failed"),
+                "test16_enabledReinstall_verificationFailureIsObservable"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_enabledReinstall_verificationFailureRestoresPriorBundle"
+            )
+            tests.expectEqual(
+                try String(contentsOf: fixture.loginState, encoding: .utf8),
+                "enabled via System Settings login item\n",
+                "test16_enabledReinstall_verificationFailurePreservesMechanism"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_enabledReinstall_verificationFailurePerformsNoLoginMutation"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_enabledReinstall_verificationFailureCleansTransaction"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("cli-link-failure")
+            let linkCommand = try writeCommand(
+                "#!/bin/sh\nprintf 'injected link failure\\n' >&2\nexit 77\n",
+                named: "fail-link.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_LINK"] = linkCommand.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(result.status != 0, "test16_installer_cliLinkFailureIsReported")
+            tests.expect(
+                result.stderr.contains("cli: ERROR - could not create staged CLI link")
+                    && result.stderr.contains("restored and verified prior bundle"),
+                "test16_installer_cliLinkFailureRollsBackObservably"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_installer_cliLinkFailureRestoresPriorBundle"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.loginState.path),
+                "test16_installer_cliLinkFailureRestoresDisabledLoginState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_installer_cliLinkFailurePerformsNoLoginMutation"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.cliLink.path),
+                "test16_installer_cliLinkFailureLeavesPriorAbsentCLIPath"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_cliLinkFailureCleansTransaction"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("prior-cli-link-restoration")
+            let priorTarget = fixture.directory.appendingPathComponent("prior-cli-target")
+            try writeExecutable("#!/bin/sh\nexit 0\n", to: priorTarget)
+            try FileManager.default.createSymbolicLink(
+                at: fixture.cliLink,
+                withDestinationURL: priorTarget
+            )
+            let priorLinkInode = try pathInode(fixture.cliLink)
+            let readlinkCalls = fixture.directory.appendingPathComponent("readlink-calls.txt")
+            let readlinkCommand = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                count=0
+                if [ -f "${TICKER_TEST_READLINK_CALLS}" ]; then
+                  count="$(cat "${TICKER_TEST_READLINK_CALLS}")"
+                fi
+                count=$((count + 1))
+                printf '%s\n' "$count" > "${TICKER_TEST_READLINK_CALLS}"
+                if [ "$count" -eq 2 ]; then
+                  printf '%s\n' '/injected/wrong-target'
+                  exit 0
+                fi
+                exec /usr/bin/readlink "$@"
+                """,
+                named: "fail-installed-link-verification.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_READLINK"] = readlinkCommand.path
+            environment["TICKER_TEST_READLINK_CALLS"] = readlinkCalls.path
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_installer_postLinkVerificationFailureIsReported"
+            )
+            tests.expect(
+                result.stderr.contains("cli: ERROR - installed CLI link targets")
+                    && result.stderr.contains("cli: restored prior path state"),
+                "test16_installer_postLinkVerificationFailureRestoresCLIObservably"
+            )
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "old",
+                "test16_installer_postLinkVerificationFailureRestoresPriorBundle"
+            )
+            tests.expectEqual(
+                try FileManager.default.destinationOfSymbolicLink(atPath: fixture.cliLink.path),
+                priorTarget.path,
+                "test16_installer_postLinkVerificationFailureRestoresPriorLink"
+            )
+            tests.expectEqual(
+                try pathInode(fixture.cliLink),
+                priorLinkInode,
+                "test16_installer_postLinkVerificationFailureRestoresPriorLinkIdentity"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status"],
+                "test16_installer_postLinkVerificationFailurePerformsNoLoginMutation"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_installer_postLinkVerificationFailureCleansTransaction"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("fresh-install", priorVersion: nil)
+            let result = try runInstaller(environment: fixture.environment)
+
+            tests.expectEqual(result.status, 0, "test16_freshInstall_succeedsTransactionally")
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "new",
+                "test16_freshInstall_installsVerifiedReplacement"
+            )
+            tests.expect(
+                result.stdout.contains("staged replacement verified")
+                    && result.stdout.contains("installed replacement verified")
+                    && result.stdout.contains("login item: enabled via LaunchAgent")
+                    && result.stdout.contains(
+                        "login item: final installed state: enabled via LaunchAgent"
+                    )
+                    && result.stdout.contains("Ticker will open automatically at login"),
+                "test16_freshInstall_reportsAllVerifiedStates"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "enable", "status", "status"],
+                "test16_freshInstall_enablesAndReadsBackFinalLoginState"
+            )
+            tests.expectEqual(
+                try FileManager.default.destinationOfSymbolicLink(atPath: fixture.cliLink.path),
+                fixture.installedBundle.appendingPathComponent("Contents/Helpers/ticker").path,
+                "test16_freshInstall_linksInstalledHelper"
+            )
+            tests.expect(
+                FileManager.default.fileExists(atPath: fixture.processState.path)
+                    && processActions(fixture.processCalls).contains("open new"),
+                "test16_freshInstall_launchesAndVerifiesNewApp"
+            )
+            let freshEvents = processActions(fixture.processCalls)
+            let freshLoginStatuses = freshEvents.indices.filter {
+                freshEvents[$0] == "login status"
+            }
+            let freshLinkIndex = freshEvents.firstIndex { $0.hasPrefix("link ") }
+            let freshOpenIndex = freshEvents.firstIndex(of: "open new")
+            if freshLoginStatuses.count == 3,
+               let freshLinkIndex,
+               let freshOpenIndex {
+                tests.expect(
+                    freshLoginStatuses[1] < freshLinkIndex
+                        && freshLinkIndex < freshOpenIndex
+                        && freshOpenIndex > freshEvents.startIndex
+                        && freshEvents[freshOpenIndex - 1].hasPrefix("pgrep new ")
+                        && freshOpenIndex < freshLoginStatuses[2],
+                    "test16_freshInstall_startsOnlyAfterPostExchangeAbsenceProof"
+                )
+            } else {
+                tests.expect(
+                    false,
+                    "test16_freshInstall_recordsCompleteFinalReadOrdering"
+                )
+            }
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_freshInstall_leavesNoTransactionArtifacts"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture(
+                "fresh-post-launch-login-transition",
+                priorVersion: nil
+            )
+            var environment = fixture.environment
+            environment["TICKER_TEST_LOGIN_TRANSITION_AFTER_OPEN_VERSION"] = "new"
+            environment["TICKER_TEST_LOGIN_STATE_AFTER_OPEN"] =
+                "enabled via System Settings login item"
+
+            let result = try runInstaller(environment: environment)
+            tests.expect(
+                result.status != 0,
+                "test16_freshPostLaunchTransition_failsBeforeCommit"
+            )
+            tests.expect(
+                result.stderr.contains(
+                    "installed login state changed before commit: "
+                        + "enabled via System Settings login item; "
+                        + "expected enabled via LaunchAgent"
+                )
+                    && result.stderr.contains("installer: rolling back incomplete install")
+                    && result.stderr.contains("login item: restored prior state: disabled"),
+                "test16_freshPostLaunchTransition_isDetectedAndCompensated"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: fixture.installedBundle.path)
+                    && !FileManager.default.fileExists(atPath: fixture.cliLink.path)
+                    && !FileManager.default.fileExists(atPath: fixture.loginState.path)
+                    && !FileManager.default.fileExists(atPath: fixture.processState.path),
+                "test16_freshPostLaunchTransition_restoresFreshPreinstallState"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "enable", "status", "status", "disable", "status"],
+                "test16_freshPostLaunchTransition_usesFinalReadThenVerifiedRollback"
+            )
+            let transitionEvents = processActions(fixture.processCalls)
+            let transitionStatuses = transitionEvents.indices.filter {
+                transitionEvents[$0] == "login status"
+            }
+            let transitionLinkIndex = transitionEvents.firstIndex {
+                $0.hasPrefix("link ")
+            }
+            let transitionOpenIndex = transitionEvents.firstIndex(of: "open new")
+            tests.expect(
+                transitionStatuses.count == 4
+                    && transitionLinkIndex != nil
+                    && transitionOpenIndex != nil
+                    && transitionLinkIndex! < transitionOpenIndex!
+                    && transitionOpenIndex! < transitionStatuses[2],
+                "test16_freshPostLaunchTransition_readsChangedStateAfterPublicationAndLaunch"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_freshPostLaunchTransition_cleansAfterVerifiedRollback"
+            )
+        }
+
+        do {
+            let fixture = try makeFixture("successful-reinstall")
+            try "running\n".write(
+                to: fixture.processState,
+                atomically: true,
+                encoding: .utf8
+            )
+            try "enabled via System Settings login item\n".write(
+                to: fixture.loginState,
+                atomically: true,
+                encoding: .utf8
+            )
+            let probeReady = fixture.directory.appendingPathComponent("probe-ready")
+            let probeStop = fixture.directory.appendingPathComponent("probe-stop")
+            let probeFailure = fixture.directory.appendingPathComponent("probe-failure.txt")
+            let probeSamples = fixture.directory.appendingPathComponent("probe-samples.txt")
+            let exchangeCommand = try writeCommand(
+                """
+                #!/bin/sh
+                set -eu
+                if [ "$1" = "${TICKER_INSTALL_BUNDLE}" ]; then
+                  while [ ! -e "${TICKER_TEST_PROBE_READY}" ]; do
+                    /bin/sleep 0.001
+                  done
+                  /bin/sleep 0.05
+                fi
+                exec "${TICKER_INSTALL_NATIVE_EXCHANGE_HELPER}" "$@"
+                """,
+                named: "observable-exchange.sh",
+                in: fixture.directory
+            )
+            var environment = fixture.environment
+            environment["TICKER_INSTALL_EXCHANGE"] = exchangeCommand.path
+            environment["TICKER_TEST_PROBE_READY"] = probeReady.path
+
+            let probe = try startInstalledHelperProbe(
+                bundle: fixture.installedBundle,
+                ready: probeReady,
+                stop: probeStop,
+                failure: probeFailure,
+                samples: probeSamples
+            )
+            defer {
+                if probe.isRunning {
+                    try? Data().write(to: probeStop)
+                    probe.terminate()
+                    probe.waitUntilExit()
+                }
+            }
+            let result = try runInstaller(environment: environment)
+            try Data().write(to: probeStop)
+            probe.waitUntilExit()
+
+            tests.expectEqual(result.status, 0, "test16_reinstall_succeedsTransactionally")
+            tests.expectEqual(
+                installedVersion(fixture.installedBundle),
+                "new",
+                "test16_reinstall_replacesPriorBundleAfterValidation"
+            )
+            tests.expect(
+                result.stdout.contains(
+                    "login item: preserved prior state: enabled via System Settings login item"
+                ),
+                "test16_reinstall_verifiesExistingMechanismWithoutMutation"
+            )
+            tests.expectEqual(
+                loginActions(fixture.loginCalls),
+                ["status", "status", "status"],
+                "test16_reinstall_readsStateBeforeAndAfterExchange"
+            )
+            tests.expect(
+                processActions(fixture.processCalls).contains { $0.hasPrefix("pkill ") }
+                    && processActions(fixture.processCalls).contains("open new")
+                    && FileManager.default.fileExists(atPath: fixture.processState.path),
+                "test16_reinstall_stopsOldAppAndVerifiesReplacementRelaunch"
+            )
+            tests.expect(
+                !FileManager.default.fileExists(atPath: probeFailure.path),
+                "test16_reinstall_atomicExchangeNeverMakesInstalledHelperUnavailable"
+            )
+            let sampleCount = Int(
+                ((try? String(contentsOf: probeSamples, encoding: .utf8)) ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            ) ?? 0
+            tests.expect(
+                sampleCount > 10,
+                "test16_reinstall_atomicExchangeIsObservedByHighFrequencyProbe"
+            )
+            tests.expectEqual(
+                transactionArtifacts(for: fixture.installedBundle),
+                [],
+                "test16_reinstall_removesBackupOnlyAfterSuccess"
+            )
+        }
+    }
+}
 
 @main
 private enum TickerTests {
@@ -7069,6 +14120,9 @@ private enum TickerTests {
         }
         tests.run("round 15 informational state presentation") {
             try test15_InformationalStatePresentationContract(tests)
+        }
+        tests.run("round 16 login at boot and fallback verification") {
+            try test16_LoginAtBootAndFallbackVerification(tests)
         }
         tests.finish()
     }

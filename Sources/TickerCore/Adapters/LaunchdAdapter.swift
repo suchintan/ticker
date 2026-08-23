@@ -140,8 +140,10 @@ public final class LaunchdAdapter: JobSourceAdapter {
 
     private struct ParsedConfiguration {
         let label: String
+        let parsedLabel: String?
         let schedule: Schedule
         let command: [String]
+        let effectiveExecutable: String
         let argv0: String?
         let environment: [String: String]
         let domain: LaunchdDomain
@@ -288,7 +290,9 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 command: configuration.command,
                 configPath: configuration.configPath,
                 workingDirectory: configuration.cwd,
-                environment: configuration.environment
+                environment: configuration.environment,
+                launchdLabel: configuration.parsedLabel,
+                effectiveExecutable: configuration.effectiveExecutable
             )
             return Job(
                 id: jobID(label: configuration.label, configPath: configuration.configPath),
@@ -477,7 +481,9 @@ public final class LaunchdAdapter: JobSourceAdapter {
 
         let literalCommand: [String]
         let literalArgv0: String?
+        let effectiveExecutable: String
         if let program {
+            effectiveExecutable = program
             if let programArguments, !programArguments.isEmpty {
                 literalCommand = [program] + programArguments.dropFirst()
                 literalArgv0 = programArguments[0] == program ? nil : programArguments[0]
@@ -486,20 +492,29 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 literalArgv0 = nil
             }
         } else if let programArguments, !programArguments.isEmpty {
+            effectiveExecutable = programArguments[0]
             literalCommand = programArguments
             literalArgv0 = nil
         } else {
+            // The runnable guard above proves this branch is unreachable.
+            effectiveExecutable = ""
             literalCommand = []
             literalArgv0 = nil
         }
-        let observedWrapper = LaunchdWrapper.decode(programArguments ?? [])
+        // `Program` is launchd's executable whenever it is present. Wrapper-
+        // shaped ProgramArguments cannot override it or make the job managed.
+        let observedWrapper = program == nil
+            ? LaunchdWrapper.decode(programArguments ?? [])
+            : nil
 
         let userName = nonEmptyString(dictionary["UserName"] as? String)
         let groupName = nonEmptyString(dictionary["GroupName"] as? String)
         return .runnable(ParsedConfiguration(
             label: label,
+            parsedLabel: plistLabel,
             schedule: parseSchedule(dictionary),
             command: observedWrapper?.original ?? literalCommand,
+            effectiveExecutable: effectiveExecutable,
             argv0: observedWrapper?.argv0 ?? literalArgv0,
             environment: parseEnvironment(dictionary["EnvironmentVariables"]),
             domain: domain,
