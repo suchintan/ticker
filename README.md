@@ -14,10 +14,13 @@ Neither scheduler surfaced these problems to the user. LaunchControl and Lingon 
 ## What you get
 
 - A menu-bar status icon that turns red when any discovered job has failed.
+- Native macOS notifications when one of your jobs enters a new failure, late-run, skip-storm, ambiguous-runtime, broken-configuration, or wrapper-recovery state. Ticker alerts once per affected job and incident type. It permits a later incident after recovery to alert again.
 - One view for launchd agents and daemons, crontab entries, and Claude routines.
 - Late-run warnings and Claude skip-storm summaries.
 - Full run history for wrapped launchd jobs, including duration, exit code, and output tails.
 - A local CLI for scripts and terminal use.
+
+Ticker asks macOS for notification permission when the app starts. If permission was denied, enable Ticker under **System Settings → Notifications → Ticker**.
 
 ## Screenshot
 

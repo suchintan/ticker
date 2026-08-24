@@ -107,8 +107,16 @@ final class AppBootstrap: ObservableObject {
     @Published private(set) var errorMessage: String?
 
     private let bootstrapQueue = DispatchQueue(label: "com.suchintan.ticker.bootstrap", qos: .userInitiated)
+    private let failureNotifier: FailureNotificationHandling
 
     init() {
+        #if TICKER_TESTING
+        let failureNotifier: FailureNotificationHandling = NoopFailureNotificationController()
+        #else
+        let failureNotifier: FailureNotificationHandling = FailureNotificationController()
+        #endif
+        self.failureNotifier = failureNotifier
+        failureNotifier.start()
         bootstrapQueue.async { [weak self] in
             guard let bootstrap = self else {
                 return
@@ -127,7 +135,11 @@ final class AppBootstrap: ObservableObject {
                 let store = try SQLiteRunStore(path: storePath)
                 let registry = JobRegistry.standard()
                 DispatchQueue.main.async {
-                    let model = AppModel(registry: registry, store: store)
+                    let model = AppModel(
+                        registry: registry,
+                        store: store,
+                        failureNotifier: bootstrap.failureNotifier
+                    )
                     bootstrap.model = model
                     model.start()
                 }
@@ -159,6 +171,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var busyJobIDs: Set<String> = []
 
     private let wrapper: JobWrapper
+    private let failureNotifier: FailureNotificationHandling
     private let tickerPathOverride: String?
     private let workQueue = DispatchQueue(label: "com.suchintan.ticker.work", qos: .userInitiated)
     private var refreshInProgress = false
@@ -171,10 +184,20 @@ final class AppModel: ObservableObject {
         registry: JobRegistry,
         store: SQLiteRunStore,
         wrapper: JobWrapper? = nil,
-        tickerPathOverride: String? = nil
+        tickerPathOverride: String? = nil,
+        failureNotifier: FailureNotificationHandling? = nil
     ) {
         self.registry = registry
         self.store = store
+        if let failureNotifier {
+            self.failureNotifier = failureNotifier
+        } else {
+            #if TICKER_TESTING
+            self.failureNotifier = NoopFailureNotificationController()
+            #else
+            self.failureNotifier = FailureNotificationController()
+            #endif
+        }
         if let wrapper {
             self.wrapper = wrapper
         } else {
@@ -200,6 +223,7 @@ final class AppModel: ObservableObject {
     }
 
     func start() {
+        failureNotifier.start()
         refresh()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             guard let model = self else {
@@ -224,14 +248,17 @@ final class AppModel: ObservableObject {
             }
 
             let discovery = self.registry.discoverAll()
-            let rawSkips = self.registry.skips()
-            let summaries = rawSkips.reduce(into: [String: SkipStormSummary]()) { result, entry in
+            let skipDiscovery = self.registry.skipSnapshot()
+            let summaries = skipDiscovery.recordsByJobID.reduce(
+                into: [String: SkipStormSummary]()
+            ) { result, entry in
                 if let summary = SkipStormSummary.make(from: entry.value) {
                     result[entry.key] = summary
                 }
             }
 
-            var refreshErrors = discovery.errors.map { $0.localizedDescription }
+            var refreshErrors = (discovery.errors + skipDiscovery.errors)
+                .map { $0.localizedDescription }
 
             var latestHealth: [String: Run]?
             var latestRecoveryStates: [String: JobRecoveryState] = [:]
@@ -263,6 +290,40 @@ final class AppModel: ObservableObject {
                 }
             }
 
+            var observedIncidentIDs = Set<AttentionIncidentID>()
+            let discoveryObservedKinds: [AttentionIncidentKind] = [
+                .brokenConfiguration,
+                .ambiguousRuntime,
+                .lateRun,
+                .wrapperRecovery,
+            ]
+            for job in discovery.jobs {
+                for kind in discoveryObservedKinds {
+                    observedIncidentIDs.insert(
+                        AttentionIncidentID(jobID: job.id, kind: kind)
+                    )
+                }
+                if AttentionIncidentObservationPolicy.failedRunIsAuthoritative(
+                    for: job,
+                    hasScheduledHealthSnapshot: latestHealth != nil
+                ) {
+                    observedIncidentIDs.insert(
+                        AttentionIncidentID(jobID: job.id, kind: .failedRun)
+                    )
+                }
+            }
+            for jobID in skipDiscovery.observedJobIDs {
+                observedIncidentIDs.insert(
+                    AttentionIncidentID(jobID: jobID, kind: .skipStorm)
+                )
+            }
+            let publishedObservedIncidentIDs = observedIncidentIDs.sorted {
+                if $0.jobID == $1.jobID {
+                    return $0.kind.rawValue < $1.kind.rawValue
+                }
+                return $0.jobID < $1.jobID
+            }
+
             let publishedErrors = refreshErrors
             let publishedHealth = latestHealth
             let publishedRecoveryStates = latestRecoveryStates
@@ -279,6 +340,10 @@ final class AppModel: ObservableObject {
                 self.recoveryStates = publishedRecoveryStates
                 self.recoveryStateErrors = publishedRecoveryErrors
                 self.errors = publishedErrors
+                self.failureNotifier.update(
+                    candidates: self.attentionNotificationCandidates(),
+                    observedIncidentIDs: publishedObservedIncidentIDs
+                )
                 self.refreshInProgress = false
                 self.lastRefresh = Date()
                 for job in historyJobs {
@@ -304,17 +369,115 @@ final class AppModel: ObservableObject {
     }
 
     func needsAttention(_ job: Job) -> Bool {
-        if job.isBroken {
+        if job.isBroken || job.runtimeStatusAttribution == .ambiguous {
             return true
         }
         guard job.enabled else {
             return false
         }
         return outcome(for: job) == .failure
-            || job.runtimeStatusAttribution == .ambiguous
             || (job.skew.map { $0 > 3_600 } ?? false)
             || skipStorm(for: job) != nil
             || wrapperNeedsAttention(job)
+    }
+
+    private func attentionNotificationCandidates() -> [AttentionNotificationCandidate] {
+        jobs.flatMap(attentionNotificationCandidates(for:))
+            .sorted {
+                if $0.jobLabel == $1.jobLabel {
+                    return $0.incidentID.kind.rawValue < $1.incidentID.kind.rawValue
+                }
+                return $0.jobLabel.localizedCaseInsensitiveCompare($1.jobLabel) == .orderedAscending
+            }
+    }
+
+    private func attentionNotificationCandidates(
+        for job: Job
+    ) -> [AttentionNotificationCandidate] {
+        guard job.provenance.isAttentionOwned else {
+            return []
+        }
+
+        func candidate(
+            _ kind: AttentionIncidentKind,
+            _ reason: String
+        ) -> AttentionNotificationCandidate {
+            AttentionNotificationCandidate(
+                incidentID: AttentionIncidentID(jobID: job.id, kind: kind),
+                jobLabel: job.label,
+                reason: reason
+            )
+        }
+
+        var candidates: [AttentionNotificationCandidate] = []
+        if job.isBroken {
+            candidates.append(
+                candidate(
+                    .brokenConfiguration,
+                    job.attention?.detail ?? "Ticker cannot run or inspect this job."
+                )
+            )
+        }
+        if job.runtimeStatusAttribution == .ambiguous {
+            candidates.append(
+                candidate(
+                    .ambiguousRuntime,
+                    job.runtimeStatusExplanation
+                        ?? "Ticker cannot attribute the current launchd status safely."
+                )
+            )
+        }
+
+        guard job.enabled else {
+            return candidates
+        }
+
+        if outcome(for: job) == .failure {
+            if let run = health[job.id], run.outcome == .failure {
+                let exit = run.exitCode.map(String.init) ?? "unknown"
+                candidates.append(
+                    candidate(
+                        .failedRun,
+                        "The latest scheduled run failed with exit code \(exit)."
+                    )
+                )
+            } else {
+                let exit = job.lastKnownExit?.code ?? -1
+                candidates.append(
+                    candidate(
+                        .failedRun,
+                        "launchd reports exit code \(exit) for this job."
+                    )
+                )
+            }
+        }
+
+        if let skew = job.skew, skew > 3_600 {
+            candidates.append(
+                candidate(
+                    .lateRun,
+                    "This job is \(Int(skew / 60)) minutes late."
+                )
+            )
+        }
+
+        if let storm = skipStorm(for: job) {
+            candidates.append(candidate(.skipStorm, storm.displayText))
+        }
+
+        if let recoveryError = recoveryStateErrors[job.id] {
+            candidates.append(candidate(.wrapperRecovery, recoveryError))
+        } else if let recovery = recoveryStates[job.id],
+                  wrapperNeedsAttention(job) {
+            candidates.append(
+                candidate(
+                    .wrapperRecovery,
+                    "Ticker wrapper state is \(recovery.description). Run ticker doctor."
+                )
+            )
+        }
+
+        return candidates
     }
 
     func wrapperNeedsAttention(_ job: Job) -> Bool {

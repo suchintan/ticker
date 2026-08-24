@@ -537,14 +537,70 @@ private func testClaudeAdapter(_ tests: TestHarness) throws {
             accuracy: 0.001,
             "Claude fractional-second ISO-8601 timestamp is parsed"
         )
-        let skips = try adapter.skips()
-        let records = try require(skips[job.id], "Claude skips")
+        let skipSnapshot = adapter.skipSnapshot()
+        let records = try require(skipSnapshot.recordsByJobID[job.id], "Claude skips")
         tests.expectEqual(records.count, 1, "Claude skip records are loaded")
         tests.expectNear(
             try require(records.first, "first Claude skip").at.timeIntervalSince1970,
             1_786_074_929.896,
             accuracy: 0.001,
             "Claude skip epoch milliseconds convert to seconds"
+        )
+        tests.expect(
+            !skipSnapshot.observedJobIDs.contains(job.id),
+            "Claude skip snapshots withhold account observations when another file is unreadable"
+        )
+        tests.expectEqual(
+            skipSnapshot.errors.count,
+            1,
+            "Claude skip snapshots preserve valid records when another file is unreadable"
+        )
+    }
+
+    try withTemporaryDirectory("claude-skip-read-failure") { root in
+        try writeScheduledTasks(
+            root: root,
+            session: "session",
+            object: [
+                "scheduledTasks": [[
+                    "id": "daily-summary",
+                    "cronExpression": "55 23 * * *",
+                    "enabled": true,
+                    "filePath": "/tmp/daily-summary/SKILL.md",
+                ] as [String: Any]],
+                "recordedSkips": [
+                    "daily-summary": [[
+                        "at": 1_786_074_929_896 as Int64,
+                        "reason": "per_task_limit",
+                    ] as [String: Any]],
+                ],
+            ]
+        )
+        let adapter = ClaudeRoutineAdapter(searchRoots: [root])
+        let job = try require(try adapter.discover().first, "Claude failure fixture job")
+        let healthySnapshot = adapter.skipSnapshot()
+        tests.expect(
+            healthySnapshot.observedJobIDs.contains(job.id),
+            "Claude skip snapshot observes a readable job"
+        )
+
+        try Data().write(
+            to: test2B_scheduledTasksURL(root: root, session: "session")
+        )
+        let failedSnapshot = adapter.skipSnapshot()
+        tests.expectEqual(
+            failedSnapshot.recordsByJobID,
+            [:],
+            "Claude skip read failure does not publish stale records"
+        )
+        tests.expect(
+            !failedSnapshot.observedJobIDs.contains(job.id),
+            "Claude skip read failure cannot declare the job recovered"
+        )
+        tests.expectEqual(
+            failedSnapshot.errors.count,
+            1,
+            "Claude skip read failure is reported"
         )
     }
 }
@@ -2003,7 +2059,7 @@ private func test2B_ClaudeSkipDeduplication(_ tests: TestHarness) throws {
                 ],
             ]
         )
-        let skips = try ClaudeRoutineAdapter(searchRoots: [root]).skips()
+        let skips = ClaudeRoutineAdapter(searchRoots: [root]).skipSnapshot().recordsByJobID
         tests.expect(
             skips.keys.first?.range(
                 of: #"^claude:daily-summary#[0-9a-f]{12}$"#,
@@ -2232,7 +2288,7 @@ private func test3B_ClaudeAccountScopedIDs(_ tests: TestHarness) throws {
             "test3B account-scoped Claude ids are stable across discovery"
         )
 
-        let skips = try adapter.skips()
+        let skips = adapter.skipSnapshot().recordsByJobID
         tests.expectEqual(
             Set(skips.keys),
             Set(firstDiscovery.map(\.id)),
@@ -2571,6 +2627,19 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
 
             func discover() throws -> [Job] {
                 jobs
+            }
+        }
+
+        private final class RecordingFailureNotifier: FailureNotificationHandling {
+            private(set) var candidates: [AttentionNotificationCandidate] = []
+
+            func start() {}
+
+            func update(
+                candidates: [AttentionNotificationCandidate],
+                observedIncidentIDs: [AttentionIncidentID]
+            ) {
+                self.candidates = candidates
             }
         }
 
@@ -3362,6 +3431,90 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                     "test14_unattributedBrokenJob_setsUrgentMenuBarState"
                 )
 
+                let ambiguousJob = Job(
+                    id: "launchd:ambiguous-disabled#111111111111",
+                    source: .launchd,
+                    provenance: .yours,
+                    label: "ambiguous-disabled",
+                    schedule: .onDemand,
+                    command: ["/usr/bin/true"],
+                    cwd: nil,
+                    enabled: false,
+                    runtimeStatusAttribution: .ambiguous,
+                    configPath: nil,
+                    lastKnownExit: nil,
+                    lastRunAt: nil,
+                    lastScheduledFor: nil,
+                    managed: false
+                )
+                let notificationRecorder = RecordingFailureNotifier()
+                let ambiguousModel = AppModel(
+                    registry: JobRegistry(
+                        adapters: [
+                            StaticAdapter(source: .launchd, jobs: [ambiguousJob]),
+                        ]
+                    ),
+                    store: store,
+                    failureNotifier: notificationRecorder
+                )
+                ambiguousModel.refresh()
+                try check(
+                    waitUntil {
+                        notificationRecorder.candidates.contains {
+                            $0.incidentID
+                                == AttentionIncidentID(
+                                    jobID: ambiguousJob.id,
+                                    kind: .ambiguousRuntime
+                                )
+                        }
+                    },
+                    "test17_disabledAmbiguousRuntime_producesNotificationCandidate"
+                )
+                try check(
+                    ambiguousModel.needsAttention(ambiguousJob),
+                    "test17_disabledAmbiguousRuntime_setsUrgentState"
+                )
+                print("APP HARNESS test17_disabledAmbiguousRuntimeNotification PASS")
+
+                let encodedFailureJob = Job(
+                    id: "launchd:encoded-failure#222222222222",
+                    source: .launchd,
+                    provenance: .yours,
+                    label: "encoded-failure",
+                    schedule: .onDemand,
+                    command: ["/usr/bin/false"],
+                    cwd: nil,
+                    enabled: true,
+                    runtimeStatusAttribution: .resolved,
+                    configPath: nil,
+                    lastKnownExit: ExitStatus(raw: 32_512),
+                    lastRunAt: nil,
+                    lastScheduledFor: nil,
+                    managed: false
+                )
+                let encodedFailureRecorder = RecordingFailureNotifier()
+                let encodedFailureModel = AppModel(
+                    registry: JobRegistry(
+                        adapters: [
+                            StaticAdapter(source: .launchd, jobs: [encodedFailureJob]),
+                        ]
+                    ),
+                    store: store,
+                    failureNotifier: encodedFailureRecorder
+                )
+                encodedFailureModel.refresh()
+                try check(
+                    waitUntil {
+                        encodedFailureRecorder.candidates.contains {
+                            $0.incidentID.kind == .failedRun
+                                && $0.reason.contains("exit code 127")
+                                && !$0.reason.contains("32512")
+                        }
+                    },
+                    "test17_encodedLaunchdStatus_reportsDecodedExitCode"
+                )
+                print("APP HARNESS test17_encodedLaunchdExitNotification PASS")
+
                 print("APP HARNESS PASS")
             }
 
@@ -3420,6 +3573,7 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
         let harnessExecutable = buildDirectory.appendingPathComponent("AppBehaviorHarness").path
         let appSources = [
             repository.appendingPathComponent("Sources/TickerApp/AppModel.swift").path,
+            repository.appendingPathComponent("Sources/TickerApp/FailureNotificationController.swift").path,
             repository.appendingPathComponent("Sources/TickerApp/JobListView.swift").path,
             repository.appendingPathComponent("Sources/TickerApp/JobDetailView.swift").path,
             harnessSourceURL.path,
@@ -3429,6 +3583,7 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
             [
                 "-module-cache-path", moduleCachePath,
                 "-target", "arm64-apple-macosx13.0",
+                "-D", "TICKER_TESTING",
                 "-parse-as-library",
                 "-I", buildDirectory.path,
                 "-L", buildDirectory.path,
@@ -13925,6 +14080,227 @@ private func test16_LoginAtBootAndFallbackVerification(_ tests: TestHarness) thr
     }
 }
 
+private func test17_AttentionNotificationPlanner(_ tests: TestHarness) {
+    let jobA = "launchd:job-a#111111111111"
+    let failureID = AttentionIncidentID(jobID: jobA, kind: .failedRun)
+    let lateID = AttentionIncidentID(jobID: jobA, kind: .lateRun)
+    let firstFailure = AttentionNotificationCandidate(
+        incidentID: failureID,
+        jobLabel: "job-a",
+        reason: "The scheduled run exited with code 1."
+    )
+    let duplicateIncident = AttentionNotificationCandidate(
+        incidentID: failureID,
+        jobLabel: "duplicate-label",
+        reason: "Duplicate discovery must not create a second notification."
+    )
+
+    func launchdObservationJob(
+        managed: Bool,
+        lastKnownExit: ExitStatus?
+    ) -> Job {
+        Job(
+            id: "launchd:observation-\(managed)#333333333333",
+            source: .launchd,
+            provenance: .yours,
+            label: "observation",
+            schedule: .onDemand,
+            command: ["/usr/bin/true"],
+            cwd: nil,
+            enabled: true,
+            runtimeStatusAttribution: .resolved,
+            configPath: nil,
+            lastKnownExit: lastKnownExit,
+            lastRunAt: nil,
+            lastScheduledFor: nil,
+            managed: managed
+        )
+    }
+    tests.expect(
+        AttentionIncidentObservationPolicy.failedRunIsAuthoritative(
+            for: launchdObservationJob(
+                managed: false,
+                lastKnownExit: ExitStatus(raw: 0)
+            ),
+            hasScheduledHealthSnapshot: false
+        ),
+        "test17_unmanagedLaunchdNativeStatusRemainsAuthoritativeWithoutDatabase"
+    )
+    tests.expect(
+        !AttentionIncidentObservationPolicy.failedRunIsAuthoritative(
+            for: launchdObservationJob(
+                managed: true,
+                lastKnownExit: ExitStatus(raw: 0)
+            ),
+            hasScheduledHealthSnapshot: false
+        ),
+        "test17_managedLaunchdStatusNeedsDatabaseEvidence"
+    )
+    tests.expect(
+        !AttentionIncidentObservationPolicy.failedRunIsAuthoritative(
+            for: launchdObservationJob(managed: false, lastKnownExit: nil),
+            hasScheduledHealthSnapshot: false
+        ),
+        "test17_missingNativeAndDatabaseStatusIsNotAuthoritative"
+    )
+
+    let initial = AttentionNotificationPlanner.plan(
+        candidates: [firstFailure, duplicateIncident],
+        notifiedIncidentIDs: [],
+        pendingIncidentIDs: [],
+        observedIncidentIDs: [failureID]
+    )
+    tests.expectEqual(
+        initial.notifications,
+        [firstFailure],
+        "test17_newIncidentProducesOneNotification"
+    )
+
+    let unchanged = AttentionNotificationPlanner.plan(
+        candidates: [firstFailure],
+        notifiedIncidentIDs: [failureID],
+        pendingIncidentIDs: [],
+        observedIncidentIDs: [failureID]
+    )
+    tests.expectEqual(
+        unchanged.notifications,
+        [],
+        "test17_sameActiveIncidentDoesNotRepeat"
+    )
+    tests.expectEqual(
+        unchanged.retainedNotifiedIncidentIDs,
+        [failureID],
+        "test17_activeIncidentRetainsNotificationState"
+    )
+
+    let missingFromPartialDiscovery = AttentionNotificationPlanner.plan(
+        candidates: [],
+        notifiedIncidentIDs: [failureID],
+        pendingIncidentIDs: [],
+        observedIncidentIDs: []
+    )
+    tests.expectEqual(
+        missingFromPartialDiscovery.retainedNotifiedIncidentIDs,
+        [failureID],
+        "test17_unobservedIncidentCannotBeDeclaredRecovered"
+    )
+
+    let wrapperID = AttentionIncidentID(
+        jobID: "launchd:job-b#222222222222",
+        kind: .wrapperRecovery
+    )
+    let wrapperError = AttentionNotificationCandidate(
+        incidentID: wrapperID,
+        jobLabel: "job-b",
+        reason: "Ticker could not verify the wrapper."
+    )
+    let partialDiscovery = AttentionNotificationPlanner.plan(
+        candidates: [wrapperError],
+        notifiedIncidentIDs: [failureID],
+        pendingIncidentIDs: [],
+        observedIncidentIDs: [wrapperID]
+    )
+    tests.expectEqual(
+        partialDiscovery.notifications,
+        [wrapperError],
+        "test17_partialDiscoveryDeliversObservedIncident"
+    )
+    tests.expectEqual(
+        partialDiscovery.retainedNotifiedIncidentIDs,
+        [failureID],
+        "test17_partialDiscoveryPreservesUnobservedIncident"
+    )
+
+    let late = AttentionNotificationCandidate(
+        incidentID: lateID,
+        jobLabel: "job-a",
+        reason: "The same job is now late."
+    )
+    let newKind = AttentionNotificationPlanner.plan(
+        candidates: [firstFailure, late],
+        notifiedIncidentIDs: [failureID],
+        pendingIncidentIDs: [],
+        observedIncidentIDs: [failureID, lateID]
+    )
+    tests.expectEqual(
+        newKind.notifications,
+        [late],
+        "test17_newIncidentKindNotifiesWhileFailureRemainsActive"
+    )
+
+    let failureRecovered = AttentionNotificationPlanner.plan(
+        candidates: [late],
+        notifiedIncidentIDs: [failureID, lateID],
+        pendingIncidentIDs: [],
+        observedIncidentIDs: [failureID, lateID]
+    )
+    tests.expectEqual(
+        failureRecovered.retainedNotifiedIncidentIDs,
+        [lateID],
+        "test17_observedIncidentRecoveryClearsOnlyThatKind"
+    )
+
+    let fullyRecovered = AttentionNotificationPlanner.plan(
+        candidates: [],
+        notifiedIncidentIDs: [lateID],
+        pendingIncidentIDs: [],
+        observedIncidentIDs: [lateID]
+    )
+    let afterRecovery = AttentionNotificationPlanner.plan(
+        candidates: [firstFailure],
+        notifiedIncidentIDs: fullyRecovered.retainedNotifiedIncidentIDs,
+        pendingIncidentIDs: [],
+        observedIncidentIDs: [failureID]
+    )
+    tests.expectEqual(
+        afterRecovery.notifications,
+        [firstFailure],
+        "test17_incidentAfterRecoveryNotifiesAgain"
+    )
+
+    let skipID = AttentionIncidentID(jobID: jobA, kind: .skipStorm)
+    let skip = AttentionNotificationCandidate(
+        incidentID: skipID,
+        jobLabel: "job-a",
+        reason: "12 scheduler skips"
+    )
+    let skipPlan = AttentionNotificationPlanner.plan(
+        candidates: [skip],
+        notifiedIncidentIDs: [],
+        pendingIncidentIDs: [],
+        observedIncidentIDs: [skipID]
+    )
+    tests.expectEqual(
+        skipPlan.notifications,
+        [skip],
+        "test17_skipStormProducesNotification"
+    )
+
+    let unreadableSkipSource = AttentionNotificationPlanner.plan(
+        candidates: [],
+        notifiedIncidentIDs: [skipID],
+        pendingIncidentIDs: [],
+        observedIncidentIDs: [failureID]
+    )
+    tests.expectEqual(
+        unreadableSkipSource.retainedNotifiedIncidentIDs,
+        [skipID],
+        "test17_unobservedSkipIncidentCannotBeDeclaredRecovered"
+    )
+
+    let pending = AttentionNotificationPlanner.plan(
+        candidates: [firstFailure],
+        notifiedIncidentIDs: [],
+        pendingIncidentIDs: [failureID],
+        observedIncidentIDs: [failureID]
+    )
+    tests.expectEqual(
+        pending.notifications,
+        [],
+        "test17_pendingNotificationDoesNotDuplicate"
+    )
+}
+
 @main
 private enum TickerTests {
     static func main() {
@@ -13971,6 +14347,19 @@ private enum TickerTests {
             }
             tests.run("round 15 informational state presentation") {
                 try test15_InformationalStatePresentationContract(tests)
+            }
+            tests.finish()
+        }
+        if ProcessInfo.processInfo.environment["TICKER_TEST17_ONLY"] == "1" {
+            let tests = TestHarness()
+            tests.run("round 17 failure notification transitions") {
+                test17_AttentionNotificationPlanner(tests)
+            }
+            tests.run("round 17 skip observation completeness") {
+                try testClaudeAdapter(tests)
+            }
+            tests.run("round 17 notification app integration") {
+                try test4B_AppExecutionAndPresentation(tests)
             }
             tests.finish()
         }
@@ -14123,6 +14512,9 @@ private enum TickerTests {
         }
         tests.run("round 16 login at boot and fallback verification") {
             try test16_LoginAtBootAndFallbackVerification(tests)
+        }
+        tests.run("round 17 failure notification transitions") {
+            test17_AttentionNotificationPlanner(tests)
         }
         tests.finish()
     }

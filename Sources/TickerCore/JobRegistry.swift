@@ -10,6 +10,22 @@ public struct DuplicateJobIDError: Error, LocalizedError {
     }
 }
 
+public struct SkipDiscoveryResult {
+    public let recordsByJobID: [String: [SkipRecord]]
+    public let observedJobIDs: Set<String>
+    public let errors: [Error]
+
+    public init(
+        recordsByJobID: [String: [SkipRecord]],
+        observedJobIDs: Set<String>,
+        errors: [Error]
+    ) {
+        self.recordsByJobID = recordsByJobID
+        self.observedJobIDs = observedJobIDs
+        self.errors = errors
+    }
+}
+
 public final class JobRegistry {
     private let adapters: [JobSourceAdapter]
 
@@ -79,16 +95,19 @@ public final class JobRegistry {
         return (sortedJobs, errors)
     }
 
-    public func skips() -> [String: [SkipRecord]] {
+    public func skipSnapshot() -> SkipDiscoveryResult {
         var recordsByJobID: [String: [SkipRecord]] = [:]
+        var observedJobIDs = Set<String>()
+        var errors: [Error] = []
 
         for adapter in adapters {
-            guard let skipSource = adapter as? SkipSourceAdapter,
-                  let records = try? skipSource.skips()
-            else {
+            guard let skipSource = adapter as? SkipSourceAdapter else {
                 continue
             }
-            for (jobID, recordsForJob) in records {
+            let snapshot = skipSource.skipSnapshot()
+            observedJobIDs.formUnion(snapshot.observedJobIDs)
+            errors.append(contentsOf: snapshot.errors)
+            for (jobID, recordsForJob) in snapshot.recordsByJobID {
                 recordsByJobID[jobID, default: []].append(contentsOf: recordsForJob)
             }
         }
@@ -96,6 +115,10 @@ public final class JobRegistry {
         for jobID in Array(recordsByJobID.keys) {
             recordsByJobID[jobID]?.sort { $0.at < $1.at }
         }
-        return recordsByJobID
+        return SkipDiscoveryResult(
+            recordsByJobID: recordsByJobID,
+            observedJobIDs: observedJobIDs,
+            errors: errors
+        )
     }
 }
