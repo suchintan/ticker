@@ -3431,6 +3431,28 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                     "test14_unattributedBrokenJob_setsUrgentMenuBarState"
                 )
 
+                try check(
+                    FailureNotificationController.shouldUseLegacyFallback(
+                        isAdHocBuild: true,
+                        modernAuthorizationRequested: false
+                    ),
+                    "test17_adHocBuildWithoutPrompt_usesLegacyNotificationFallback"
+                )
+                try check(
+                    !FailureNotificationController.shouldUseLegacyFallback(
+                        isAdHocBuild: true,
+                        modernAuthorizationRequested: true
+                    ),
+                    "test17_explicitModernDenial_disablesLegacyNotificationFallback"
+                )
+                try check(
+                    !FailureNotificationController.shouldUseLegacyFallback(
+                        isAdHocBuild: false,
+                        modernAuthorizationRequested: false
+                    ),
+                    "test17_signedBuildNeverUsesLegacyNotificationFallback"
+                )
+
                 let ambiguousJob = Job(
                     id: "launchd:ambiguous-disabled#111111111111",
                     source: .launchd,
@@ -6575,6 +6597,10 @@ private func test12_BuiltBundlePackaging(_ tests: TestHarness) throws {
     let version = try require(
         info["CFBundleShortVersionString"] as? String,
         "test12 CFBundleShortVersionString"
+    )
+    tests.expect(
+        info["TickerAdHocSigned"] as? Bool == true,
+        "test17_adHocBundle_enablesCompatibleNotificationFallback"
     )
     let appExecutable = bundle
         .appendingPathComponent("Contents/MacOS", isDirectory: true)

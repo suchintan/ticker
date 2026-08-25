@@ -20,7 +20,7 @@ Neither scheduler surfaced these problems to the user. LaunchControl and Lingon 
 - Full run history for wrapped launchd jobs, including duration, exit code, and output tails.
 - A local CLI for scripts and terminal use.
 
-Ticker asks macOS for notification permission when the app starts. If permission was denied, enable Ticker under **System Settings → Notifications → Ticker**.
+Signed builds ask macOS for notification permission when the app starts. If permission was denied, enable Ticker under **System Settings → Notifications → Ticker**. The repository build is ad-hoc signed. macOS does not register ad-hoc apps for the modern permission panel, so that build uses the compatible local-notification API instead.
 
 ## Screenshot
 
