@@ -3,6 +3,7 @@ import Foundation
 public enum AttentionIncidentKind: String, Codable, Hashable, Sendable {
     case brokenConfiguration
     case failedRun
+    case interruptedRun
     case ambiguousRuntime
     case lateRun
     case skipStorm

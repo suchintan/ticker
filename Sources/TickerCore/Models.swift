@@ -18,6 +18,7 @@ public enum LaunchdDomain: String, Codable, Hashable {
 
 public enum Outcome: String, Codable {
     case running
+    case interrupted
     case success
     case failure
     case unknown
@@ -48,12 +49,8 @@ public enum JobHealthPolicy {
               let scheduledHistory else {
             return scheduledHistory?.outcome ?? nativeOutcome ?? .unknown
         }
-
-        if scheduledHistory.outcome == .running {
-            return scheduledHistory.isCorroboratedRunning
-                    && scheduledHistory.processID == job.launchdProcessID
-                ? .running
-                : (nativeOutcome ?? .unknown)
+        if scheduledHistory.finishedAt == nil {
+            return scheduledHistory.observedOutcome(for: job)
         }
 
         if nativeOutcome == .failure, scheduledHistory.outcome == .success {
@@ -288,13 +285,63 @@ public struct Run: Identifiable, Codable, Hashable {
     }
 
     public var outcome: Outcome {
-        guard finishedAt != nil else {
-            return .running
+        if finishedAt != nil {
+            guard let exitCode else {
+                return .unknown
+            }
+            return exitCode == 0 ? .success : .failure
         }
-        guard let exitCode = exitCode else {
+
+        guard let processID,
+              processID > 0,
+              let bootSessionID,
+              !bootSessionID.isEmpty,
+              bootSessionID != RunExecutionEvidence.unavailableBootSessionID else {
             return .unknown
         }
-        return exitCode == 0 ? .success : .failure
+        let currentBootSessionID = RunExecutionEvidence.currentBootSessionID()
+        guard currentBootSessionID != RunExecutionEvidence.unavailableBootSessionID else {
+            return .unknown
+        }
+        if bootSessionID == currentBootSessionID,
+           RunExecutionEvidence.processIsAlive(processID) {
+            return .running
+        }
+        return .interrupted
+    }
+
+    public func observedOutcome(for job: Job?) -> Outcome {
+        let recordedOutcome = outcome
+        guard finishedAt == nil else {
+            return recordedOutcome
+        }
+        guard let job else {
+            return jobID.hasPrefix("launchd:") ? .unknown : recordedOutcome
+        }
+        guard job.source == .launchd, job.managed else {
+            return recordedOutcome
+        }
+        guard let startingRunCount = launchdRunCountAtStart,
+              let currentRunCount = job.launchdRunCount else {
+            return .unknown
+        }
+        if startingRunCount != currentRunCount {
+            return .interrupted
+        }
+        if recordedOutcome == .unknown,
+           let nativeExit = job.lastKnownExit,
+           !nativeExit.isSuccess {
+            return .failure
+        }
+        guard recordedOutcome == .running else {
+            return recordedOutcome
+        }
+        guard job.launchdProcessID == processID else {
+            return job.lastKnownExit.map {
+                $0.isSuccess ? .success : .failure
+            } ?? .unknown
+        }
+        return .running
     }
 
     public var isCorroboratedRunning: Bool {
@@ -403,7 +450,9 @@ public protocol RunStore: AnyObject {
     func runs(jobID: String, limit: Int) throws -> [Run]
     func latestRun(jobID: String) throws -> Run?
     func scheduledHealthRuns() throws -> [String: Run]
+    func interruptedRuns(limit: Int) throws -> [Run]
     func health() throws -> [String: Outcome]
+    func unfinishedRuns(limit: Int) throws -> [Run]
     func markManaged(jobID: String, backupPath: String?) throws
     func unmarkManaged(jobID: String) throws
     func migrateJobIdentity(from oldJobID: String, to newJobID: String) throws
@@ -412,6 +461,14 @@ public protocol RunStore: AnyObject {
 }
 
 public extension RunStore {
+    func interruptedRuns() throws -> [Run] {
+        try interruptedRuns(limit: Int.max)
+    }
+
+    func unfinishedRuns() throws -> [Run] {
+        try unfinishedRuns(limit: Int.max)
+    }
+
     func beginRun(
         jobID: String,
         startedAt: Date,

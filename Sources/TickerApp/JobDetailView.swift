@@ -137,7 +137,8 @@ struct JobDetailView: View {
     }
 
     private func selectedRunInspector(_ run: Run) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let outcome = run.observedOutcome(for: job)
+        return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text("Run inspector")
                     .font(.headline)
@@ -149,9 +150,9 @@ struct JobDetailView: View {
             }
 
             HStack(spacing: 10) {
-                RunOutcomeView(outcome: run.outcome)
+                RunOutcomeView(outcome: outcome)
                 Text("Exit code: \(run.exitCode.map(String.init) ?? "—")")
-                Text("Duration: \(Self.durationText(run))")
+                Text("Duration: \(durationText(run, outcome: outcome))")
             }
             .font(.caption)
             .accessibilityElement(children: .combine)
@@ -222,6 +223,13 @@ struct JobDetailView: View {
                         icon: "arrow.triangle.2.circlepath",
                         title: "Running now",
                         detail: lastEvidenceText
+                    )
+                case .interrupted:
+                    HealthSummaryView(
+                        color: .orange,
+                        icon: "exclamationmark.triangle.fill",
+                        title: "The last observed run was interrupted",
+                        detail: interruptedEvidenceText
                     )
                 case .success:
                     HealthSummaryView(
@@ -464,6 +472,7 @@ struct JobDetailView: View {
                 } else {
                     VStack(spacing: 2) {
                         ForEach(runs) { run in
+                            let outcome = run.observedOutcome(for: job)
                             Button {
                                 selectedRunID = run.id
                             } label: {
@@ -475,9 +484,9 @@ struct JobDetailView: View {
                                             .foregroundStyle(.secondary)
                                     }
                                     Spacer(minLength: 2)
-                                    RunOutcomeView(outcome: run.outcome)
+                                    RunOutcomeView(outcome: outcome)
                                     VStack(alignment: .trailing, spacing: 2) {
-                                        Text(Self.durationText(run))
+                                        Text(durationText(run, outcome: outcome))
                                         Text("Exit \(run.exitCode.map(String.init) ?? "—")")
                                             .monospaced()
                                             .foregroundStyle(.secondary)
@@ -492,7 +501,7 @@ struct JobDetailView: View {
                             .buttonStyle(.plain)
                             .help("Inspect run from \(Self.dateTime(run.startedAt))")
                             .accessibilityLabel(
-                                "Inspect \(run.outcome.rawValue) run from \(Self.dateTime(run.startedAt))"
+                                "Inspect \(outcome.rawValue) run from \(Self.dateTime(run.startedAt))"
                             )
                         }
                     }
@@ -690,6 +699,16 @@ struct JobDetailView: View {
         return "Observed \(Self.dateTime(date))."
     }
 
+    private var interruptedEvidenceText: String {
+        guard let run = model.health[job.id] else {
+            return "The wrapper stopped before recording an exit."
+        }
+        if run.bootSessionID != RunExecutionEvidence.currentBootSessionID() {
+            return "The wrapper started in a previous boot session and did not record an exit."
+        }
+        return "The wrapper process is no longer running and did not record an exit."
+    }
+
     private func revealConfig() {
         guard let configPath = job.configPath else {
             return
@@ -704,9 +723,14 @@ struct JobDetailView: View {
         return formatter.string(from: date)
     }
 
-    private static func durationText(_ run: Run) -> String {
+    private func durationText(_ run: Run, outcome: Outcome) -> String {
         guard let duration = run.duration else {
-            return run.outcome == .running ? "Running" : "—"
+            switch outcome {
+            case .running:
+                return "Running"
+            case .interrupted, .success, .failure, .unknown:
+                return "—"
+            }
         }
         return duration >= 60
             ? String(format: "%.1fm", duration / 60)
@@ -818,6 +842,9 @@ private struct RunOutcomeView: View {
         case .running:
             Label("Running", systemImage: "arrow.triangle.2.circlepath")
                 .foregroundStyle(.blue)
+        case .interrupted:
+            Label("Interrupted", systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
         case .success:
             Label("Success", systemImage: "checkmark.circle")
                 .foregroundStyle(.secondary)
