@@ -3298,9 +3298,14 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                     "test13_displayName_humanizesSafeFinalComponent"
                 )
                 try check(
+                    JobDisplayName.candidate(for: "com.daily-vitals.morning")
+                        == "Daily vitals morning",
+                    "test18_displayName_usesReadableReverseDNSComponents"
+                )
+                try check(
                     JobDisplayName.candidate(for: "com.bjango.istatmenus.fans")
-                        == "com.bjango.istatmenus.fans",
-                    "test13_displayName_preservesLossySingleComponentLabel"
+                        == "Istatmenus fans",
+                    "test18_displayName_preservesReadableReverseDNSContext"
                 )
                 let duplicateUser = Job(
                     id: "launchd:cyolo-user",
@@ -7041,7 +7046,7 @@ private func test13_UIArchitectureContract(_ tests: TestHarness) throws {
     tests.expect(
         listSource.contains("@AppStorage")
             && listSource.contains("DisclosureGroup")
-            && listSource.contains("Section(\"My Jobs\")"),
+            && listSource.contains("listSectionHeader(\"My Jobs\""),
         "test13_sidebar_persistsProvenanceGroupExpansion"
     )
     tests.expect(
@@ -7794,7 +7799,7 @@ private func test14_UISafetyContract(_ tests: TestHarness) throws {
         encoding: .utf8
     )
     tests.expect(
-        listSource.contains("Section(\"Needs Review\")")
+        listSource.contains("listSectionHeader(\"Needs Review\"")
             && !listSource.contains("subgroupHeader(\"Unknown Owners\"")
             && listSource.contains("unattributedJobs"),
         "test14_unattributedJobs_haveVisibleTopLevelGroup"
@@ -7810,7 +7815,7 @@ private func test14_UISafetyContract(_ tests: TestHarness) throws {
     )
     let confirmedThirdPartyRowContracts: [(JobProvenance, [String])] = [
         (.ticker, ["tickerJobs", "jobRows(tickerJobs)", "subgroupHeader(\"Ticker\""]),
-        (.app("Example"), ["appJobs", "jobRows(appJobs.filter"]),
+        (.app("Example"), ["appJobs", "jobRows(ownerJobs)"]),
         (.packageManager("Example"), ["packageManagerJobs", "jobRows(packageManagerJobs)"]),
         (.system, ["systemJobs", "jobRows(systemJobs)"]),
     ]
@@ -7824,7 +7829,7 @@ private func test14_UISafetyContract(_ tests: TestHarness) throws {
     tests.expect(
         listSource.contains("otherJobs.filter { $0.provenance == .ticker }")
             && listSource.contains("Text(\"Other Jobs\")")
-            && listSource.contains("allOtherJobs.count"),
+            && listSource.contains("visibleJobs.count"),
         "test14_tickerSubgroup_rowsAndOtherJobsCountUseSamePopulation"
     )
     tests.expect(

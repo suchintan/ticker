@@ -3,6 +3,10 @@ import Foundation
 import SwiftUI
 import TickerCore
 
+enum TickerPopoverLayout {
+    static let width: CGFloat = 360
+}
+
 enum JobNextFirePresentation {
     static func relativeText(
         for schedule: Schedule,
@@ -20,20 +24,20 @@ enum JobNextFirePresentation {
 
 enum JobDisplayName {
     static func candidate(for label: String) -> String {
-        guard let component = label.split(separator: ".").last else {
+        let components = label.split(separator: ".").map(String.init)
+        guard let finalComponent = components.last else {
             return label
         }
-        let raw = String(component)
-        let words = raw.split(whereSeparator: { $0 == "-" || $0 == "_" })
-        guard words.count >= 2,
-              words.allSatisfy({ word in
-                  !word.isEmpty && word.allSatisfy { $0.isLetter || $0.isNumber }
-              })
-        else {
-            return label
+        if let humanized = humanized(finalComponent) {
+            return humanized
         }
-        let joined = words.map(String.init).joined(separator: " ")
-        return joined.prefix(1).uppercased() + joined.dropFirst()
+        if components.count >= 3 {
+            let contextComponent = components[components.count - 2]
+            if let humanized = humanized(contextComponent + "-" + finalComponent) {
+                return humanized
+            }
+        }
+        return label
     }
 
     static func disambiguated(for job: Job, among jobs: [Job]) -> String {
@@ -42,33 +46,68 @@ enum JobDisplayName {
         guard collisions.count > 1 else {
             return candidate
         }
-        if Set(collisions.map(\.label)).count == collisions.count {
-            return job.label
+
+        let variantDisplay = "\(candidate) — \(variantName(for: job))"
+        let variantCollisions = collisions.filter {
+            "\(candidate) — \(variantName(for: $0))" == variantDisplay
         }
-        let locationDisplay = "\(job.label) — \(locationName(for: job))"
-        let locationCollisions = collisions.filter {
-            "\($0.label) — \(locationName(for: $0))" == locationDisplay
+        guard variantCollisions.count > 1 else {
+            return variantDisplay
+        }
+
+        let locationDisplay = "\(candidate) — \(locationName(for: job))"
+        let locationCollisions = variantCollisions.filter {
+            "\(candidate) — \(locationName(for: $0))" == locationDisplay
         }
         guard locationCollisions.count > 1 else {
             return locationDisplay
         }
+
         let plistName = job.configPath.map {
-            URL(fileURLWithPath: $0).lastPathComponent
+            URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent
         } ?? job.source.rawValue
         let pathDisplay = "\(locationDisplay) · \(plistName)"
         let pathCollisions = locationCollisions.filter {
             let otherName = $0.configPath.map {
-                URL(fileURLWithPath: $0).lastPathComponent
+                URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent
             } ?? $0.source.rawValue
-            return "\($0.label) — \(locationName(for: $0)) · \(otherName)" == pathDisplay
+            return "\(locationDisplay) · \(otherName)" == pathDisplay
         }
         guard pathCollisions.count > 1 else {
             return pathDisplay
         }
+
         let shortID = job.id.split(separator: "#").last.map {
             String($0.prefix(6))
         } ?? String(job.id.suffix(6))
         return "\(pathDisplay) · \(shortID)"
+    }
+
+    private static func humanized(_ value: String) -> String? {
+        let words = value.split(whereSeparator: { $0 == "-" || $0 == "_" })
+        guard words.count >= 2,
+              words.allSatisfy({ word in
+                  !word.isEmpty && word.allSatisfy { $0.isLetter || $0.isNumber }
+              })
+        else {
+            return nil
+        }
+        let joined = words.map(String.init).joined(separator: " ")
+        return joined.prefix(1).uppercased() + joined.dropFirst()
+    }
+
+    private static func variantName(for job: Job) -> String {
+        if job.managed || job.provenance == .ticker {
+            return "Ticker"
+        }
+        switch job.source {
+        case .launchd:
+            return "Launchd"
+        case .crontab:
+            return "Cron"
+        case .claudeRoutine:
+            return "Claude"
+        }
     }
 
     private static func locationName(for job: Job) -> String {
@@ -193,13 +232,13 @@ enum JobRunHistoryPresentation {
     ) -> (symbolName: String, statusText: String) {
         switch outcome {
         case .success:
-            return ("checkmark.circle.fill", "Succeeded")
+            return ("checkmark", "Succeeded")
         case .failure:
-            return ("xmark.square.fill", "Failed")
+            return ("xmark", "Failed")
         case .running:
-            return ("clock.fill", "Running")
+            return ("ellipsis", "Running")
         case .unknown:
-            return ("questionmark.diamond.fill", "Unknown result")
+            return ("questionmark", "Unknown result")
         }
     }
 }
@@ -234,6 +273,14 @@ struct JobListView: View {
 
     private var allYourJobs: [Job] {
         model.jobs.filter { $0.provenance.isYours }
+    }
+
+    private var attentionYourJobs: [Job] {
+        yourJobs.filter(model.needsAttention)
+    }
+
+    private var remainingYourJobs: [Job] {
+        yourJobs.filter { !model.needsAttention($0) }
     }
 
     private var otherJobs: [Job] {
@@ -298,7 +345,7 @@ struct JobListView: View {
                 sidebar
             }
         }
-        .frame(width: 298, height: 529)
+        .frame(width: TickerPopoverLayout.width, height: 529)
         .onReceive(model.$jobs) { jobs in
             navigationState.reconcileJobs(
                 visibleJobs(in: jobs).map(\.id)
@@ -323,22 +370,40 @@ struct JobListView: View {
                 if model.jobs.isEmpty {
                     emptyState
                 } else {
-                    Section("My Jobs") {
-                        if yourJobs.isEmpty, isSearching {
-                            Text("No matching jobs")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                    if !attentionYourJobs.isEmpty {
+                        Section {
+                            jobRows(attentionYourJobs, namingContext: yourJobs)
+                        } header: {
+                            listSectionHeader(
+                                "Needs Attention",
+                                count: attentionYourJobs.count,
+                                color: .red
+                            )
                         }
-                        jobRows(yourJobs)
+                    }
+
+                    if !remainingYourJobs.isEmpty || (yourJobs.isEmpty && isSearching) {
+                        Section {
+                            if yourJobs.isEmpty, isSearching {
+                                Text("No matching jobs")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            jobRows(remainingYourJobs, namingContext: yourJobs)
+                        } header: {
+                            listSectionHeader("My Jobs", count: remainingYourJobs.count)
+                        }
                     }
 
                     if !unattributedJobs.isEmpty {
-                        Section("Needs Review") {
+                        Section {
                             jobRows(unattributedJobs)
+                        } header: {
+                            listSectionHeader("Needs Review", count: unattributedJobs.count)
                         }
                     }
 
-                    if !allOtherJobs.isEmpty {
+                    if !allOtherJobs.isEmpty && (!isSearching || !otherJobs.isEmpty) {
                         DisclosureGroup(isExpanded: otherExpansion) {
                             provenanceSubgroups
                         } label: {
@@ -412,10 +477,10 @@ struct JobListView: View {
         if !appJobs.isEmpty {
             DisclosureGroup(isExpanded: subgroupExpansion($appsExpanded, hasMatches: !appJobs.isEmpty)) {
                 ForEach(appOwnerNames, id: \.self) { owner in
-                    Text(owner)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    jobRows(appJobs.filter { $0.provenance.displayName == owner })
+                    let ownerJobs = appJobs.filter { $0.provenance.displayName == owner }
+                    subgroupHeader(owner, count: ownerJobs.count)
+                        .padding(.leading, 6)
+                    jobRows(ownerJobs)
                 }
             } label: {
                 subgroupHeader("Apps", count: appJobs.count)
@@ -446,11 +511,15 @@ struct JobListView: View {
         }
     }
 
-    private func jobRows(_ jobs: [Job]) -> some View {
-        ForEach(jobs) { job in
+    private func jobRows(
+        _ jobs: [Job],
+        namingContext: [Job]? = nil
+    ) -> some View {
+        let allNames = namingContext ?? jobs
+        return ForEach(jobs) { job in
             JobRow(
                 job: job,
-                displayName: JobDisplayName.disambiguated(for: job, among: jobs),
+                displayName: JobDisplayName.disambiguated(for: job, among: allNames),
                 outcome: model.outcome(for: job),
                 skipStorm: model.skipStorm(for: job),
                 wrapperNeedsAttention: model.wrapperNeedsAttention(job),
@@ -486,18 +555,42 @@ struct JobListView: View {
     }
 
     private var otherJobsHeader: some View {
-        let issueCount = allOtherJobs.filter(model.needsAttention).count
+        let visibleJobs = isSearching ? otherJobs : allOtherJobs
+        let issueCount = visibleJobs.filter(model.needsAttention).count
         return HStack {
             Text("Other Jobs")
-            Text("\(allOtherJobs.count)")
+                .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
+            Text("\(visibleJobs.count)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
             Spacer()
             if issueCount > 0 {
-                Label("\(issueCount) \(issueCount == 1 ? "issue" : "issues")", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
+                Label(
+                    "\(issueCount) \(issueCount == 1 ? "issue" : "issues")",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
             }
         }
+    }
+
+    private func listSectionHeader(
+        _ title: String,
+        count: Int,
+        color: Color = .secondary
+    ) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(color)
+            Text("\(count)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+            Spacer()
+        }
+        .textCase(nil)
     }
 
     private func subgroupHeader(_ title: String, count: Int) -> some View {
@@ -511,8 +604,14 @@ struct JobListView: View {
     }
 
     private var yourSummary: String {
+        let jobCount = allYourJobs.count
+        let jobNoun = jobCount == 1 ? "job" : "jobs"
         let issueCount = allYourJobs.filter(model.needsAttention).count
-        return "\(issueCount) of your \(allYourJobs.count) jobs \(issueCount == 1 ? "needs" : "need") attention"
+        if issueCount == 0 {
+            return "\(jobCount) \(jobNoun) monitored"
+        }
+        let attentionVerb = issueCount == 1 ? "needs" : "need"
+        return "\(issueCount) \(attentionVerb) attention · \(jobCount) \(jobNoun) monitored"
     }
 
     private var refreshStatus: String {
@@ -662,32 +761,29 @@ private struct JobRow: View {
     let onSelectRun: (JobRunSelection) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(alignment: .center, spacing: 5) {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .center, spacing: 6) {
                 Text(displayName)
-                    .font(.body)
+                    .font(.callout.weight(.medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Spacer(minLength: 4)
+                    .layoutPriority(1)
+                Spacer(minLength: 6)
                 status
                     .fixedSize(horizontal: true, vertical: true)
                 rowMenu
             }
-            HStack(spacing: 4) {
+            HStack(spacing: 6) {
                 Text(job.schedule.humanDescription)
                     .lineLimit(1)
-                    .layoutPriority(1)
-                if let nextFire = JobNextFirePresentation.relativeText(
-                    for: job.schedule,
-                    nextFire: job.nextFireAt
-                ) {
-                    Text("· next \(nextFire)")
+                    .truncationMode(.tail)
+                    .layoutPriority(0)
+                    .help(job.schedule.humanDescription)
+                Spacer(minLength: 4)
+                if let nextFireText {
+                    Text(nextFireText)
                         .lineLimit(1)
-                }
-                Spacer(minLength: 3)
-                if let evidenceText {
-                    Text(evidenceText)
-                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
                 RecentRunHistoryView(
                     jobID: job.id,
@@ -699,8 +795,8 @@ private struct JobRow: View {
             .font(.caption)
             .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 5)
         .contentShape(Rectangle())
         .help(job.label)
     }
@@ -755,37 +851,21 @@ private struct JobRow: View {
                 color: .orange
             )
         } else if !job.enabled {
-            Label("Disabled", systemImage: "pause.circle")
-                .font(.caption)
+            Image(systemName: "pause.circle")
                 .foregroundStyle(.secondary)
+                .frame(width: 18, height: 18)
+                .help("Disabled")
+                .accessibilityLabel("Disabled")
         } else {
             QuietStatus(outcome: outcome)
         }
     }
 
-    private var evidenceText: String? {
-        switch outcome {
-        case .running:
-            return "Running now"
-        case .success:
-            return relativeEvidence(prefix: "Last succeeded")
-        case .failure:
-            return relativeEvidence(prefix: "Last failed")
-        case .unknown:
-            if let lastRunAt = job.lastRunAt {
-                return relativeEvidence(prefix: "Last observed", date: lastRunAt)
-            }
-            return job.attention == nil ? nil : "No run evidence"
-        }
-    }
-
-    private func relativeEvidence(prefix: String, date: Date? = nil) -> String {
-        guard let observedAt = date ?? job.nativeStatusObservedAt ?? job.lastRunAt else {
-            return prefix
-        }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return "\(prefix) \(formatter.localizedString(for: observedAt, relativeTo: Date()))"
+    private var nextFireText: String? {
+        JobNextFirePresentation.relativeText(
+            for: job.schedule,
+            nextFire: job.nextFireAt
+        )
     }
 }
 
@@ -796,12 +876,13 @@ private struct RecentRunHistoryView: View {
     let onSelect: (JobRunSelection) -> Void
 
     var body: some View {
-        HStack(spacing: 0) {
+        HStack(spacing: 1) {
             content
         }
         .fixedSize()
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Recent run history")
+        .help("Recent runs. Click a result to open details.")
     }
 
     @ViewBuilder
@@ -809,27 +890,28 @@ private struct RecentRunHistoryView: View {
         switch loadState {
         case .idle:
             Image(systemName: "clock")
-                .frame(width: 20, height: 20)
+                .frame(width: 18, height: 18)
                 .accessibilityLabel("Run history not loaded")
                 .help("Run history not loaded")
         case .loading:
             ProgressView()
                 .controlSize(.mini)
-                .frame(width: 20, height: 20)
+                .frame(width: 18, height: 18)
                 .accessibilityLabel("Loading run history")
                 .help("Loading run history")
         case .failed(let message):
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
-                .frame(width: 20, height: 20)
+                .frame(width: 18, height: 18)
                 .accessibilityLabel("Run history failed to load: \(message)")
                 .help("Run history failed to load: \(message)")
         case .loaded:
             if cells.isEmpty {
-                Image(systemName: "minus")
-                    .frame(width: 20, height: 20)
-                    .accessibilityLabel("No recent runs")
-                    .help("No recent runs")
+                Text("No runs")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .help("No recorded runs")
+                    .accessibilityLabel("No recorded runs")
             } else {
                 ForEach(cells) { cell in
                     Button {
@@ -841,14 +923,19 @@ private struct RecentRunHistoryView: View {
                         )
                     } label: {
                         Image(systemName: cell.symbolName)
-                            .font(.system(size: 9, weight: .bold))
+                            .font(.system(size: 7, weight: .bold))
                             .symbolRenderingMode(.monochrome)
-                            .frame(width: 12, height: 12)
-                            .frame(width: 20, height: 20)
+                            .foregroundStyle(color(for: cell.outcome))
+                            .frame(width: 14, height: 14)
+                            .background(
+                                color(for: cell.outcome).opacity(0.16),
+                                in: Circle()
+                            )
+                            .frame(width: 18, height: 18)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(color(for: cell.outcome))
+                    .buttonStyle(.borderless)
+                    .controlSize(.mini)
                     .help(cell.accessibilityLabel)
                     .accessibilityLabel(cell.accessibilityLabel)
                 }
@@ -878,10 +965,15 @@ private struct AttentionBadge: View {
     var body: some View {
         Label(title, systemImage: icon)
             .font(.caption.weight(.semibold))
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: 120, alignment: .leading)
             .foregroundStyle(color)
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
             .background(color.opacity(0.1), in: Capsule())
+            .help(title)
+            .accessibilityLabel(title)
     }
 }
 
@@ -889,23 +981,25 @@ private struct QuietStatus: View {
     let outcome: Outcome
 
     var body: some View {
-        Group {
-            switch outcome {
-            case .running:
-                Label("Running", systemImage: "arrow.triangle.2.circlepath")
-                    .foregroundStyle(.blue)
-            case .success:
-                Label("Succeeded", systemImage: "checkmark.circle")
-                    .foregroundStyle(.secondary)
-            case .failure:
-                Label("Failed", systemImage: "xmark.circle.fill")
-                    .foregroundStyle(.red)
-            case .unknown:
-                Label("No run evidence", systemImage: "questionmark.circle")
-                    .foregroundStyle(.secondary)
-            }
+        Image(systemName: presentation.icon)
+            .font(.caption.weight(.medium))
+            .foregroundStyle(presentation.color)
+            .frame(width: 18, height: 18)
+            .help(presentation.label)
+            .accessibilityLabel(presentation.label)
+    }
+
+    private var presentation: (icon: String, label: String, color: Color) {
+        switch outcome {
+        case .running:
+            return ("arrow.triangle.2.circlepath", "Running", .blue)
+        case .success:
+            return ("checkmark.circle.fill", "Succeeded", .green)
+        case .failure:
+            return ("xmark.circle.fill", "Failed", .red)
+        case .unknown:
+            return ("questionmark.circle", "No run evidence", .secondary)
         }
-        .font(.caption)
     }
 }
 

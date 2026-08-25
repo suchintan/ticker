@@ -20,12 +20,12 @@ struct TickerMenuBarApp: App {
             if let model = bootstrap.model {
                 MenuBarStatusIcon(model: model)
             } else if bootstrap.errorMessage != nil {
-                Image(systemName: "exclamationmark.triangle.fill")
+                Image(systemName: "stopwatch.fill")
                     .symbolRenderingMode(.monochrome)
                     .foregroundColor(.red)
                     .accessibilityLabel("Ticker could not start")
             } else {
-                Image(systemName: "clock.badge.questionmark")
+                Image(systemName: "stopwatch")
                     .accessibilityLabel("Ticker is starting")
             }
         }
@@ -38,15 +38,15 @@ private struct MenuBarStatusIcon: View {
 
     var body: some View {
         if model.jobs.isEmpty {
-            Image(systemName: "clock.badge.questionmark")
+            Image(systemName: "stopwatch")
                 .accessibilityLabel("Ticker found no scheduled jobs")
         } else if model.hasUrgentAttentionOwnedJobs {
-            Image(systemName: "exclamationmark.triangle.fill")
+            Image(systemName: "stopwatch.fill")
                 .symbolRenderingMode(.monochrome)
                 .foregroundColor(.red)
                 .accessibilityLabel("Ticker found a job that needs attention")
         } else {
-            Image(systemName: "clock")
+            Image(systemName: "stopwatch")
                 .accessibilityLabel("Your Ticker jobs have no known issues")
         }
     }
@@ -59,7 +59,7 @@ private struct BootstrapLoadingView: View {
             Text("Opening run history…")
                 .foregroundColor(.secondary)
         }
-        .frame(width: 360, height: 180)
+        .frame(width: TickerPopoverLayout.width, height: 180)
     }
 }
 
@@ -81,6 +81,6 @@ private struct BootstrapErrorView: View {
             }
         }
         .padding(18)
-        .frame(width: 400)
+        .frame(width: TickerPopoverLayout.width)
     }
 }
