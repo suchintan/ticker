@@ -219,6 +219,26 @@ private struct InterruptedRecord: Encodable {
     }
 }
 
+private struct RecoveryPolicyRecord: Encodable {
+    let jobID: String
+    let policy: RecoveryPolicy
+}
+
+private struct RecoveryRecord: Encodable {
+    let runID: Int64
+    let jobID: String
+    let status: String
+    let policy: RecoveryPolicy?
+    let dateKey: String?
+    let exitCode: Int32?
+    let claimID: String?
+    let message: String?
+}
+
+private struct RecoveryChildResult {
+    let terminationStatus: Int32?
+    let launchError: String?
+}
 private final class TailBuffer {
     private let capacity: Int
     private let lock = NSLock()
@@ -415,12 +435,22 @@ private struct TickerCLI {
             try doctor(arguments: remaining)
         case "login-item":
             try loginItem(arguments: remaining)
+        case "recovery-policy":
+            try recoveryPolicy(arguments: remaining)
+        case "recovery-agent":
+            try recoveryAgent(arguments: remaining)
+        case "recover":
+            try recover(arguments: remaining)
         default:
             throw CLIError.usage("Unknown command '\(command)'. Run 'ticker --help' for usage.")
         }
     }
 
     private func runChild(arguments: [String]) throws {
+        if arguments.first == "--recovery" {
+            try runRecoveryChild(arguments: Array(arguments.dropFirst()))
+            return
+        }
         guard let separator = arguments.firstIndex(of: "--") else {
             throw CLIError.usage("run requires '--' before the child command")
         }
@@ -606,6 +636,160 @@ private struct TickerCLI {
             currentDirectory: childWorkingDirectory
         )
     }
+    private func runRecoveryChild(arguments: [String]) throws {
+        guard let separator = arguments.firstIndex(of: "--") else {
+            throw CLIError.usage(
+                "recovery run requires --recovery-claim, --recovery-task, "
+                    + "--recovery-date, --label, and '--' before the child command"
+            )
+        }
+        let options = Array(arguments[..<separator])
+        let childArguments = Array(arguments[arguments.index(after: separator)...])
+        guard !childArguments.isEmpty else {
+            throw CLIError.usage("recovery run requires a child command after '--'")
+        }
+
+        var claimID: String?
+        var taskID: String?
+        var dateKey: String?
+        var jobID: String?
+        var originalArgv0: String?
+        var argv0Seen = false
+        var index = 0
+        while index < options.count {
+            let option = options[index]
+            guard index + 1 < options.count else {
+                throw CLIError.usage("recovery run option \(option) requires a value")
+            }
+            let value = options[index + 1]
+            guard !value.isEmpty else {
+                throw CLIError.usage("recovery run option \(option) requires a non-empty value")
+            }
+            switch option {
+            case "--recovery-claim":
+                guard claimID == nil else {
+                    throw CLIError.usage("--recovery-claim may be specified only once")
+                }
+                claimID = value
+            case "--recovery-task":
+                guard taskID == nil else {
+                    throw CLIError.usage("--recovery-task may be specified only once")
+                }
+                taskID = value
+            case "--recovery-date":
+                guard dateKey == nil else {
+                    throw CLIError.usage("--recovery-date may be specified only once")
+                }
+                dateKey = value
+            case "--label":
+                guard jobID == nil else {
+                    throw CLIError.usage("--label may be specified only once")
+                }
+                jobID = value
+            case "--argv0":
+                guard !argv0Seen else {
+                    throw CLIError.usage("--argv0 may be specified only once")
+                }
+                argv0Seen = true
+                originalArgv0 = value
+            default:
+                throw CLIError.usage(
+                    "recovery run does not accept \(option); wrapper and manual flags are forbidden"
+                )
+            }
+            index += 2
+        }
+
+        guard let claimID, let taskID, let dateKey, let jobID else {
+            throw CLIError.usage(
+                "recovery run requires exact --recovery-claim, --recovery-task, "
+                    + "--recovery-date, and --label options"
+            )
+        }
+
+        let store = try SQLiteRunStore(path: configuredStorePath())
+        let discovery = discoverJobs()
+        guard discovery.complete else {
+            throw CLIError.operation("recovery job discovery was incomplete; child was not executed")
+        }
+        let canonicalJobID = try store.canonicalJobID(jobID)
+        let matchingJobs = discovery.jobs.filter { job in
+            guard let candidate = try? store.canonicalJobID(job.id) else {
+                return false
+            }
+            return candidate == canonicalJobID
+        }
+        guard matchingJobs.count == 1, let job = matchingJobs.first, job.managed else {
+            throw CLIError.operation(
+                "recovery label \(jobID) does not resolve to exactly one current managed job"
+            )
+        }
+
+        guard let storedPolicy = try store.recoveryPolicy(jobID: canonicalJobID),
+              case .retryIdempotent(let storedTaskID, let timeZone) = storedPolicy,
+              storedTaskID == taskID else {
+            throw CLIError.operation(
+                "recovery policy for \(canonicalJobID) does not authorize task \(taskID)"
+            )
+        }
+        guard let claim = try store.recoveryAttempt(claimID: claimID),
+              claim.claimID == claimID,
+              claim.jobID == canonicalJobID,
+              claim.taskID == taskID,
+              claim.dateKey == dateKey,
+              claim.status == .claimed,
+              let interruptedRunID = claim.interruptedRunID else {
+            throw CLIError.operation("recovery claim is missing, forged, or no longer claimable")
+        }
+
+        let runs = try store.runs(jobID: canonicalJobID, limit: Int.max)
+        guard let interruptedRun = runs.first(where: { $0.id == interruptedRunID }),
+              interruptedRun.finishedAt == nil,
+              interruptedRun.observedOutcome(for: job) == .interrupted else {
+            throw CLIError.operation("recovery claim does not reference a current interrupted run")
+        }
+        let expectedDate = try RecoveryDate.key(
+            for: interruptedRun.startedAt,
+            timeZoneIdentifier: timeZone
+        )
+        guard expectedDate == dateKey else {
+            throw CLIError.operation("recovery date does not match the interrupted run")
+        }
+        guard childArguments == job.command + ["--recovery-date", expectedDate],
+              originalArgv0 == job.argv0 else {
+            throw CLIError.operation("recovery child command does not match the current job")
+        }
+
+        _ = try store.startRecoveryAttempt(
+            claimID: claimID,
+            jobID: canonicalJobID,
+            taskID: taskID,
+            dateKey: dateKey,
+            startedAt: Date()
+        )
+        let runID = try store.beginRun(
+            jobID: canonicalJobID,
+            startedAt: Date(),
+            trigger: .recovery,
+            context: RunStartContext(
+                processID: getpid(),
+                bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+                nativeExitStatusAtStart: nil,
+                launchdRunCountAtStart: nil
+            )
+        )
+        executeChild(
+            jobID: canonicalJobID,
+            arguments: childArguments,
+            originalArgv0: originalArgv0,
+            tailBytes: defaultTailBytes,
+            trigger: .recovery,
+            scheduledRun: (store, runID),
+            environment: SchedulerEnvironment.effectiveEnvironment(for: job),
+            currentDirectory: job.cwd
+        )
+    }
+
 
     private func executeChild(
         jobID: String,
@@ -959,6 +1143,415 @@ private struct TickerCLI {
         )
     }
 
+    private func recoveryPolicy(arguments: [String]) throws {
+        guard let requestedJobID = arguments.first, !requestedJobID.isEmpty,
+              !requestedJobID.hasPrefix("-") else {
+            throw CLIError.usage(
+                "recovery-policy requires <job-id> [alert-only|retry-idempotent ...]"
+            )
+        }
+        let tail = Array(arguments.dropFirst())
+        let json: Bool
+        let requestedPolicy: RecoveryPolicy?
+        switch tail.first {
+        case nil:
+            json = false
+            requestedPolicy = nil
+        case "--json":
+            guard tail.count == 1 else {
+                throw CLIError.usage("recovery-policy accepts only one trailing --json flag")
+            }
+            json = true
+            requestedPolicy = nil
+        case "alert-only":
+            guard tail.dropFirst().isEmpty || tail.dropFirst().elementsEqual(["--json"]) else {
+                throw CLIError.usage("alert-only accepts only the optional --json flag")
+            }
+            json = tail.count == 2
+            requestedPolicy = .alertOnly
+        case "retry-idempotent":
+            guard tail.count == 5 || tail.count == 6 else {
+                throw CLIError.usage(
+                    "retry-idempotent requires --task-id <id> --time-zone <iana> [--json]"
+                )
+            }
+            guard tail[1] == "--task-id", !tail[2].isEmpty,
+                  tail[3] == "--time-zone", !tail[4].isEmpty else {
+                throw CLIError.usage(
+                    "retry-idempotent requires --task-id <id> --time-zone <iana> [--json]"
+                )
+            }
+            if tail.count == 6, tail[5] != "--json" {
+                throw CLIError.usage("retry-idempotent accepts only the optional --json flag")
+            }
+            do {
+                requestedPolicy = try RecoveryPolicy(taskID: tail[2], timeZone: tail[4])
+            } catch {
+                throw CLIError.usage(error.localizedDescription)
+            }
+            json = tail.count == 6
+        default:
+            throw CLIError.usage(
+                "recovery-policy requires alert-only or retry-idempotent with its exact options"
+                )
+        }
+        let store = try SQLiteRunStore(path: configuredStorePath())
+        let canonicalJobID = try store.canonicalJobID(requestedJobID)
+        let policy: RecoveryPolicy
+        if let requestedPolicy {
+            do {
+                try store.setRecoveryPolicy(jobID: canonicalJobID, policy: requestedPolicy)
+            } catch let error as RecoveryStoreError {
+                throw CLIError.operation(error.localizedDescription)
+            }
+            policy = requestedPolicy
+        } else {
+            guard let currentPolicy = try store.recoveryPolicy(jobID: canonicalJobID) else {
+                throw CLIError.operation("Recovery policy requires managed job \(canonicalJobID).")
+            }
+            policy = currentPolicy
+        }
+
+        if json {
+            try printJSON(RecoveryPolicyRecord(jobID: canonicalJobID, policy: policy))
+            return
+        }
+        switch policy {
+        case .alertOnly:
+            print("\(canonicalJobID)\talert-only")
+        case .retryIdempotent(let taskID, let timeZone):
+            print("\(canonicalJobID)\tretry-idempotent\ttask=\(taskID)\ttime-zone=\(timeZone)")
+        }
+    }
+
+    private func recoveryAgent(arguments: [String]) throws {
+        guard arguments.count <= 1 else {
+            throw CLIError.usage("recovery-agent accepts no arguments or exactly one of status, enable, or disable")
+        }
+        let action = arguments.first ?? "status"
+        guard ["status", "enable", "disable"].contains(action) else {
+            throw CLIError.usage("recovery-agent accepts no arguments or exactly one of status, enable, or disable")
+        }
+        let controller = makeRecoveryAgentController()
+        let state: RecoveryAgentStatus
+        switch action {
+        case "enable":
+            state = controller.enable()
+        case "disable":
+            state = controller.disable()
+        default:
+            state = controller.status()
+        }
+        switch state {
+        case .enabled:
+            print("enabled")
+        case .disabled:
+            print("disabled")
+        case .failed(let reason):
+            print("failed: \(reason)")
+            throw CLIError.operation("could not change the recovery agent")
+        }
+    }
+
+    private func recover(arguments: [String]) throws {
+        let json = try parseJSONOnlyOption(arguments, command: "recover")
+        let store = try SQLiteRunStore(path: configuredStorePath())
+        let discovery = discoverJobs()
+        let unfinishedRuns = try store.unfinishedRuns().sorted {
+            if $0.id == $1.id { return $0.startedAt > $1.startedAt }
+            return $0.id > $1.id
+        }
+        var records: [RecoveryRecord] = []
+        records.reserveCapacity(unfinishedRuns.count)
+
+        func append(
+            run: Run,
+            jobID: String,
+            status: String,
+            policy: RecoveryPolicy? = nil,
+            dateKey: String? = nil,
+            exitCode: Int32? = nil,
+            claimID: String? = nil,
+            message: String? = nil
+        ) {
+            records.append(RecoveryRecord(
+                runID: run.id,
+                jobID: jobID,
+                status: status,
+                policy: policy,
+                dateKey: dateKey,
+                exitCode: exitCode,
+                claimID: claimID,
+                message: message
+            ))
+        }
+
+        guard discovery.complete else {
+            for run in unfinishedRuns {
+                append(
+                    run: run,
+                    jobID: run.jobID,
+                    status: "skipped",
+                    message: "current job discovery was incomplete"
+                )
+            }
+            return try finishRecoveryOutput(records: records, json: json)
+        }
+
+        var currentJobs: [String: Job] = [:]
+        var ambiguousJobIDs = Set<String>()
+        for job in discovery.jobs {
+            guard let canonicalJobID = try? store.canonicalJobID(job.id) else { continue }
+            if currentJobs[canonicalJobID] != nil {
+                currentJobs.removeValue(forKey: canonicalJobID)
+                ambiguousJobIDs.insert(canonicalJobID)
+            } else if !ambiguousJobIDs.contains(canonicalJobID) {
+                currentJobs[canonicalJobID] = job
+            }
+        }
+
+        for run in unfinishedRuns {
+            guard let canonicalJobID = try? store.canonicalJobID(run.jobID) else {
+                append(
+                    run: run,
+                    jobID: run.jobID,
+                    status: "skipped",
+                    message: "run job identity could not be canonicalized"
+                )
+                continue
+            }
+            guard !ambiguousJobIDs.contains(canonicalJobID),
+                  let currentJob = currentJobs[canonicalJobID],
+                  currentJob.managed else {
+                append(
+                    run: run,
+                    jobID: canonicalJobID,
+                    status: "skipped",
+                    message: "run does not resolve to exactly one current managed job"
+                )
+                continue
+            }
+            guard run.observedOutcome(for: currentJob) == .interrupted else {
+                continue
+            }
+
+            let policy: RecoveryPolicy
+            do {
+                guard let storedPolicy = try store.recoveryPolicy(jobID: canonicalJobID) else {
+                    append(
+                        run: run,
+                        jobID: canonicalJobID,
+                        status: "skipped",
+                        message: "managed recovery policy is missing"
+                    )
+                    continue
+                }
+                policy = storedPolicy
+            } catch {
+                append(
+                    run: run,
+                    jobID: canonicalJobID,
+                    status: "skipped",
+                    message: "managed recovery policy is malformed"
+                )
+                continue
+            }
+
+            switch policy {
+            case .alertOnly:
+                append(
+                    run: run,
+                    jobID: canonicalJobID,
+                    status: "reported",
+                    policy: policy,
+                    message: "alert-only policy does not launch recovery"
+                )
+                continue
+            case .retryIdempotent(let taskID, let timeZone):
+                let dateKey: String
+                do {
+                    dateKey = try RecoveryDate.key(
+                        for: run.startedAt,
+                        timeZoneIdentifier: timeZone
+                    )
+                } catch {
+                    append(
+                        run: run,
+                        jobID: canonicalJobID,
+                        status: "skipped",
+                        policy: policy,
+                        message: "recovery date could not be derived"
+                    )
+                    continue
+                }
+
+                guard let claim = try store.claimRecoveryAttempt(
+                    jobID: canonicalJobID,
+                    taskID: taskID,
+                    dateKey: dateKey,
+                    interruptedRunID: run.id,
+                    claimedAt: Date()
+                ) else {
+                    append(
+                        run: run,
+                        jobID: canonicalJobID,
+                        status: "duplicate",
+                        policy: policy,
+                        dateKey: dateKey,
+                        message: "recovery attempt was already claimed"
+                    )
+                    continue
+                }
+
+                var invocation = [
+                    "run",
+                    "--recovery",
+                    "--recovery-claim", claim.claimID,
+                    "--recovery-task", taskID,
+                    "--recovery-date", dateKey,
+                    "--label", canonicalJobID,
+                ]
+                if let argv0 = currentJob.argv0 {
+                    invocation.append(contentsOf: ["--argv0", argv0])
+                }
+                invocation.append("--")
+                invocation.append(contentsOf: currentJob.command)
+                invocation.append(contentsOf: ["--recovery-date", dateKey])
+
+                let child = launchRecoveryChild(arguments: invocation)
+                guard let terminationStatus = child.terminationStatus else {
+                    append(
+                        run: run,
+                        jobID: canonicalJobID,
+                        status: "claimed",
+                        policy: policy,
+                        dateKey: dateKey,
+                        claimID: claim.claimID,
+                        message: child.launchError ?? "recovery child could not be launched"
+                    )
+                    continue
+                }
+
+                do {
+                    guard let currentAttempt = try store.recoveryAttempt(claimID: claim.claimID) else {
+                        append(
+                            run: run,
+                            jobID: canonicalJobID,
+                            status: "unknown",
+                            policy: policy,
+                            dateKey: dateKey,
+                            exitCode: terminationStatus,
+                            claimID: claim.claimID,
+                            message: "recovery attempt disappeared after child exit"
+                        )
+                        continue
+                    }
+                    guard currentAttempt.status == .running else {
+                        append(
+                            run: run,
+                            jobID: canonicalJobID,
+                            status: currentAttempt.status.rawValue,
+                            policy: policy,
+                            dateKey: dateKey,
+                            exitCode: terminationStatus,
+                            claimID: claim.claimID,
+                            message: "recovery child rejected the claim before execution"
+                        )
+                        continue
+                    }
+                    let terminalStatus: RecoveryAttemptStatus =
+                        terminationStatus == 0 ? .succeeded : .failed
+                    let terminal = try store.finishRecoveryAttempt(
+                        claimID: claim.claimID,
+                        jobID: canonicalJobID,
+                        taskID: taskID,
+                        dateKey: dateKey,
+                        status: terminalStatus,
+                        finishedAt: Date(),
+                        exitCode: terminationStatus
+                    )
+                    append(
+                        run: run,
+                        jobID: canonicalJobID,
+                        status: terminal.status.rawValue,
+                        policy: policy,
+                        dateKey: dateKey,
+                        exitCode: terminal.exitCode,
+                        claimID: claim.claimID
+                    )
+                } catch {
+                    append(
+                        run: run,
+                        jobID: canonicalJobID,
+                        status: "unknown",
+                        policy: policy,
+                        dateKey: dateKey,
+                        exitCode: terminationStatus,
+                        claimID: claim.claimID,
+                        message: "recovery attempt terminal transition failed"
+                    )
+                }
+            }
+        }
+        try finishRecoveryOutput(records: records, json: json)
+    }
+
+    private func finishRecoveryOutput(records: [RecoveryRecord], json: Bool) throws {
+        if json {
+            try printJSON(records)
+            return
+        }
+        printTable(
+            headers: ["RUN", "JOB", "STATUS", "DATE", "EXIT", "MESSAGE"],
+            rows: records.map {
+                [
+                    String($0.runID),
+                    $0.jobID,
+                    $0.status,
+                    $0.dateKey ?? "—",
+                    $0.exitCode.map(String.init) ?? "—",
+                    $0.message ?? "—",
+                ]
+            }
+        )
+    }
+
+    private func launchRecoveryChild(arguments: [String]) -> RecoveryChildResult {
+        let process = Process()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: runningExecutablePath())
+        process.arguments = arguments
+        process.environment = ProcessInfo.processInfo.environment
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        do {
+            try process.run()
+        } catch {
+            return RecoveryChildResult(
+                terminationStatus: nil,
+                launchError: "recovery child launch failed"
+            )
+        }
+        let outputGroup = DispatchGroup()
+        outputGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            _ = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            outputGroup.leave()
+        }
+        outputGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            _ = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            outputGroup.leave()
+        }
+        process.waitUntilExit()
+        _ = outputGroup.wait(timeout: .now() + postExitDrainTimeout)
+        return RecoveryChildResult(
+            terminationStatus: process.terminationStatus,
+            launchError: nil
+        )
+    }
+
     private func wrap(arguments: [String]) throws {
         guard arguments.count == 1 else {
             throw CLIError.usage("wrap requires exactly one <job-id>")
@@ -1041,8 +1634,67 @@ private struct TickerCLI {
         for error in discovery.errors {
             writeStandardError("ticker: discovery warning: \(error.localizedDescription)\n")
         }
-        return (discovery.jobs, discovery.errors.isEmpty)
+        #if TICKER_TESTING
+        let jobs = discovery.jobs.map(testingRuntimeJob)
+        #else
+        let jobs = discovery.jobs
+        #endif
+        return (jobs, discovery.errors.isEmpty)
     }
+
+    #if TICKER_TESTING
+    private func testingRuntimeJob(_ job: Job) -> Job {
+        guard job.source == .launchd,
+              let domain = job.launchdDomain else {
+            return job
+        }
+        let target = domain == .userAgent
+            ? "gui/\(geteuid())/\(job.label)"
+            : "system/\(job.label)"
+        let result = runRecoveryLaunchctl(["print", target])
+        guard result.status == 0 else {
+            return job
+        }
+        let snapshot = LaunchdRuntimeSnapshot.parse(result.stdout)
+        let attribution: RuntimeStatusAttribution?
+        if snapshot.lastExitStatus != nil {
+            attribution = .resolved
+        } else if snapshot.processID != nil || snapshot.runCount != nil {
+            attribution = .recordWithoutExit
+        } else {
+            attribution = job.runtimeStatusAttribution
+        }
+        return Job(
+            id: job.id,
+            source: job.source,
+            provenance: job.provenance,
+            attention: job.attention,
+            label: job.label,
+            schedule: job.schedule,
+            command: job.command,
+            argv0: job.argv0,
+            environment: job.environment,
+            cwd: job.cwd,
+            enabled: job.enabled,
+            launchdDomain: job.launchdDomain,
+            launchdUserName: job.launchdUserName,
+            launchdGroupName: job.launchdGroupName,
+            runNowUnavailableReason: job.runNowUnavailableReason,
+            runtimeStatusAttribution: attribution,
+            configPath: job.configPath,
+            lastKnownExit: snapshot.lastExitStatus ?? job.lastKnownExit,
+            nativeStatusObservedAt: snapshot.lastExitStatus == nil
+                ? job.nativeStatusObservedAt
+                : Date(),
+            launchdProcessID: snapshot.processID ?? job.launchdProcessID,
+            launchdRunCount: snapshot.runCount ?? job.launchdRunCount,
+            lastRunAt: job.lastRunAt,
+            lastScheduledFor: job.lastScheduledFor,
+            managed: job.managed
+        )
+    }
+    #endif
+
 
     private func jobsByCanonicalID(
         _ jobs: [Job],
@@ -1107,12 +1759,19 @@ private struct TickerCLI {
           ticker list [--json]
           ticker history <job-id> [--limit N] [--json]
           ticker interrupted [--json]
+          ticker recovery-policy <job-id> [--json]
+          ticker recovery-policy <job-id> alert-only [--json]
+          ticker recovery-policy <job-id> retry-idempotent --task-id <id> --time-zone <iana> [--json]
+          ticker recovery-agent [status|enable|disable]
+          ticker recover [--json]
           ticker wrap <job-id>
           ticker unwrap <job-id>
           ticker doctor [--clear-stale <job-id>]
           ticker --help
           ticker --version
 
+        Recovery runs are internal and require an exact recovery claim, task,
+        date, label, and discovered child command.
         --manual records a Run Now invocation without changing scheduled health.
         --argv0 preserves a launchd job's original process name when it differs
         from the executable. --tail-bytes is clamped to 1,048,576 bytes.
@@ -1504,6 +2163,48 @@ do {
 } catch {
     writeStandardError("ticker: \(error.localizedDescription)\n")
     Darwin.exit(1)
+}
+
+private func runRecoveryLaunchctl(_ arguments: [String]) -> LoginItemCommandResult {
+    let process = Process()
+    let stdoutPipe = Pipe()
+    let stderrPipe = Pipe()
+    process.executableURL = scheduledLaunchctlURL()
+    process.arguments = arguments
+    process.standardOutput = stdoutPipe
+    process.standardError = stderrPipe
+    do {
+        try process.run()
+    } catch {
+        return LoginItemCommandResult(status: -1, stderr: "launchctl could not be started")
+    }
+    let stdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+    let stderr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return LoginItemCommandResult(
+        status: process.terminationStatus,
+        stdout: String(decoding: stdout, as: UTF8.self),
+        stderr: String(decoding: stderr, as: UTF8.self)
+    )
+}
+
+private func makeRecoveryAgentController() -> RecoveryAgentController {
+    #if TICKER_TESTING
+    let environment = ProcessInfo.processInfo.environment
+    let testHome = environment["TICKER_TEST_RECOVERY_AGENT_HOME"]
+        ?? environment["TICKER_TEST_LOGIN_ITEM_HOME"]
+    let testUID = environment["TICKER_TEST_RECOVERY_AGENT_UID"]
+        .flatMap(UInt32.init)
+        ?? getuid()
+    if let testHome, !testHome.isEmpty {
+        return RecoveryAgentController(
+            homeDirectory: URL(fileURLWithPath: testHome, isDirectory: true),
+            uid: testUID,
+            launchctl: { runRecoveryLaunchctl($0) }
+        )
+    }
+    #endif
+    return RecoveryAgentController()
 }
 
 /// `ticker login-item [status|enable|disable]`

@@ -9,6 +9,201 @@ public enum JobSource: String, Codable, CaseIterable {
 public enum RunTrigger: String, Codable, Hashable {
     case scheduled
     case manual
+    case recovery
+}
+
+public struct RecoveryPolicyValidationError: Error, LocalizedError, Equatable {
+    public let message: String
+
+    public init(message: String) {
+        self.message = message
+    }
+
+    public var errorDescription: String? { message }
+}
+
+/// The contract that permits an interrupted managed job to run again.
+///
+/// A missing policy is never interpreted as permission to retry. Callers must
+/// persist and validate the explicit `retryIdempotent` contract first.
+public enum RecoveryPolicy: Codable, Hashable {
+    case alertOnly
+    case retryIdempotent(taskID: String, timeZone: String)
+
+    public init(taskID: String, timeZone: String) throws {
+        guard Self.isValidTaskID(taskID) else {
+            throw RecoveryPolicyValidationError(message: "recovery task ID is empty or invalid")
+        }
+        guard Self.isValidTimeZoneIdentifier(timeZone) else {
+            throw RecoveryPolicyValidationError(
+                message: "recovery time zone is not a valid IANA identifier"
+            )
+        }
+        self = .retryIdempotent(taskID: taskID, timeZone: timeZone)
+    }
+
+    public static func isValidTaskID(_ value: String) -> Bool {
+        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && value.unicodeScalars.allSatisfy {
+                !CharacterSet.controlCharacters.contains($0)
+            }
+    }
+
+    public static func isValidTimeZoneIdentifier(_ value: String) -> Bool {
+        !value.isEmpty
+            && value.unicodeScalars.allSatisfy {
+                !CharacterSet.controlCharacters.contains($0)
+            }
+            && TimeZone.knownTimeZoneIdentifiers.contains(value)
+            && TimeZone(identifier: value) != nil
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case taskID
+        case timeZone
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try container.decode(String.self, forKey: .kind)
+        switch kind {
+        case "alertOnly":
+            guard Set(container.allKeys) == Set([.kind]) else {
+                throw RecoveryPolicyValidationError(
+                    message: "alert-only recovery policy contains unsupported fields"
+                )
+            }
+            self = .alertOnly
+        case "retryIdempotent":
+            guard Set(container.allKeys) == Set([.kind, .taskID, .timeZone]) else {
+                throw RecoveryPolicyValidationError(
+                    message: "retry recovery policy must contain only its contract fields"
+                )
+            }
+            let taskID = try container.decode(String.self, forKey: .taskID)
+            let timeZone = try container.decode(String.self, forKey: .timeZone)
+            self = try RecoveryPolicy(taskID: taskID, timeZone: timeZone)
+        default:
+            throw RecoveryPolicyValidationError(message: "unknown recovery policy kind '\(kind)'")
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .alertOnly:
+            try container.encode("alertOnly", forKey: .kind)
+        case .retryIdempotent(let taskID, let timeZone):
+            guard Self.isValidTaskID(taskID), Self.isValidTimeZoneIdentifier(timeZone) else {
+                throw RecoveryPolicyValidationError(message: "recovery policy contract is invalid")
+            }
+            try container.encode("retryIdempotent", forKey: .kind)
+            try container.encode(taskID, forKey: .taskID)
+            try container.encode(timeZone, forKey: .timeZone)
+        }
+    }
+}
+
+public enum RecoveryDate {
+    public static func key(for date: Date, timeZoneIdentifier: String) throws -> String {
+        guard RecoveryPolicy.isValidTimeZoneIdentifier(timeZoneIdentifier),
+              let timeZone = TimeZone(identifier: timeZoneIdentifier) else {
+            throw RecoveryPolicyValidationError(
+                message: "recovery time zone is not a valid IANA identifier"
+            )
+        }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = Locale(identifier: "en_US_POSIX")
+        calendar.timeZone = timeZone
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        guard let year = components.year, let month = components.month, let day = components.day
+        else {
+            throw RecoveryPolicyValidationError(message: "recovery date could not be represented")
+        }
+        return String(format: "%04d-%02d-%02d", year, month, day)
+    }
+}
+
+public enum RecoveryAttemptStatus: String, Codable, Hashable {
+    case claimed
+    case running
+    case succeeded
+    case failed
+
+    public var isTerminal: Bool {
+        switch self {
+        case .succeeded, .failed:
+            return true
+        case .claimed, .running:
+            return false
+        }
+    }
+}
+
+public struct RecoveryAttempt: Identifiable, Codable, Hashable {
+    public let claimID: String
+    public var id: String { claimID }
+    public let jobID: String
+    public let taskID: String
+    public let dateKey: String
+    public let interruptedRunID: Int64?
+    public let status: RecoveryAttemptStatus
+    public let claimedAt: Date
+    public let startedAt: Date?
+    public let finishedAt: Date?
+    public let exitCode: Int32?
+
+    public init(
+        claimID: String,
+        jobID: String,
+        taskID: String,
+        dateKey: String,
+        interruptedRunID: Int64?,
+        status: RecoveryAttemptStatus,
+        claimedAt: Date,
+        startedAt: Date?,
+        finishedAt: Date?,
+        exitCode: Int32?
+    ) {
+        self.claimID = claimID
+        self.jobID = jobID
+        self.taskID = taskID
+        self.dateKey = dateKey
+        self.interruptedRunID = interruptedRunID
+        self.status = status
+        self.claimedAt = claimedAt
+        self.startedAt = startedAt
+        self.finishedAt = finishedAt
+        self.exitCode = exitCode
+    }
+}
+
+public enum RecoveryStoreError: Error, LocalizedError, Equatable {
+    case nonManagedJob(String)
+    case malformedPolicy(String)
+    case invalidIdentifier(String)
+    case mismatchedAttemptIdentity
+    case invalidAttemptTransition(from: RecoveryAttemptStatus, to: RecoveryAttemptStatus)
+    case terminalStatusRequired
+
+    public var errorDescription: String? {
+        switch self {
+        case .nonManagedJob(let jobID):
+            return "Recovery policy requires managed job \(jobID)."
+        case .malformedPolicy(let detail):
+            return "Stored recovery policy is malformed and recovery is disabled: \(detail)"
+        case .invalidIdentifier(let detail):
+            return "Recovery attempt identity is invalid: \(detail)"
+        case .mismatchedAttemptIdentity:
+            return "Recovery attempt claim identity does not match the stored claim."
+        case .invalidAttemptTransition(let from, let to):
+            return "Recovery attempt cannot transition from \(from.rawValue) to \(to.rawValue)."
+        case .terminalStatusRequired:
+            return "Recovery attempt transition requires succeeded or failed status."
+        }
+    }
 }
 
 public enum LaunchdDomain: String, Codable, Hashable {
@@ -315,6 +510,13 @@ public struct Run: Identifiable, Codable, Hashable {
         guard finishedAt == nil else {
             return recordedOutcome
         }
+
+        // Manual and recovery launches have no reliable launchd run-count
+        // snapshot. Their PID/boot evidence is the only corroboration.
+        guard trigger == .scheduled else {
+            return recordedOutcome
+        }
+
         guard let job else {
             return jobID.hasPrefix("launchd:") ? .unknown : recordedOutcome
         }
@@ -458,6 +660,33 @@ public protocol RunStore: AnyObject {
     func migrateJobIdentity(from oldJobID: String, to newJobID: String) throws
     func canonicalJobID(_ jobID: String) throws -> String
     func managedJobIDs() throws -> Set<String>
+    func recoveryPolicy(jobID: String) throws -> RecoveryPolicy?
+    func setRecoveryPolicy(jobID: String, policy: RecoveryPolicy) throws
+    func claimRecoveryAttempt(
+        claimID: String,
+        jobID: String,
+        taskID: String,
+        dateKey: String,
+        interruptedRunID: Int64?,
+        claimedAt: Date
+    ) throws -> RecoveryAttempt?
+    func recoveryAttempt(claimID: String) throws -> RecoveryAttempt?
+    func startRecoveryAttempt(
+        claimID: String,
+        jobID: String,
+        taskID: String,
+        dateKey: String,
+        startedAt: Date
+    ) throws -> RecoveryAttempt
+    func finishRecoveryAttempt(
+        claimID: String,
+        jobID: String,
+        taskID: String,
+        dateKey: String,
+        status: RecoveryAttemptStatus,
+        finishedAt: Date,
+        exitCode: Int32?
+    ) throws -> RecoveryAttempt
 }
 
 public extension RunStore {

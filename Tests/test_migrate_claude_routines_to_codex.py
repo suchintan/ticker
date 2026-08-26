@@ -232,6 +232,7 @@ class FakeCommandRunner:
         self.loaded: set[str] = set()
         self.wrapped: set[str] = set()
         self.authenticated_backups: set[str] = set()
+        self.recovery_policies: dict[str, str] = {}
         self.claude_pids: set[int] = {812}
         self.next_claude_pid = 900
         self.claude_relaunched = False
@@ -394,6 +395,17 @@ class FakeCommandRunner:
                     if os.path.lexists(routine.plist)
                 )
                 return cutover.CommandResult(0, output, "")
+            if command == "recovery-policy":
+                routine = self.routine_for_ticker_id(arguments[1])
+                if self.consume_failure("recovery-policy"):
+                    return cutover.CommandResult(5, "", "injected recovery policy failure")
+                if arguments[2:3] == ["alert-only"]:
+                    self.recovery_policies[routine.task_id] = "alert-only"
+                elif arguments[2:3] == ["retry-idempotent"]:
+                    self.recovery_policies[routine.task_id] = "retry-idempotent"
+                else:
+                    raise AssertionError(f"unexpected recovery policy: {arguments}")
+                return cutover.CommandResult(0, "", "")
             routine = self.routine_for_ticker_id(arguments[1])
             if command == "wrap":
                 if (
@@ -4552,6 +4564,126 @@ class TransactionTests(unittest.TestCase):
                     fixture.registry_document()["scheduledTasks"][0], original_unrelated
                 )
                 fixture.assert_claude_state(self)
+
+    def test_recovery_policies_are_configured_after_consistent_wrap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with CutoverFixture(Path(directory)) as fixture:
+                fixture.commands.claude_running = False
+                state = fixture.transaction().execute()
+                self.assertTrue(state.committed)
+                policy_events = [
+                    (index, event)
+                    for index, event in enumerate(fixture.commands.events)
+                    if event.startswith("ticker recovery-policy ")
+                ]
+                self.assertEqual(len(policy_events), len(fixture.routines))
+                first_policy_index = policy_events[0][0]
+                self.assertTrue(
+                    all(
+                        routine.task_id in fixture.commands.wrapped
+                        and fixture.commands.doctor_state(routine)
+                        == "wrapped-consistent"
+                        for routine in fixture.routines
+                    )
+                )
+                self.assertEqual(
+                    [event for _index, event in policy_events],
+                    [
+                        *[
+                            f"ticker recovery-policy {routine.ticker_id} alert-only"
+                            for routine in fixture.routines
+                            if routine.task_id != "daily-summary"
+                        ],
+                        (
+                            "ticker recovery-policy "
+                            f"{next(routine for routine in fixture.routines if routine.task_id == 'daily-summary').ticker_id} "
+                            "retry-idempotent --task-id daily-summary "
+                            "--time-zone America/New_York"
+                        ),
+                    ],
+                )
+                self.assertLess(
+                    max(
+                        index
+                        for index, event in enumerate(fixture.commands.events[:first_policy_index])
+                        if event.startswith("ticker doctor")
+                    ),
+                    first_policy_index,
+                )
+
+    def test_recovery_policy_failure_fails_closed_and_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with CutoverFixture(Path(directory)) as fixture:
+                fixture.commands.fail_once("recovery-policy")
+                with self.assertRaises(cutover.CutoverError):
+                    fixture.transaction().execute()
+                self.assertEqual(
+                    fixture.commands.recovery_policies,
+                    {routine.task_id: "alert-only" for routine in fixture.routines},
+                )
+                fixture.assert_claude_state(self)
+
+    def test_committed_refresh_reapplies_recovery_policies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with CutoverFixture(Path(directory)) as fixture:
+                fixture.prepare_state(
+                    plist_states=["wrapped"] * len(fixture.routines),
+                    loaded=len(fixture.routines),
+                    registry_enabled=False,
+                    marker_exact=True,
+                )
+                cutover.refresh_runtime_artifact(
+                    fixture.routines_tuple,
+                    command_runner=fixture.commands,
+                    clock=lambda: dt.datetime(
+                        2026,
+                        8,
+                        15,
+                        10,
+                        30,
+                        tzinfo=cutover.NEW_YORK,
+                    ),
+                )
+                self.assertEqual(
+                    fixture.commands.recovery_policies,
+                    {
+                        routine.task_id: (
+                            "retry-idempotent"
+                            if routine.task_id == "daily-summary"
+                            else "alert-only"
+                        )
+                        for routine in fixture.routines
+                    },
+                )
+
+    def test_preflight_and_unwrapped_rollback_do_not_configure_policies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with CutoverFixture(Path(directory)) as fixture:
+                fixture.commands.fail_once("doctor")
+                with self.assertRaises(cutover.CutoverError):
+                    fixture.transaction().execute()
+                self.assertFalse(
+                    any(
+                        event.startswith("ticker recovery-policy ")
+                        for event in fixture.commands.events
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with CutoverFixture(Path(directory)) as fixture:
+                fixture.prepare_state(
+                    plist_states=["absent"] * len(fixture.routines),
+                    loaded=0,
+                    registry_enabled=False,
+                    marker_exact=True,
+                )
+                fixture.transaction().rollback_committed()
+                self.assertFalse(
+                    any(
+                        event.startswith("ticker recovery-policy ")
+                        for event in fixture.commands.events
+                    )
+                )
 
     def test_success_marker_is_published_only_after_all_six_verify(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

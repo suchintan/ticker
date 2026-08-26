@@ -1019,10 +1019,38 @@ def _task_contract(task_id: str, binding: RuntimeBinding) -> Tuple[str, Path, Pa
     link = root / "SKILL.md"
     prompt = f"Use ${skill_name} at {root} {invocation}. Execute the canonical workflow once."
     return prompt, root, link
+def _recovery_prompt(prompt: str, task_id: str, run_date: str) -> str:
+    return (
+        f"{prompt} This is recovery for TASK_ID={task_id} and "
+        f"SCHEDULED_RUN_DATE_ET={run_date}. Before any side effect, "
+        "inspect/reconcile destination state keyed by both TASK_ID and "
+        "SCHEDULED_RUN_DATE_ET. If valid output already exists, validate it "
+        "and exit successfully without duplicate writes, messages, or posts; "
+        "otherwise execute the canonical workflow once."
+    )
+
 
 
 def _capture_run_date() -> str:
     return dt.datetime.now(tz=ZoneInfo(TRUSTED_TZ)).date().isoformat()
+
+
+def _parse_run_arguments(arguments: Sequence[str]) -> Tuple[str, str, Optional[str]]:
+    if len(arguments) == 2:
+        return arguments[0], arguments[1], None
+    if len(arguments) != 4 or arguments[2] != "--recovery-date":
+        raise ValueError(
+            "usage: run-codex-scheduled-task TASK_ID WORKING_DIRECTORY "
+            "[--recovery-date YYYY-MM-DD]"
+        )
+    raw_date = arguments[3]
+    try:
+        parsed = dt.date.fromisoformat(raw_date)
+    except (TypeError, ValueError) as error:
+        raise ValueError("recovery date must be a canonical YYYY-MM-DD date") from error
+    if parsed.isoformat() != raw_date:
+        raise ValueError("recovery date must be a canonical YYYY-MM-DD date")
+    return arguments[0], arguments[1], raw_date
 
 
 def _build_environment(
@@ -1033,6 +1061,8 @@ def _build_environment(
     run_date: str,
     dotenv: Mapping[str, str],
     inherited: Mapping[str, str],
+    *,
+    recovery_mode: bool = False,
 ) -> Dict[str, str]:
     child_environment: Dict[str, str] = {}
     aliases: Dict[str, str] = {}
@@ -1087,6 +1117,8 @@ def _build_environment(
         }
     )
     child_environment[f"CODEX_MANAGED_BY_{binding.codex_managed_by.upper()}"] = "1"
+    if recovery_mode:
+        child_environment["SCHEDULED_RECOVERY_MODE"] = "1"
     return child_environment
 
 
@@ -1776,9 +1808,11 @@ def _forwarded_child_status(
 
 
 def run(arguments: Sequence[str]) -> int:
-    if len(arguments) != 2:
-        return _error("usage: run-codex-scheduled-task TASK_ID WORKING_DIRECTORY", 64)
-    task_id, requested_repository = arguments
+    try:
+        task_id, requested_repository, recovery_date = _parse_run_arguments(arguments)
+    except ValueError as error:
+        return _error(str(error), 64)
+    recovery_mode = recovery_date is not None
     try:
         binding = _read_runtime_binding()
     except ValueError as error:
@@ -1797,8 +1831,10 @@ def run(arguments: Sequence[str]) -> int:
         _validate_directory_chain(binding.repository, binding.uid, "approved working directory", owner=True)
         _validate_bound_path(binding)
         _validate_codex_home(binding)
-        run_date = _capture_run_date()
+        run_date = recovery_date if recovery_date is not None else _capture_run_date()
         prompt, root, link = _task_contract(task_id, binding)
+        if recovery_mode:
+            prompt = _recovery_prompt(prompt, task_id, run_date)
         try:
             _validate_readable_file(
                 link,
@@ -1819,6 +1855,7 @@ def run(arguments: Sequence[str]) -> int:
             run_date,
             dotenv,
             inherited,
+            recovery_mode=recovery_mode,
         )
         return _forwarded_child_status(binding, prompt, child_environment)
     except (ValueError, KeyError) as error:

@@ -7,6 +7,7 @@
 
 static const char *const observed_environment[] = {
     "SCHEDULED_RUN_DATE_ET",
+    "SCHEDULED_RECOVERY_MODE",
     "SCHEDULED_AGENT_ENGINE",
     "SCHEDULED_SKILL_ROOT",
     "SCHEDULED_SKILL_LINK",
