@@ -615,8 +615,8 @@ private func testStore(_ tests: TestHarness) throws {
         let successID = try opened.beginRun(jobID: "launchd:success", startedAt: startedAt)
         tests.expectEqual(
             try opened.latestRun(jobID: "launchd:success")?.outcome,
-            .running,
-            "store returns a newly started run as running"
+            .unknown,
+            "store keeps an evidence-less unfinished run conservative"
         )
         try opened.finishRun(
             id: successID,
@@ -3004,13 +3004,25 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
 
                 let recentRunsNewestFirst = [
                     Run(
-                        id: 104,
+                        id: 105,
                         jobID: "launchd:history-presentation",
                         startedAt: Date(timeIntervalSince1970: 400),
                         finishedAt: Date(timeIntervalSince1970: 410),
                         exitCode: 9,
                         stdoutTail: "partial output",
                         stderrTail: "failed"
+                    ),
+                    Run(
+                        id: 104,
+                        jobID: "launchd:history-presentation",
+                        startedAt: Date(timeIntervalSince1970: 350),
+                        finishedAt: nil,
+                        exitCode: nil,
+                        stdoutTail: nil,
+                        stderrTail: nil,
+                        processID: getpid(),
+                        bootSessionID: "previous-boot-session",
+                        launchdRunCountAtStart: 5
                     ),
                     Run(
                         id: 103,
@@ -3028,7 +3040,10 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                         finishedAt: nil,
                         exitCode: nil,
                         stdoutTail: nil,
-                        stderrTail: nil
+                        stderrTail: nil,
+                        processID: getpid(),
+                        bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+                        launchdRunCountAtStart: 5
                     ),
                     Run(
                         id: 101,
@@ -3040,32 +3055,53 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                         stderrTail: ""
                     ),
                 ]
+                let historyJob = Job(
+                    id: "launchd:history-presentation",
+                    source: .launchd,
+                    provenance: .yours,
+                    label: "history-presentation",
+                    schedule: .onDemand,
+                    command: ["/usr/bin/true"],
+                    cwd: nil,
+                    enabled: true,
+                    runtimeStatusAttribution: .resolved,
+                    configPath: nil,
+                    lastKnownExit: nil,
+                    nativeStatusObservedAt: nil,
+                    launchdProcessID: getpid(),
+                    launchdRunCount: 5,
+                    lastRunAt: nil,
+                    lastScheduledFor: nil,
+                    managed: true
+                )
                 let historyCells = JobRunHistoryPresentation.cells(
-                    from: recentRunsNewestFirst
+                    from: recentRunsNewestFirst,
+                    job: historyJob
                 )
                 try check(
-                    historyCells.map(\.id) == [101, 102, 103, 104],
+                    historyCells.map(\.id) == [101, 102, 103, 104, 105],
                     "test13_recentHistory_ordersOldestToNewest"
                 )
                 try check(
                     historyCells.map(\.statusText)
-                        == ["Succeeded", "Running", "Unknown result", "Failed"],
+                        == ["Succeeded", "Running", "Unknown result", "Interrupted", "Failed"],
                     "test13_recentHistory_mapsEveryOutcome"
                 )
                 try check(
-                    Set(historyCells.map(\.symbolName)).count == 4,
+                    Set(historyCells.map(\.symbolName)).count == 5,
                     "test13_recentHistory_usesDistinctOutcomeShapes"
                 )
                 try check(
                     historyCells.last?.accessibilityLabel
-                        == "Recent run 4 of 4: Failed, exit code 9",
+                        == "Recent run 5 of 5: Failed, exit code 9",
                     "test13_recentHistory_failureHasNonColorAccessibilityLabel"
                 )
                 try check(
                     JobRunHistoryPresentation.cells(
                         from: recentRunsNewestFirst,
+                        job: historyJob,
                         limit: 2
-                    ).map(\.id) == [103, 104],
+                    ).map(\.id) == [104, 105],
                     "test13_recentHistory_limitsToNewestRecords"
                 )
                 if let failedCell = historyCells.last {
@@ -3075,7 +3111,7 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                             cell: failedCell
                         ) == JobRunSelection(
                             jobID: "launchd:history-presentation",
-                            runID: 104
+                            runID: 105
                         ),
                         "test13_failedHistoryCell_selectsItsJobAndRun"
                     )
@@ -3542,6 +3578,104 @@ private func test4B_AppExecutionAndPresentation(_ tests: TestHarness) throws {
                 )
                 print("APP HARNESS test17_encodedLaunchdExitNotification PASS")
 
+                let interruptedJob = makeJob(
+                    id: "cron:interrupted-run",
+                    provenance: .yours,
+                    environment: [:],
+                    command: ["/usr/bin/true"]
+                )
+                _ = try store.beginRun(
+                    jobID: interruptedJob.id,
+                    startedAt: Date(timeIntervalSince1970: 1_700_000_100),
+                    trigger: .scheduled,
+                    context: RunStartContext(
+                        processID: Int32.max,
+                        bootSessionID: "previous-boot-session",
+                        nativeExitStatusAtStart: nil,
+                        launchdRunCountAtStart: nil
+                    )
+                )
+                let interruptedRecorder = RecordingFailureNotifier()
+                let interruptedModel = AppModel(
+                    registry: JobRegistry(
+                        adapters: [
+                            StaticAdapter(source: .crontab, jobs: [interruptedJob]),
+                        ]
+                    ),
+                    store: store,
+                    failureNotifier: interruptedRecorder
+                )
+                interruptedModel.refresh()
+                try check(
+                    waitUntil {
+                        interruptedRecorder.candidates.contains {
+                            $0.incidentID
+                                == AttentionIncidentID(
+                                    jobID: interruptedJob.id,
+                                    kind: .interruptedRun
+                                )
+                        }
+                    },
+                    "test17_interruptedRun_producesOneTypedNotification"
+                )
+                try check(
+                    interruptedModel.needsAttention(interruptedJob),
+                    "test17_interruptedRun_setsAttentionOwnedHealth"
+                )
+
+                let reusedPIDJob = Job(
+                    id: "launchd:reused-pid-interruption#333333333333",
+                    source: .launchd,
+                    provenance: .yours,
+                    label: "reused-pid-interruption",
+                    schedule: .onDemand,
+                    command: ["/usr/bin/true"],
+                    cwd: nil,
+                    enabled: true,
+                    runtimeStatusAttribution: .resolved,
+                    configPath: nil,
+                    lastKnownExit: ExitStatus(raw: 1),
+                    nativeStatusObservedAt: Date(),
+                    launchdProcessID: getpid(),
+                    launchdRunCount: 41,
+                    lastRunAt: nil,
+                    lastScheduledFor: nil,
+                    managed: true
+                )
+                _ = try store.beginRun(
+                    jobID: reusedPIDJob.id,
+                    startedAt: Date(timeIntervalSince1970: 1_700_000_200),
+                    trigger: .scheduled,
+                    context: RunStartContext(
+                        processID: getpid(),
+                        bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+                        nativeExitStatusAtStart: 1,
+                        launchdRunCountAtStart: 40
+                    )
+                )
+                let reusedPIDRecorder = RecordingFailureNotifier()
+                let reusedPIDModel = AppModel(
+                    registry: JobRegistry(
+                        adapters: [
+                            StaticAdapter(source: .launchd, jobs: [reusedPIDJob]),
+                        ]
+                    ),
+                    store: store,
+                    failureNotifier: reusedPIDRecorder
+                )
+                reusedPIDModel.refresh()
+                try check(
+                    waitUntil {
+                        reusedPIDRecorder.candidates.contains {
+                            $0.incidentID
+                                == AttentionIncidentID(
+                                    jobID: reusedPIDJob.id,
+                                    kind: .interruptedRun
+                                )
+                        }
+                    },
+                    "test17_reusedPIDRunCountMismatch_producesInterruptedNotification"
+                )
                 print("APP HARNESS PASS")
             }
 
@@ -5320,6 +5454,19 @@ private func test7_ManualCrontabRunUsesDiscoveredContext(_ tests: TestHarness) t
             "\(fixtureHome.path)|from-crontab|\(fixtureHome.path)\n",
             "test7_manualCrontab_usesDiscoveredCwdAndEnvironment"
         )
+        let manualStore = try SQLiteRunStore(
+            path: directory.appendingPathComponent("ticker.db").path
+        )
+        let manualRun = try require(
+            try manualStore.latestRun(jobID: job.id),
+            "test7 manual run history"
+        )
+        tests.expect(
+            manualRun.trigger == .manual
+                && manualRun.processID != nil
+                && manualRun.bootSessionID != nil,
+            "test7_manualCrontabRun_recordsWrapperExecutionEvidence"
+        )
     }
 }
 
@@ -5360,12 +5507,17 @@ private func test9_RunLivenessAndNativeOrdering(_ tests: TestHarness) throws {
             managed: true
         )
         tests.expectEqual(
+            try store.scheduledHealthRuns()[deadID]?.outcome,
+            .interrupted,
+            "test9_deadWrapper_unfinishedRowIsInterrupted"
+        )
+        tests.expectEqual(
             JobHealthPolicy.outcome(
                 for: deadJob,
                 scheduledHistory: try store.scheduledHealthRuns()[deadID]
             ),
-            .failure,
-            "test9_deadWrapper_nativeFailureWinsOverUnfinishedRow"
+            .interrupted,
+            "test9_deadWrapper_healthRemainsInterrupted"
         )
 
         let previousBootID = "launchd:test9-previous-boot#222222222222"
@@ -5387,12 +5539,17 @@ private func test9_RunLivenessAndNativeOrdering(_ tests: TestHarness) throws {
             managed: true
         )
         tests.expectEqual(
+            try store.scheduledHealthRuns()[previousBootID]?.outcome,
+            .interrupted,
+            "test9_previousBoot_unfinishedRowIsInterrupted"
+        )
+        tests.expectEqual(
             JobHealthPolicy.outcome(
                 for: previousBootJob,
                 scheduledHistory: try store.scheduledHealthRuns()[previousBootID]
             ),
-            .failure,
-            "test9_previousBoot_unfinishedRowIsNotRunning"
+            .interrupted,
+            "test9_previousBoot_healthRemainsInterrupted"
         )
 
         let unavailableBootID = "launchd:test9-unavailable-boot#232323232323"
@@ -5415,12 +5572,162 @@ private func test9_RunLivenessAndNativeOrdering(_ tests: TestHarness) throws {
             managed: true
         )
         tests.expectEqual(
+            try store.scheduledHealthRuns()[unavailableBootID]?.outcome,
+            .unknown,
+            "test9_unavailableBootEvidence_staysConservative"
+        )
+        tests.expectEqual(
             JobHealthPolicy.outcome(
                 for: unavailableBootJob,
                 scheduledHistory: try store.scheduledHealthRuns()[unavailableBootID]
             ),
             .failure,
-            "test9_unavailableBootEvidence_neverCorroboratesRunning"
+            "test9_unavailableBootEvidence_preservesNativeFailure"
+        )
+        let unavailableBootRun = try require(
+            try store.scheduledHealthRuns()[unavailableBootID],
+            "test9 unavailable-boot run"
+        )
+        tests.expectEqual(
+            unavailableBootRun.observedOutcome(for: unavailableBootJob),
+            .failure,
+            "test9_equalRunCountsKeepHealthAndHistoryFailureConsistent"
+        )
+        let previousBootRun = try require(
+            try store.scheduledHealthRuns()[previousBootID],
+            "test9 previous-boot contextual run"
+        )
+        tests.expectEqual(
+            previousBootRun.observedOutcome(for: nil),
+            .unknown,
+            "test9_missingLaunchdDiscoveryKeepsContextualOutcomeUnknown"
+        )
+        let unavailableBootRestartedJob = test5_makeJob(
+            id: unavailableBootID,
+            lastKnownExit: ExitStatus(raw: 2),
+            launchdProcessID: getpid(),
+            launchdRunCount: 26,
+            managed: true
+        )
+        tests.expectEqual(
+            unavailableBootRun.observedOutcome(for: unavailableBootRestartedJob),
+            .interrupted,
+            "test9_knownRunCountMismatchInterruptsUnknownEvidenceRun"
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: unavailableBootRestartedJob,
+                scheduledHistory: unavailableBootRun
+            ),
+            .interrupted,
+            "test9_knownRunCountMismatchInterruptsUnknownHealth"
+        )
+
+        let missingStartingCountRun = Run(
+            id: -1,
+            jobID: "launchd:test9-missing-start-count#242424242424",
+            startedAt: Date(timeIntervalSince1970: 275),
+            finishedAt: nil,
+            exitCode: nil,
+            stdoutTail: nil,
+            trigger: .scheduled,
+            stderrTail: nil,
+            processID: getpid(),
+            bootSessionID: RunExecutionEvidence.unavailableBootSessionID,
+            nativeExitStatusAtStart: 2,
+            launchdRunCountAtStart: nil
+        )
+        let missingStartingCountJob = test5_makeJob(
+            id: missingStartingCountRun.jobID,
+            lastKnownExit: ExitStatus(raw: 2),
+            launchdProcessID: getpid(),
+            launchdRunCount: 27,
+            managed: true
+        )
+        tests.expectEqual(
+            missingStartingCountRun.observedOutcome(for: missingStartingCountJob),
+            .unknown,
+            "test9_missingStartingRunCountKeepsObservedOutcomeUnknown"
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: missingStartingCountJob,
+                scheduledHistory: missingStartingCountRun
+            ),
+            .unknown,
+            "test9_missingStartingRunCountCannotBecomeNativeFailure"
+        )
+
+        let interruptedWithoutStartingCount = Run(
+            id: -2,
+            jobID: "launchd:test9-interrupted-missing-start-count#252525252525",
+            startedAt: Date(timeIntervalSince1970: 280),
+            finishedAt: nil,
+            exitCode: nil,
+            stdoutTail: nil,
+            trigger: .scheduled,
+            stderrTail: nil,
+            processID: getpid(),
+            bootSessionID: "previous-boot-session",
+            nativeExitStatusAtStart: 2,
+            launchdRunCountAtStart: nil
+        )
+        let interruptedWithCurrentCount = test5_makeJob(
+            id: interruptedWithoutStartingCount.jobID,
+            lastKnownExit: ExitStatus(raw: 2),
+            launchdProcessID: nil,
+            launchdRunCount: 28,
+            managed: true
+        )
+        tests.expectEqual(
+            interruptedWithoutStartingCount.observedOutcome(for: interruptedWithCurrentCount),
+            .unknown,
+            "test9_interruptedRunMissingStartingCountStaysUnknown"
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: interruptedWithCurrentCount,
+                scheduledHistory: interruptedWithoutStartingCount
+            ),
+            .unknown,
+            "test9_interruptedHealthMissingStartingCountStaysUnknown"
+        )
+
+        let interruptedWithoutCurrentCount = Run(
+            id: -3,
+            jobID: "launchd:test9-interrupted-missing-current-count#262626262626",
+            startedAt: Date(timeIntervalSince1970: 285),
+            finishedAt: nil,
+            exitCode: nil,
+            stdoutTail: nil,
+            trigger: .scheduled,
+            stderrTail: nil,
+            processID: getpid(),
+            bootSessionID: "previous-boot-session",
+            nativeExitStatusAtStart: 2,
+            launchdRunCountAtStart: 29
+        )
+        let interruptedWithoutCurrentCountJob = test5_makeJob(
+            id: interruptedWithoutCurrentCount.jobID,
+            lastKnownExit: ExitStatus(raw: 2),
+            launchdProcessID: nil,
+            launchdRunCount: nil,
+            managed: true
+        )
+        tests.expectEqual(
+            interruptedWithoutCurrentCount.observedOutcome(
+                for: interruptedWithoutCurrentCountJob
+            ),
+            .unknown,
+            "test9_interruptedRunMissingCurrentCountStaysUnknown"
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: interruptedWithoutCurrentCountJob,
+                scheduledHistory: interruptedWithoutCurrentCount
+            ),
+            .unknown,
+            "test9_interruptedHealthMissingCurrentCountStaysUnknown"
         )
 
         let liveID = "launchd:test9-live#333333333333"
@@ -5443,12 +5750,102 @@ private func test9_RunLivenessAndNativeOrdering(_ tests: TestHarness) throws {
             managed: true
         )
         tests.expectEqual(
+            try store.scheduledHealthRuns()[liveID]?.outcome,
+            .running,
+            "test9_liveWrapper_runOutcome_isRunning"
+        )
+        tests.expectEqual(
             JobHealthPolicy.outcome(
                 for: liveJob,
                 scheduledHistory: try store.scheduledHealthRuns()[liveID]
             ),
             .running,
             "test9_liveLongRunningWrapper_remainsRunning"
+        )
+        let restartedLiveJob = test5_makeJob(
+            id: liveID,
+            lastKnownExit: ExitStatus(raw: 1),
+            launchdProcessID: getpid(),
+            launchdRunCount: 31,
+            managed: true
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: restartedLiveJob,
+                scheduledHistory: try store.scheduledHealthRuns()[liveID]
+            ),
+            .interrupted,
+            "test9_reusedPID_newLaunchdRunMarksHealthInterrupted"
+        )
+        let liveRun = try require(
+            try store.scheduledHealthRuns()[liveID],
+            "test9 live scheduled run"
+        )
+        tests.expectEqual(
+            liveRun.observedOutcome(for: restartedLiveJob),
+            .interrupted,
+            "test9_reusedPID_newLaunchdRunMarksStoredHistoryInterrupted"
+        )
+        let missingRunCountJob = test5_makeJob(
+            id: liveID,
+            lastKnownExit: ExitStatus(raw: 1),
+            launchdProcessID: getpid(),
+            launchdRunCount: nil,
+            managed: true
+        )
+        tests.expectEqual(
+            liveRun.observedOutcome(for: missingRunCountJob),
+            .unknown,
+            "test9_missingLaunchdRunCountCannotCorroborateStoredRun"
+        )
+        tests.expectEqual(
+            JobHealthPolicy.outcome(
+                for: missingRunCountJob,
+                scheduledHistory: liveRun
+            ),
+            .unknown,
+            "test9_missingLaunchdRunCountKeepsHealthUnknown"
+        )
+        let unpublishedLiveJob = test5_makeJob(
+            id: liveID,
+            lastKnownExit: nil,
+            launchdProcessID: nil,
+            launchdRunCount: 30,
+            managed: true
+        )
+        tests.expectEqual(
+            liveRun.observedOutcome(for: unpublishedLiveJob),
+            .unknown,
+            "test9_unpublishedLaunchdPIDCannotCorroborateStoredRun"
+        )
+        let unfinishedRunIDs = Set(try store.unfinishedRuns().map(\.id))
+        tests.expect(
+            unfinishedRunIDs.contains(liveRun.id),
+            "test9_unfinishedRuns_includesRunCountMismatchCandidate"
+        )
+        let interruptedIDs = Set(try store.interruptedRuns().map(\.id))
+        let deadRunID = try require(
+            try store.latestRun(jobID: deadID)?.id,
+            "test9 dead run id"
+        )
+        let previousBootRunID = try require(
+            try store.latestRun(jobID: previousBootID)?.id,
+            "test9 previous-boot run id"
+        )
+        let liveRunID = try require(
+            try store.latestRun(jobID: liveID)?.id,
+            "test9 live run id"
+        )
+        let unavailableRunID = try require(
+            try store.latestRun(jobID: unavailableBootID)?.id,
+            "test9 unavailable-boot run id"
+        )
+        tests.expect(
+            interruptedIDs.contains(deadRunID)
+                && interruptedIDs.contains(previousBootRunID)
+                && !interruptedIDs.contains(liveRunID)
+                && !interruptedIDs.contains(unavailableRunID),
+            "test9_interruptedRuns_listsOnlyAuthoritativeInterruptedRows"
         )
 
         let clockRollbackID = "launchd:test9-clock-rollback#444444444444"
@@ -6982,6 +7379,77 @@ private func test13_CLISurfacesMissingPayload(_ tests: TestHarness) throws {
             "TICKER_STORE_PATH": storePath,
         ]
         let tickerPath = try test3A_builtCLIPath()
+        let interruptedStore = try SQLiteRunStore(path: storePath)
+        _ = try interruptedStore.beginRun(
+            jobID: "cron:test13-interrupted",
+            startedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            trigger: .scheduled,
+            context: RunStartContext(
+                processID: Int32.max,
+                bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+                nativeExitStatusAtStart: nil,
+                launchdRunCountAtStart: nil
+            )
+        )
+        _ = try interruptedStore.beginRun(
+            jobID: "launchd:test13-missing-discovery",
+            startedAt: Date(timeIntervalSince1970: 1_700_000_001),
+            trigger: .scheduled,
+            context: RunStartContext(
+                processID: Int32.max,
+                bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+                nativeExitStatusAtStart: 1,
+                launchdRunCountAtStart: 10
+            )
+        )
+        let interrupted = try test3A_runProcess(
+            tickerPath,
+            ["interrupted"],
+            environment: environment
+        )
+        tests.expectEqual(interrupted.status, 0, "test13_interrupted_exitsSuccessfully")
+        tests.expect(
+            interrupted.stdout.contains("cron:test13-interrupted")
+                && interrupted.stdout.contains("interrupted")
+                && !interrupted.stdout.contains("launchd:test13-missing-discovery"),
+            "test13_interrupted_humanOutputRequiresLaunchdDiscoveryEvidence"
+        )
+        let interruptedJSON = try test3A_runProcess(
+            tickerPath,
+            ["interrupted", "--json"],
+            environment: environment
+        )
+        let interruptedRecords = try require(
+            try JSONSerialization.jsonObject(
+                with: Data(interruptedJSON.stdout.utf8)
+            ) as? [[String: Any]],
+            "test13 interrupted JSON records"
+        )
+        tests.expect(
+            interruptedRecords.contains {
+                ($0["jobID"] as? String) == "cron:test13-interrupted"
+                    && ($0["outcome"] as? String) == "interrupted"
+            }
+                && !interruptedRecords.contains {
+                    ($0["jobID"] as? String) == "launchd:test13-missing-discovery"
+                },
+            "test13_interrupted_JSON_requiresLaunchdDiscoveryEvidence"
+        )
+        let missingLaunchdHistory = try test3A_runProcess(
+            tickerPath,
+            ["history", "launchd:test13-missing-discovery", "--json"],
+            environment: environment
+        )
+        let missingLaunchdRecords = try require(
+            try JSONSerialization.jsonObject(
+                with: Data(missingLaunchdHistory.stdout.utf8)
+            ) as? [[String: Any]],
+            "test13 missing launchd history records"
+        )
+        tests.expect(
+            missingLaunchdRecords.first?["outcome"] as? String == "unknown",
+            "test13_history_missingLaunchdDiscoveryReportsUnknown"
+        )
 
         let list = try test3A_runProcess(tickerPath, ["list"], environment: environment)
         tests.expectEqual(list.status, 0, "test13_list_missingPayload_exitsSuccessfully")
@@ -7091,6 +7559,12 @@ private func test13_UIArchitectureContract(_ tests: TestHarness) throws {
             && listSource.contains("case .success: return 3")
             && listSource.contains("if !job.enabled { return 4 }"),
         "test13_sidebarSort_usesReviewedAttentionEvidenceOrder"
+    )
+    tests.expect(
+        listSource.contains("case .interrupted")
+            && listSource.contains("\"Interrupted\"")
+            && detailSource.contains("The last observed run was interrupted"),
+        "test13_interruptedOutcome_hasDistinctUIContract"
     )
     tests.expect(
         detailSource.contains("RewriteConfirmationSheet")
@@ -14144,6 +14618,7 @@ private func test17_AttentionNotificationPlanner(_ tests: TestHarness) {
             lastKnownExit: lastKnownExit,
             lastRunAt: nil,
             lastScheduledFor: nil,
+
             managed: managed
         )
     }
@@ -14240,6 +14715,38 @@ private func test17_AttentionNotificationPlanner(_ tests: TestHarness) {
         partialDiscovery.retainedNotifiedIncidentIDs,
         [failureID],
         "test17_partialDiscoveryPreservesUnobservedIncident"
+    )
+
+    let interruptedID = AttentionIncidentID(
+        jobID: jobA,
+        kind: .interruptedRun
+    )
+    let interrupted = AttentionNotificationCandidate(
+        incidentID: interruptedID,
+        jobLabel: "job-a",
+        reason: "The latest scheduled run was interrupted."
+    )
+    let interruptedPlan = AttentionNotificationPlanner.plan(
+        candidates: [interrupted],
+        notifiedIncidentIDs: [],
+        pendingIncidentIDs: [],
+        observedIncidentIDs: [interruptedID]
+    )
+    tests.expectEqual(
+        interruptedPlan.notifications,
+        [interrupted],
+        "test17_interruptedRunProducesTypedNotification"
+    )
+    let interruptedRepeat = AttentionNotificationPlanner.plan(
+        candidates: [interrupted],
+        notifiedIncidentIDs: [interruptedID],
+        pendingIncidentIDs: [],
+        observedIncidentIDs: [interruptedID]
+    )
+    tests.expectEqual(
+        interruptedRepeat.notifications,
+        [],
+        "test17_interruptedRunDoesNotRepeatWhileActive"
     )
 
     let late = AttentionNotificationCandidate(
@@ -14391,6 +14898,25 @@ private enum TickerTests {
             }
             tests.run("round 17 notification app integration") {
                 try test4B_AppExecutionAndPresentation(tests)
+            }
+            tests.finish()
+        }
+        if ProcessInfo.processInfo.environment["TICKER_TEST18_ONLY"] == "1" {
+            let tests = TestHarness()
+            tests.run("round 7 manual execution evidence") {
+                try test7_ManualCrontabRunUsesDiscoveredContext(tests)
+            }
+            tests.run("round 9 interrupted run classification") {
+                try test9_RunLivenessAndNativeOrdering(tests)
+            }
+            tests.run("round 13 interrupted CLI diagnostics") {
+                try test13_CLISurfacesMissingPayload(tests)
+            }
+            tests.run("round 17 interrupted notifications and UI") {
+                try test4B_AppExecutionAndPresentation(tests)
+            }
+            tests.run("round 17 interrupted notification transitions") {
+                test17_AttentionNotificationPlanner(tests)
             }
             tests.finish()
         }

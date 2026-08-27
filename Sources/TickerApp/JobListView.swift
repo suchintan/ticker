@@ -199,6 +199,7 @@ enum JobRunHistoryPresentation {
 
     static func cells(
         from runs: [Run],
+        job: Job? = nil,
         limit: Int = maximumVisibleRuns
     ) -> [JobRunHistoryCell] {
         guard limit > 0 else {
@@ -207,11 +208,12 @@ enum JobRunHistoryPresentation {
         let recentRuns = runs.prefix(limit)
         let count = recentRuns.count
         return recentRuns.reversed().enumerated().map { index, run in
-            let presentation = outcomePresentation(for: run.outcome)
+            let outcome = run.observedOutcome(for: job)
+            let presentation = outcomePresentation(for: outcome)
             let exitText = run.exitCode.map { ", exit code \($0)" } ?? ""
             return JobRunHistoryCell(
                 id: run.id,
-                outcome: run.outcome,
+                outcome: outcome,
                 symbolName: presentation.symbolName,
                 statusText: presentation.statusText,
                 accessibilityLabel:
@@ -237,6 +239,8 @@ enum JobRunHistoryPresentation {
             return ("xmark", "Failed")
         case .running:
             return ("ellipsis", "Running")
+        case .interrupted:
+            return ("exclamationmark.triangle.fill", "Interrupted")
         case .unknown:
             return ("questionmark", "Unknown result")
         }
@@ -741,6 +745,7 @@ struct JobListView: View {
         if !job.enabled { return 4 }
         switch model.outcome(for: job) {
         case .running: return 1
+        case .interrupted: return 0
         case .unknown: return 2
         case .success: return 3
         case .failure: return 0
@@ -788,7 +793,7 @@ private struct JobRow: View {
                 RecentRunHistoryView(
                     jobID: job.id,
                     loadState: historyLoadState,
-                    cells: JobRunHistoryPresentation.cells(from: runs),
+                    cells: JobRunHistoryPresentation.cells(from: runs, job: job),
                     onSelect: onSelectRun
                 )
             }
@@ -834,6 +839,12 @@ private struct JobRow: View {
             )
         } else if outcome == .failure {
             AttentionBadge(title: "Failed", icon: "xmark.circle.fill", color: .red)
+        } else if outcome == .interrupted {
+            AttentionBadge(
+                title: "Interrupted",
+                icon: "exclamationmark.triangle.fill",
+                color: .orange
+            )
         } else if let skew = job.skew, skew > 3_600 {
             AttentionBadge(title: "Late", icon: "clock.badge.exclamationmark", color: .orange)
         } else if skipStorm != nil {
@@ -951,6 +962,8 @@ private struct RecentRunHistoryView: View {
             return .red
         case .running:
             return .blue
+        case .interrupted:
+            return .orange
         case .unknown:
             return .secondary
         }
@@ -993,6 +1006,8 @@ private struct QuietStatus: View {
         switch outcome {
         case .running:
             return ("arrow.triangle.2.circlepath", "Running", .blue)
+        case .interrupted:
+            return ("exclamationmark.triangle.fill", "Interrupted", .orange)
         case .success:
             return ("checkmark.circle.fill", "Succeeded", .green)
         case .failure:

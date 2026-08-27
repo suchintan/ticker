@@ -80,9 +80,10 @@ private struct ListRecord: Encodable {
         attention = job.attention
         isBroken = job.isBroken
         needsAttention = job.isBroken
+            || job.runtimeStatusAttribution == .ambiguous
             || (job.enabled
                 && (lastOutcome == .failure
-                    || job.runtimeStatusAttribution == .ambiguous))
+                    || lastOutcome == .interrupted))
         label = job.label
         schedule = job.schedule.humanDescription
         command = job.command
@@ -194,6 +195,28 @@ private struct HistoryRecord: Encodable {
     let outcome: Outcome
     let stdoutTail: String?
     let stderrTail: String?
+}
+
+private struct InterruptedRecord: Encodable {
+    let id: Int64
+    let jobID: String
+    let startedAt: Date
+    let duration: TimeInterval?
+    let trigger: RunTrigger
+    let processID: Int32?
+    let bootSessionID: String?
+    let outcome: Outcome
+
+    init(_ run: Run) {
+        id = run.id
+        jobID = run.jobID
+        startedAt = run.startedAt
+        duration = nil
+        trigger = run.trigger
+        processID = run.processID
+        bootSessionID = run.bootSessionID
+        outcome = .interrupted
+    }
 }
 
 private final class TailBuffer {
@@ -382,6 +405,8 @@ private struct TickerCLI {
             try list(arguments: remaining)
         case "history":
             try history(arguments: remaining)
+        case "interrupted":
+            try interrupted(arguments: remaining)
         case "wrap":
             try wrap(arguments: remaining)
         case "unwrap":
@@ -613,7 +638,12 @@ private struct TickerCLI {
                         jobID: jobID,
                         startedAt: startedAt,
                         trigger: trigger,
-                        context: nil
+                        context: RunStartContext(
+                            processID: getpid(),
+                            bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+                            nativeExitStatusAtStart: nil,
+                            launchdRunCountAtStart: nil
+                        )
                     )
                 } catch {
                     writeStandardError("ticker: could not record run start: \(error.localizedDescription)\n")
@@ -840,6 +870,9 @@ private struct TickerCLI {
 
         let store = try SQLiteRunStore(path: configuredStorePath())
         let runs = try store.runs(jobID: jobID, limit: limit)
+        let currentJobs = jobsByCanonicalID(discoverJobs().jobs, store: store)
+        let canonicalJobID = try store.canonicalJobID(jobID)
+        let currentJob = currentJobs[canonicalJobID]
         if json {
             let records = runs.map { run in
                 HistoryRecord(
@@ -850,7 +883,7 @@ private struct TickerCLI {
                     duration: run.duration,
                     exitCode: run.exitCode,
                     trigger: run.trigger,
-                    outcome: run.outcome,
+                    outcome: run.observedOutcome(for: currentJob),
                     stdoutTail: run.stdoutTail,
                     stderrTail: run.stderrTail
                 )
@@ -860,12 +893,22 @@ private struct TickerCLI {
         }
 
         let rows = runs.map { run in
-            [
+            let outcome = run.observedOutcome(for: currentJob)
+            let duration: String
+            switch outcome {
+            case .running:
+                duration = "running"
+            case .interrupted:
+                duration = "interrupted"
+            case .success, .failure, .unknown:
+                duration = run.duration.map { String(format: "%.3fs", $0) } ?? "—"
+            }
+            return [
                 formatDate(run.startedAt),
                 run.trigger.rawValue,
-                run.duration.map { String(format: "%.3fs", $0) } ?? "running",
+                duration,
                 run.exitCode.map(String.init) ?? "—",
-                run.outcome.rawValue,
+                outcome.rawValue,
             ]
         }
         printTable(
@@ -883,6 +926,37 @@ private struct TickerCLI {
                 print(stderr, terminator: stderr.hasSuffix("\n") ? "" : "\n")
             }
         }
+    }
+
+    private func interrupted(arguments: [String]) throws {
+        let json = try parseJSONOnlyOption(arguments, command: "interrupted")
+        let store = try SQLiteRunStore(path: configuredStorePath())
+        let currentJobs = jobsByCanonicalID(discoverJobs().jobs, store: store)
+        let runs = try store.unfinishedRuns().filter { run in
+            let canonicalJobID = (try? store.canonicalJobID(run.jobID)) ?? run.jobID
+            return run.observedOutcome(for: currentJobs[canonicalJobID]) == .interrupted
+        }
+
+        if json {
+            try printJSON(runs.map(InterruptedRecord.init))
+            return
+        }
+
+        let rows = runs.map { run in
+            [
+                String(run.id),
+                run.jobID,
+                formatDate(run.startedAt),
+                run.trigger.rawValue,
+                run.processID.map(String.init) ?? "—",
+                run.bootSessionID ?? "—",
+                Outcome.interrupted.rawValue,
+            ]
+        }
+        printTable(
+            headers: ["ID", "JOB", "STARTED", "TRIGGER", "PID", "BOOT SESSION", "OUTCOME"],
+            rows: rows
+        )
     }
 
     private func wrap(arguments: [String]) throws {
@@ -969,6 +1043,22 @@ private struct TickerCLI {
         }
         return (discovery.jobs, discovery.errors.isEmpty)
     }
+
+    private func jobsByCanonicalID(
+        _ jobs: [Job],
+        store: SQLiteRunStore
+    ) -> [String: Job] {
+        var result: [String: Job] = [:]
+        result.reserveCapacity(jobs.count)
+        for job in jobs {
+            guard let canonicalJobID = try? store.canonicalJobID(job.id) else {
+                continue
+            }
+            result[canonicalJobID] = job
+        }
+        return result
+    }
+
     private func findJob(id: String, in jobs: [Job]) throws -> Job {
         guard let job = jobs.first(where: { $0.id == id }) else {
             throw CLIError.operation("No discovered job has id '\(id)'")
@@ -1016,6 +1106,7 @@ private struct TickerCLI {
           ticker run --label <id> [--manual] [--ticker-wrapper-version VERSION] [--argv0 VALUE] [--tail-bytes N] -- <argv>...
           ticker list [--json]
           ticker history <job-id> [--limit N] [--json]
+          ticker interrupted [--json]
           ticker wrap <job-id>
           ticker unwrap <job-id>
           ticker doctor [--clear-stale <job-id>]

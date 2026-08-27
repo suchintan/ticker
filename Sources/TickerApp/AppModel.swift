@@ -312,6 +312,13 @@ final class AppModel: ObservableObject {
                     )
                 }
             }
+            if latestHealth != nil {
+                for job in discovery.jobs {
+                    observedIncidentIDs.insert(
+                        AttentionIncidentID(jobID: job.id, kind: .interruptedRun)
+                    )
+                }
+            }
             for jobID in skipDiscovery.observedJobIDs {
                 observedIncidentIDs.insert(
                     AttentionIncidentID(jobID: jobID, kind: .skipStorm)
@@ -376,6 +383,7 @@ final class AppModel: ObservableObject {
             return false
         }
         return outcome(for: job) == .failure
+            || outcome(for: job) == .interrupted
             || (job.skew.map { $0 > 3_600 } ?? false)
             || skipStorm(for: job) != nil
             || wrapperNeedsAttention(job)
@@ -430,6 +438,16 @@ final class AppModel: ObservableObject {
 
         guard job.enabled else {
             return candidates
+        }
+        if outcome(for: job) == .interrupted,
+           let run = health[job.id],
+           run.observedOutcome(for: job) == .interrupted {
+            candidates.append(
+                candidate(
+                    .interruptedRun,
+                    "The latest scheduled run was interrupted before it recorded an exit."
+                )
+            )
         }
 
         if outcome(for: job) == .failure {

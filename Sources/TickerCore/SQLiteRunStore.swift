@@ -325,6 +325,53 @@ public final class SQLiteRunStore: RunStore {
         }
     }
 
+    public func unfinishedRuns(limit: Int = Int.max) throws -> [Run] {
+        guard limit > 0 else {
+            return []
+        }
+        return try queue.sync {
+            let statement = try prepare(
+                """
+                SELECT id, job_id, started_at, finished_at, exit_code, stdout_tail, stderr_tail,
+                       trigger, process_id, boot_session_id, native_exit_status_at_start,
+                       launchd_run_count_at_start
+                FROM runs
+                WHERE finished_at IS NULL
+                ORDER BY id DESC;
+                """
+            )
+            defer { sqlite3_finalize(statement) }
+            return Array(
+                try readRuns(statement, operation: "read unfinished runs").prefix(limit)
+            )
+        }
+    }
+
+    public func interruptedRuns(limit: Int = Int.max) throws -> [Run] {
+        guard limit > 0 else {
+            return []
+        }
+        return try queue.sync {
+            let statement = try prepare(
+                """
+                SELECT id, job_id, started_at, finished_at, exit_code, stdout_tail, stderr_tail,
+                       trigger, process_id, boot_session_id, native_exit_status_at_start,
+                       launchd_run_count_at_start
+                FROM runs
+                WHERE finished_at IS NULL
+                  AND process_id IS NOT NULL
+                  AND boot_session_id IS NOT NULL
+                  AND boot_session_id != ?
+                ORDER BY id DESC;
+                """
+            )
+            defer { sqlite3_finalize(statement) }
+            try bind(RunExecutionEvidence.unavailableBootSessionID, to: 1, in: statement)
+            let candidates = try readRuns(statement, operation: "read interrupted runs")
+            return Array(candidates.filter { $0.outcome == .interrupted }.prefix(limit))
+        }
+    }
+
     public func health() throws -> [String: Outcome] {
         try scheduledHealthRuns().mapValues { run in
             run.outcome == .running && !run.isCorroboratedRunning
