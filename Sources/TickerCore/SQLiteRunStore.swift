@@ -34,13 +34,13 @@ public struct BackupSourceClaim: Equatable {
 }
 
 public final class SQLiteRunStore: RunStore {
-    private static let schemaVersion = "4"
+    private static let schemaVersion = "5"
     private static let runTriggerHealthMigrationKey = "run_trigger_health_v3"
+    private static let defaultRecoveryPolicyJSON = "{\"kind\":\"alertOnly\"}"
 
     private let database: OpaquePointer
     private let queue = DispatchQueue(label: "com.ticker.SQLiteRunStore")
     private let afterBeginRunCanonicalization: (() -> Void)?
-
     public static func defaultPath() -> String {
         return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".ticker", isDirectory: true)
@@ -107,7 +107,8 @@ public final class SQLiteRunStore: RunStore {
                   launchd_run_count_at_start INTEGER);
                 CREATE INDEX IF NOT EXISTS idx_runs_job ON runs(job_id, started_at DESC);
                 CREATE TABLE IF NOT EXISTS managed_jobs(
-                  job_id TEXT PRIMARY KEY, wrapped_at REAL NOT NULL, backup_path TEXT);
+                  job_id TEXT PRIMARY KEY, wrapped_at REAL NOT NULL, backup_path TEXT,
+                  recovery_policy TEXT NOT NULL DEFAULT '\(Self.defaultRecoveryPolicyJSON)');
                 CREATE TABLE IF NOT EXISTS health_resets(
                   job_id TEXT PRIMARY KEY, reset_after_run_id INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS job_identity_aliases(
@@ -120,18 +121,19 @@ public final class SQLiteRunStore: RunStore {
                 CREATE TABLE IF NOT EXISTS backup_source_claims(
                   backup_path TEXT PRIMARY KEY, job_id TEXT NOT NULL,
                   source_plist_path TEXT NOT NULL, rebound_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS recovery_attempts(
+                  claim_id TEXT PRIMARY KEY,
+                  job_id TEXT NOT NULL,
+                  task_id TEXT NOT NULL,
+                  date_key TEXT NOT NULL,
+                  interrupted_run_id INTEGER,
+                  status TEXT NOT NULL CHECK(status IN ('claimed', 'running', 'succeeded', 'failed')),
+                  claimed_at REAL NOT NULL,
+                  started_at REAL,
+                  finished_at REAL,
+                  exit_code INTEGER,
+                  UNIQUE(job_id, task_id, date_key));
                 CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);
-                """
-            )
-            try Self.execute(
-                database: validDatabase,
-                sql: """
-                DELETE FROM recorder_diagnostics
-                WHERE id NOT IN (
-                  SELECT MAX(id) FROM recorder_diagnostics GROUP BY claimed_job_id
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_recorder_diagnostics_job
-                ON recorder_diagnostics(claimed_job_id);
                 """
             )
             try Self.ensureRunsTriggerColumn(
@@ -142,6 +144,7 @@ public final class SQLiteRunStore: RunStore {
                 database: validDatabase,
                 beforeMigration: beforeRunEvidenceMigration
             )
+            try Self.ensureManagedRecoveryPolicyColumn(database: validDatabase)
             try Self.stampSchemaVersion(database: validDatabase)
         } catch {
             sqlite3_close_v2(validDatabase)
@@ -585,6 +588,361 @@ public final class SQLiteRunStore: RunStore {
         }
     }
 
+    public func recoveryPolicy(jobID: String) throws -> RecoveryPolicy? {
+        try queue.sync {
+            let canonicalID = try canonicalJobIDLocked(jobID)
+            let statement = try prepare(
+                "SELECT recovery_policy FROM managed_jobs WHERE job_id = ? LIMIT 1;"
+            )
+            defer { sqlite3_finalize(statement) }
+            try bind(canonicalID, to: 1, in: statement)
+            let result = sqlite3_step(statement)
+            if result == SQLITE_DONE {
+                return nil
+            }
+            guard result == SQLITE_ROW else {
+                throw databaseError(operation: "read managed recovery policy", code: result)
+            }
+            guard let encoded = textColumn(0, in: statement) else {
+                throw RecoveryStoreError.malformedPolicy("stored policy is NULL")
+            }
+            return try Self.decodeRecoveryPolicy(encoded)
+        }
+    }
+
+    public func setRecoveryPolicy(jobID: String, policy: RecoveryPolicy) throws {
+        let encoded = try Self.encodeRecoveryPolicy(policy)
+        try queue.sync {
+            try withImmediateTransaction {
+                let canonicalID = try canonicalJobIDLocked(jobID)
+                let statement = try prepare(
+                    "UPDATE managed_jobs SET recovery_policy = ? WHERE job_id = ?;"
+                )
+                defer { sqlite3_finalize(statement) }
+                try bind(encoded, to: 1, in: statement)
+                try bind(canonicalID, to: 2, in: statement)
+                try stepDone(statement, operation: "set managed recovery policy")
+                guard sqlite3_changes(database) == 1 else {
+                    throw RecoveryStoreError.nonManagedJob(canonicalID)
+                }
+            }
+        }
+    }
+
+    public func claimRecoveryAttempt(
+        claimID: String,
+        jobID: String,
+        taskID: String,
+        dateKey: String,
+        interruptedRunID: Int64?,
+        claimedAt: Date
+    ) throws -> RecoveryAttempt? {
+        try Self.validateRecoveryAttemptIdentifiers(
+            claimID: claimID,
+            jobID: jobID,
+            taskID: taskID,
+            dateKey: dateKey
+        )
+        return try queue.sync {
+            try withImmediateTransaction {
+                let canonicalID = try canonicalJobIDLocked(jobID)
+                let statement = try prepare(
+                    """
+                    INSERT OR IGNORE INTO recovery_attempts(
+                      claim_id, job_id, task_id, date_key, interrupted_run_id,
+                      status, claimed_at
+                    ) VALUES(?, ?, ?, ?, ?, 'claimed', ?);
+                    """
+                )
+                defer { sqlite3_finalize(statement) }
+                try bind(claimID, to: 1, in: statement)
+                try bind(canonicalID, to: 2, in: statement)
+                try bind(taskID, to: 3, in: statement)
+                try bind(dateKey, to: 4, in: statement)
+                try bind(interruptedRunID, to: 5, in: statement)
+                try bind(claimedAt.timeIntervalSince1970, to: 6, in: statement)
+                try stepDone(statement, operation: "claim recovery attempt")
+                guard sqlite3_changes(database) == 1 else {
+                    return nil
+                }
+                return try recoveryAttemptLocked(claimID: claimID)
+            }
+        }
+    }
+
+    public func claimRecoveryAttempt(
+        jobID: String,
+        taskID: String,
+        dateKey: String,
+        interruptedRunID: Int64?,
+        claimedAt: Date = Date()
+    ) throws -> RecoveryAttempt? {
+        try claimRecoveryAttempt(
+            claimID: UUID().uuidString,
+            jobID: jobID,
+            taskID: taskID,
+            dateKey: dateKey,
+            interruptedRunID: interruptedRunID,
+            claimedAt: claimedAt
+        )
+    }
+
+    public func recoveryAttempt(claimID: String) throws -> RecoveryAttempt? {
+        try queue.sync {
+            try recoveryAttemptLocked(claimID: claimID)
+        }
+    }
+
+    public func startRecoveryAttempt(
+        claimID: String,
+        jobID: String,
+        taskID: String,
+        dateKey: String,
+        startedAt: Date
+    ) throws -> RecoveryAttempt {
+        try Self.validateRecoveryAttemptIdentifiers(
+            claimID: claimID,
+            jobID: jobID,
+            taskID: taskID,
+            dateKey: dateKey
+        )
+        return try queue.sync {
+            try withImmediateTransaction {
+                let canonicalID = try canonicalJobIDLocked(jobID)
+                let current = try requireRecoveryAttemptLocked(claimID: claimID)
+                try validateRecoveryAttemptIdentity(
+                    current,
+                    jobID: canonicalID,
+                    taskID: taskID,
+                    dateKey: dateKey
+                )
+                guard current.status == .claimed else {
+                    throw RecoveryStoreError.invalidAttemptTransition(
+                        from: current.status,
+                        to: .running
+                    )
+                }
+
+                let statement = try prepare(
+                    """
+                    UPDATE recovery_attempts
+                    SET status = 'running', started_at = ?
+                    WHERE claim_id = ? AND job_id = ? AND task_id = ? AND date_key = ?
+                      AND status = 'claimed';
+                    """
+                )
+                defer { sqlite3_finalize(statement) }
+                try bind(startedAt.timeIntervalSince1970, to: 1, in: statement)
+                try bind(claimID, to: 2, in: statement)
+                try bind(canonicalID, to: 3, in: statement)
+                try bind(taskID, to: 4, in: statement)
+                try bind(dateKey, to: 5, in: statement)
+                try stepDone(statement, operation: "start recovery attempt")
+                guard sqlite3_changes(database) == 1 else {
+                    throw RecoveryStoreError.invalidAttemptTransition(
+                        from: current.status,
+                        to: .running
+                    )
+                }
+                return try requireRecoveryAttemptLocked(claimID: claimID)
+            }
+        }
+    }
+
+    public func finishRecoveryAttempt(
+        claimID: String,
+        jobID: String,
+        taskID: String,
+        dateKey: String,
+        status: RecoveryAttemptStatus,
+        finishedAt: Date,
+        exitCode: Int32?
+    ) throws -> RecoveryAttempt {
+        guard status.isTerminal else {
+            throw RecoveryStoreError.terminalStatusRequired
+        }
+        try Self.validateRecoveryAttemptIdentifiers(
+            claimID: claimID,
+            jobID: jobID,
+            taskID: taskID,
+            dateKey: dateKey
+        )
+        return try queue.sync {
+            try withImmediateTransaction {
+                let canonicalID = try canonicalJobIDLocked(jobID)
+                let current = try requireRecoveryAttemptLocked(claimID: claimID)
+                try validateRecoveryAttemptIdentity(
+                    current,
+                    jobID: canonicalID,
+                    taskID: taskID,
+                    dateKey: dateKey
+                )
+                guard current.status == .running else {
+                    throw RecoveryStoreError.invalidAttemptTransition(
+                        from: current.status,
+                        to: status
+                    )
+                }
+
+                let statement = try prepare(
+                    """
+                    UPDATE recovery_attempts
+                    SET status = ?, finished_at = ?, exit_code = ?
+                    WHERE claim_id = ? AND job_id = ? AND task_id = ? AND date_key = ?
+                      AND status = 'running';
+                    """
+                )
+                defer { sqlite3_finalize(statement) }
+                try bind(status.rawValue, to: 1, in: statement)
+                try bind(finishedAt.timeIntervalSince1970, to: 2, in: statement)
+                try bind(exitCode, to: 3, in: statement)
+                try bind(claimID, to: 4, in: statement)
+                try bind(canonicalID, to: 5, in: statement)
+                try bind(taskID, to: 6, in: statement)
+                try bind(dateKey, to: 7, in: statement)
+                try stepDone(statement, operation: "finish recovery attempt")
+                guard sqlite3_changes(database) == 1 else {
+                    throw RecoveryStoreError.invalidAttemptTransition(
+                        from: current.status,
+                        to: status
+                    )
+                }
+                return try requireRecoveryAttemptLocked(claimID: claimID)
+            }
+        }
+    }
+
+    private static func validateRecoveryAttemptIdentifiers(
+        claimID: String,
+        jobID: String,
+        taskID: String,
+        dateKey: String
+    ) throws {
+        let values = [
+            ("claim ID", claimID),
+            ("job ID", jobID),
+            ("task ID", taskID),
+            ("date key", dateKey),
+        ]
+        for (name, value) in values {
+            guard !value.isEmpty,
+                  value.unicodeScalars.allSatisfy({
+                      !CharacterSet.controlCharacters.contains($0)
+                  }) else {
+                throw RecoveryStoreError.invalidIdentifier(
+                    "\(name) is empty or contains control characters"
+                )
+            }
+        }
+        guard RecoveryPolicy.isValidTaskID(taskID) else {
+            throw RecoveryStoreError.invalidIdentifier("task ID is empty or invalid")
+        }
+    }
+
+    private func validateRecoveryAttemptIdentity(
+        _ attempt: RecoveryAttempt,
+        jobID: String,
+        taskID: String,
+        dateKey: String
+    ) throws {
+        guard attempt.jobID == jobID,
+              attempt.taskID == taskID,
+              attempt.dateKey == dateKey else {
+            throw RecoveryStoreError.mismatchedAttemptIdentity
+        }
+    }
+
+    private func recoveryAttemptLocked(claimID: String) throws -> RecoveryAttempt? {
+        let statement = try prepare(
+            """
+            SELECT claim_id, job_id, task_id, date_key, interrupted_run_id, status,
+                   claimed_at, started_at, finished_at, exit_code
+            FROM recovery_attempts
+            WHERE claim_id = ? LIMIT 1;
+            """
+        )
+        defer { sqlite3_finalize(statement) }
+        try bind(claimID, to: 1, in: statement)
+        let result = sqlite3_step(statement)
+        if result == SQLITE_DONE {
+            return nil
+        }
+        guard result == SQLITE_ROW else {
+            throw databaseError(operation: "read recovery attempt", code: result)
+        }
+        guard let storedClaimID = textColumn(0, in: statement),
+              let storedJobID = textColumn(1, in: statement),
+              let taskID = textColumn(2, in: statement),
+              let dateKey = textColumn(3, in: statement),
+              let status = textColumn(5, in: statement)
+                .flatMap(RecoveryAttemptStatus.init(rawValue:)),
+              sqlite3_column_type(statement, 6) != SQLITE_NULL else {
+            throw SQLiteRunStoreError(
+                operation: "decode recovery attempt",
+                code: SQLITE_CORRUPT,
+                message: "Recovery attempt row contains invalid required fields."
+            )
+        }
+        let interruptedRunID: Int64? = sqlite3_column_type(statement, 4) == SQLITE_NULL
+            ? nil
+            : sqlite3_column_int64(statement, 4)
+        let startedAt: Date? = sqlite3_column_type(statement, 7) == SQLITE_NULL
+            ? nil
+            : Date(timeIntervalSince1970: sqlite3_column_double(statement, 7))
+        let finishedAt: Date? = sqlite3_column_type(statement, 8) == SQLITE_NULL
+            ? nil
+            : Date(timeIntervalSince1970: sqlite3_column_double(statement, 8))
+        let exitCode: Int32? = sqlite3_column_type(statement, 9) == SQLITE_NULL
+            ? nil
+            : sqlite3_column_int(statement, 9)
+        return RecoveryAttempt(
+            claimID: storedClaimID,
+            jobID: try canonicalJobIDLocked(storedJobID),
+            taskID: taskID,
+            dateKey: dateKey,
+            interruptedRunID: interruptedRunID,
+            status: status,
+            claimedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 6)),
+            startedAt: startedAt,
+            finishedAt: finishedAt,
+            exitCode: exitCode
+        )
+    }
+
+    private func requireRecoveryAttemptLocked(claimID: String) throws -> RecoveryAttempt {
+        guard let attempt = try recoveryAttemptLocked(claimID: claimID) else {
+            throw RecoveryStoreError.mismatchedAttemptIdentity
+        }
+        return attempt
+    }
+
+    private static func encodeRecoveryPolicy(_ policy: RecoveryPolicy) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        do {
+            let data = try encoder.encode(policy)
+            guard let encoded = String(data: data, encoding: .utf8) else {
+                throw RecoveryStoreError.malformedPolicy("policy could not be encoded as UTF-8")
+            }
+            return encoded
+        } catch let error as RecoveryStoreError {
+            throw error
+        } catch {
+            throw error
+        }
+    }
+
+    private static func decodeRecoveryPolicy(_ encoded: String) throws -> RecoveryPolicy {
+        guard let data = encoded.data(using: .utf8) else {
+            throw RecoveryStoreError.malformedPolicy("policy is not valid UTF-8")
+        }
+        do {
+            return try JSONDecoder().decode(RecoveryPolicy.self, from: data)
+        } catch {
+            throw RecoveryStoreError.malformedPolicy(error.localizedDescription)
+        }
+    }
+
     private func canonicalJobIDLocked(_ jobID: String) throws -> String {
         var current = jobID
         var visited = Set<String>()
@@ -671,6 +1029,7 @@ public final class SQLiteRunStore: RunStore {
             guard try canonicalJobIDLocked(storedID) == newCanonical else {
                 continue
             }
+            try rekeyRecoveryAttempts(from: storedID, to: newCanonical)
             try rekeyRuns(from: storedID, to: newCanonical)
             try rekeyManagedJob(from: storedID, to: newCanonical)
             try rekeyHealthReset(from: storedID, to: newCanonical)
@@ -758,6 +1117,7 @@ public final class SQLiteRunStore: RunStore {
             SELECT job_id FROM runs
             UNION SELECT job_id FROM managed_jobs
             UNION SELECT job_id FROM health_resets
+            UNION SELECT job_id FROM recovery_attempts
             UNION SELECT old_job_id FROM job_identity_aliases
             UNION SELECT new_job_id FROM job_identity_aliases;
             """
@@ -778,6 +1138,84 @@ public final class SQLiteRunStore: RunStore {
         }
     }
 
+    private func rekeyRecoveryAttempts(from legacyID: String, to newID: String) throws {
+        let readStatement = try prepare(
+            "SELECT claim_id FROM recovery_attempts WHERE job_id = ? ORDER BY claim_id;"
+        )
+        defer { sqlite3_finalize(readStatement) }
+        try bind(legacyID, to: 1, in: readStatement)
+
+        var claimIDs: [String] = []
+        while true {
+            let result = sqlite3_step(readStatement)
+            if result == SQLITE_DONE {
+                break
+            }
+            guard result == SQLITE_ROW, let claimID = textColumn(0, in: readStatement) else {
+                throw databaseError(operation: "read recovery attempts for migration", code: result)
+            }
+            claimIDs.append(claimID)
+        }
+
+        for claimID in claimIDs {
+            let attempt = try requireRecoveryAttemptLocked(claimID: claimID)
+            let collisionStatement = try prepare(
+                """
+                SELECT claim_id FROM recovery_attempts
+                WHERE job_id = ? AND task_id = ? AND date_key = ? LIMIT 1;
+                """
+            )
+            defer { sqlite3_finalize(collisionStatement) }
+            try bind(newID, to: 1, in: collisionStatement)
+            try bind(attempt.taskID, to: 2, in: collisionStatement)
+            try bind(attempt.dateKey, to: 3, in: collisionStatement)
+            let collisionResult = sqlite3_step(collisionStatement)
+            let existingClaimID: String?
+            if collisionResult == SQLITE_DONE {
+                existingClaimID = nil
+            } else if collisionResult == SQLITE_ROW {
+                existingClaimID = textColumn(0, in: collisionStatement)
+            } else {
+                throw databaseError(operation: "check recovery attempt identity collision", code: collisionResult)
+            }
+
+            if let existingClaimID {
+                // Two identities describe the same logical day. Keep one row and
+                // force it terminal-failed so neither stale claimant can retry.
+                let mergeStatement = try prepare(
+                    """
+                    UPDATE recovery_attempts
+                    SET status = 'failed',
+                        finished_at = ?,
+                        exit_code = NULL,
+                        interrupted_run_id = COALESCE(interrupted_run_id, ?)
+                    WHERE claim_id = ?;
+                    """
+                )
+                defer { sqlite3_finalize(mergeStatement) }
+                try bind(Date().timeIntervalSince1970, to: 1, in: mergeStatement)
+                try bind(attempt.interruptedRunID, to: 2, in: mergeStatement)
+                try bind(existingClaimID, to: 3, in: mergeStatement)
+                try stepDone(mergeStatement, operation: "merge recovery attempt identity")
+
+                let deleteStatement = try prepare(
+                    "DELETE FROM recovery_attempts WHERE claim_id = ?;"
+                )
+                defer { sqlite3_finalize(deleteStatement) }
+                try bind(attempt.claimID, to: 1, in: deleteStatement)
+                try stepDone(deleteStatement, operation: "delete duplicate recovery attempt")
+            } else {
+                let updateStatement = try prepare(
+                    "UPDATE recovery_attempts SET job_id = ? WHERE claim_id = ?;"
+                )
+                defer { sqlite3_finalize(updateStatement) }
+                try bind(newID, to: 1, in: updateStatement)
+                try bind(attempt.claimID, to: 2, in: updateStatement)
+                try stepDone(updateStatement, operation: "migrate recovery attempt job id")
+            }
+        }
+    }
+
     private func rekeyRuns(from legacyID: String, to newID: String) throws {
         let statement = try prepare("UPDATE runs SET job_id = ? WHERE job_id = ?;")
         defer { sqlite3_finalize(statement) }
@@ -788,7 +1226,7 @@ public final class SQLiteRunStore: RunStore {
 
     private func rekeyManagedJob(from legacyID: String, to newID: String) throws {
         let readStatement = try prepare(
-            "SELECT wrapped_at, backup_path FROM managed_jobs WHERE job_id = ? LIMIT 1;"
+            "SELECT wrapped_at, backup_path, recovery_policy FROM managed_jobs WHERE job_id = ? LIMIT 1;"
         )
         try bind(legacyID, to: 1, in: readStatement)
         let readResult = sqlite3_step(readStatement)
@@ -802,12 +1240,17 @@ public final class SQLiteRunStore: RunStore {
         }
         let wrappedAt = sqlite3_column_double(readStatement, 0)
         let backupPath = textColumn(1, in: readStatement)
+        guard let encodedPolicy = textColumn(2, in: readStatement) else {
+            sqlite3_finalize(readStatement)
+            throw RecoveryStoreError.malformedPolicy("stored policy is NULL")
+        }
+        _ = try Self.decodeRecoveryPolicy(encodedPolicy)
         sqlite3_finalize(readStatement)
 
         let writeStatement = try prepare(
             """
-            INSERT INTO managed_jobs(job_id, wrapped_at, backup_path)
-            VALUES(?, ?, ?)
+            INSERT INTO managed_jobs(job_id, wrapped_at, backup_path, recovery_policy)
+            VALUES(?, ?, ?, ?)
             ON CONFLICT(job_id) DO UPDATE SET
               wrapped_at = MAX(managed_jobs.wrapped_at, excluded.wrapped_at),
               backup_path = COALESCE(managed_jobs.backup_path, excluded.backup_path);
@@ -816,11 +1259,8 @@ public final class SQLiteRunStore: RunStore {
         defer { sqlite3_finalize(writeStatement) }
         try bind(newID, to: 1, in: writeStatement)
         try bind(wrappedAt, to: 2, in: writeStatement)
-        if let backupPath {
-            try bind(backupPath, to: 3, in: writeStatement)
-        } else {
-            try bindNull(to: 3, in: writeStatement)
-        }
+        try bind(backupPath, to: 3, in: writeStatement)
+        try bind(encodedPolicy, to: 4, in: writeStatement)
         try stepDone(writeStatement, operation: "migrate managed job id")
 
         let deleteStatement = try prepare("DELETE FROM managed_jobs WHERE job_id = ?;")
@@ -1008,6 +1448,74 @@ public final class SQLiteRunStore: RunStore {
         }
         try execute(database: database, sql: "COMMIT;")
         committed = true
+    }
+
+    private static func ensureManagedRecoveryPolicyColumn(database: OpaquePointer) throws {
+        guard !(try tableColumnNames(database: database, table: "managed_jobs"))
+            .contains("recovery_policy") else {
+            return
+        }
+
+        try execute(database: database, sql: "BEGIN IMMEDIATE TRANSACTION;")
+        var committed = false
+        defer {
+            if !committed {
+                try? execute(database: database, sql: "ROLLBACK;")
+            }
+        }
+
+        let existingColumns = try tableColumnNames(database: database, table: "managed_jobs")
+        if !existingColumns.contains("recovery_policy") {
+            try execute(
+                database: database,
+                sql: """
+                ALTER TABLE managed_jobs
+                ADD COLUMN recovery_policy TEXT NOT NULL DEFAULT '{"kind":"alertOnly"}';
+                """
+            )
+        }
+        try execute(database: database, sql: "COMMIT;")
+        committed = true
+    }
+
+    private static func tableColumnNames(
+        database: OpaquePointer,
+        table: String
+    ) throws -> Set<String> {
+        var statement: OpaquePointer?
+        let prepareResult = sqlite3_prepare_v2(
+            database,
+            "PRAGMA table_info(\(table));",
+            -1,
+            &statement,
+            nil
+        )
+        guard prepareResult == SQLITE_OK, let validStatement = statement else {
+            throw SQLiteRunStoreError(
+                operation: "inspect \(table) schema",
+                code: prepareResult,
+                message: String(cString: sqlite3_errmsg(database))
+            )
+        }
+        defer { sqlite3_finalize(validStatement) }
+
+        var result = Set<String>()
+        while true {
+            let stepResult = sqlite3_step(validStatement)
+            if stepResult == SQLITE_ROW {
+                if let name = sqlite3_column_text(validStatement, 1) {
+                    result.insert(String(cString: name))
+                }
+            } else if stepResult == SQLITE_DONE {
+                return result
+            } else {
+                throw SQLiteRunStoreError(
+                    operation: "inspect \(table) schema",
+                    code: stepResult,
+                    message: String(cString: sqlite3_errmsg(database))
+                )
+            }
+        }
     }
 
     private static func runColumnNames(database: OpaquePointer) throws -> Set<String> {

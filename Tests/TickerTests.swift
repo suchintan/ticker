@@ -14839,12 +14839,956 @@ private func test17_AttentionNotificationPlanner(_ tests: TestHarness) {
     )
 }
 
+private func test18_RecoveryCore(_ tests: TestHarness) throws {
+    let retryPolicy = try RecoveryPolicy(taskID: "daily-recovery", timeZone: "America/New_York")
+    let policyData = try JSONEncoder().encode(retryPolicy)
+    tests.expectEqual(
+        try JSONDecoder().decode(RecoveryPolicy.self, from: policyData),
+        retryPolicy,
+        "test18_recoveryPolicy_roundTrips"
+    )
+    tests.expectThrows(
+        try RecoveryPolicy(taskID: " \n", timeZone: "America/New_York"),
+        "test18_recoveryPolicy_rejects_empty_or_control_task_id"
+    )
+    tests.expectThrows(
+        try RecoveryPolicy(taskID: "task", timeZone: "Not/AZone"),
+        "test18_recoveryPolicy_rejects_unknown_time_zone"
+    )
+    tests.expectEqual(
+        try RecoveryDate.key(
+            for: Date(timeIntervalSince1970: 1_707_199_200),
+            timeZoneIdentifier: "America/New_York"
+        ),
+        "2024-02-06",
+        "test18_recoveryDate_uses_timezone_calendar"
+    )
+    tests.expectThrows(
+        try JSONDecoder().decode(
+            RecoveryPolicy.self,
+            from: Data(#"{"kind":"alertOnly","taskID":"unexpected"}"#.utf8)
+        ),
+        "test18_recoveryPolicy_malformed_encoding_fails_closed"
+    )
+
+    try withTemporaryDirectory("round18-recovery-core") { directory in
+        let databaseURL = directory.appendingPathComponent("recovery.sqlite")
+        let openedStore = try SQLiteRunStore(path: databaseURL.path)
+        try openedStore.markManaged(jobID: "launchd:recovery", backupPath: nil)
+        tests.expectEqual(
+            try openedStore.recoveryPolicy(jobID: "launchd:recovery"),
+            .alertOnly,
+            "test18_new_managed_job_defaults_alert_only"
+        )
+        try openedStore.setRecoveryPolicy(jobID: "launchd:recovery", policy: retryPolicy)
+        try openedStore.markManaged(jobID: "launchd:recovery", backupPath: "/tmp/backup")
+        tests.expectEqual(
+            try openedStore.recoveryPolicy(jobID: "launchd:recovery"),
+            retryPolicy,
+            "test18_rewrap_preserves_recovery_policy"
+        )
+        tests.expectThrows(
+            try openedStore.setRecoveryPolicy(jobID: "launchd:unmanaged", policy: retryPolicy),
+            "test18_setting_policy_on_unmanaged_job_fails"
+        )
+
+        let scheduledRun = try openedStore.beginRun(
+            jobID: "launchd:recovery",
+            startedAt: Date(timeIntervalSince1970: 10),
+            trigger: .scheduled,
+            context: RunStartContext(
+                processID: getpid(),
+                bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+                nativeExitStatusAtStart: nil,
+                launchdRunCountAtStart: 1
+            )
+        )
+        let recoveryRun = try openedStore.beginRun(
+            jobID: "launchd:recovery",
+            startedAt: Date(timeIntervalSince1970: 11),
+            trigger: .recovery,
+            context: RunStartContext(
+                processID: getpid(),
+                bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+                nativeExitStatusAtStart: nil,
+                launchdRunCountAtStart: nil
+            )
+        )
+        let healthJob = Job(
+            id: "launchd:recovery",
+            source: .launchd,
+            label: "recovery",
+            schedule: .onDemand,
+            command: ["/bin/true"],
+            cwd: nil,
+            enabled: true,
+            configPath: nil,
+            lastKnownExit: nil,
+            lastRunAt: nil,
+            lastScheduledFor: nil,
+            managed: true
+        )
+        tests.expectEqual(
+            try openedStore.health()[healthJob.id],
+            .running,
+            "test18_recovery_trigger_preserves_scheduled_health"
+        )
+        tests.expectEqual(
+            try openedStore.scheduledHealthRuns()[healthJob.id]?.id,
+            scheduledRun,
+            "test18_recovery_trigger_does_not_replace_scheduled_health_record"
+        )
+        tests.expectEqual(
+            try openedStore.latestRun(jobID: healthJob.id)?.id,
+            recoveryRun,
+            "test18_recovery_run_is_stored"
+        )
+
+        let firstClaim = try require(
+            try openedStore.claimRecoveryAttempt(
+                claimID: "claim-old",
+                jobID: "launchd:old",
+                taskID: "daily-recovery",
+                dateKey: "2024-02-06",
+                interruptedRunID: 7,
+                claimedAt: Date(timeIntervalSince1970: 20)
+            ),
+            "test18 first recovery claim"
+        )
+        tests.expectEqual(firstClaim.status, .claimed, "test18_claim_starts_claimed")
+        tests.expectEqual(
+            try openedStore.claimRecoveryAttempt(
+                claimID: "claim-duplicate",
+                jobID: "launchd:old",
+                taskID: "daily-recovery",
+                dateKey: "2024-02-06",
+                interruptedRunID: 8,
+                claimedAt: Date(timeIntervalSince1970: 21)
+            ),
+            nil,
+            "test18_duplicate_recovery_claim_returns_nil"
+        )
+        tests.expectThrows(
+            try openedStore.finishRecoveryAttempt(
+                claimID: firstClaim.claimID,
+                jobID: "launchd:old",
+                taskID: firstClaim.taskID,
+                dateKey: firstClaim.dateKey,
+                status: .succeeded,
+                finishedAt: Date(timeIntervalSince1970: 22),
+                exitCode: 0
+            ),
+            "test18_terminal_transition_requires_running"
+        )
+        let running = try openedStore.startRecoveryAttempt(
+            claimID: firstClaim.claimID,
+            jobID: firstClaim.jobID,
+            taskID: firstClaim.taskID,
+            dateKey: firstClaim.dateKey,
+            startedAt: Date(timeIntervalSince1970: 23)
+        )
+        tests.expectEqual(running.status, .running, "test18_claimed_transitions_to_running")
+        let succeeded = try openedStore.finishRecoveryAttempt(
+            claimID: running.claimID,
+            jobID: running.jobID,
+            taskID: running.taskID,
+            dateKey: running.dateKey,
+            status: .succeeded,
+            finishedAt: Date(timeIntervalSince1970: 24),
+            exitCode: 0
+        )
+        tests.expectEqual(succeeded.status, .succeeded, "test18_running_transitions_to_terminal")
+        tests.expectThrows(
+            try openedStore.startRecoveryAttempt(
+                claimID: running.claimID,
+                jobID: running.jobID,
+                taskID: running.taskID,
+                dateKey: running.dateKey,
+                startedAt: Date(timeIntervalSince1970: 25)
+            ),
+            "test18_terminal_claim_cannot_start_again"
+        )
+
+        let newClaim = try require(
+            try openedStore.claimRecoveryAttempt(
+                claimID: "claim-new",
+                jobID: "launchd:new",
+                taskID: "daily-recovery",
+                dateKey: "2024-02-06",
+                interruptedRunID: nil,
+                claimedAt: Date(timeIntervalSince1970: 30)
+            ),
+            "test18 new identity recovery claim"
+        )
+        try openedStore.migrateJobIdentity(from: "launchd:old", to: "launchd:new")
+        tests.expectEqual(
+            try openedStore.recoveryAttempt(claimID: newClaim.claimID)?.status,
+            .failed,
+            "test18_identity_collision_merges_fail_closed"
+        )
+        try openedStore.unmarkManaged(jobID: "launchd:recovery")
+        tests.expectEqual(
+            try openedStore.recoveryAttempt(claimID: newClaim.claimID)?.status,
+            .failed,
+            "test18_unmark_does_not_delete_attempt_history"
+        )
+
+    }
+
+    try withTemporaryDirectory("round18-recovery-agent") { home in
+        var loaded = false
+        var loadedSubcommand = "recover"
+        var calls: [[String]] = []
+        let controller = RecoveryAgentController(
+            homeDirectory: home,
+            uid: 42,
+            launchctl: { arguments in
+                calls.append(arguments)
+                switch arguments.first {
+                case "print" where loaded:
+                    return LoginItemCommandResult(
+                        status: 0,
+                        stdout: "gui/42/\(RecoveryAgentController.agentLabel) = {\n"
+                            + " state = running\n"
+                            + " program = \(RecoveryAgentController.helperExecutablePath)\n"
+                            + " arguments = {\n"
+                            + "  \(RecoveryAgentController.helperExecutablePath)\n"
+                            + "  \(loadedSubcommand)\n"
+                            + " }\n"
+                            + "}\n"
+                    )
+                case "print":
+                    return LoginItemCommandResult(status: 113, stderr: "Could not find service")
+                case "bootstrap":
+                    loaded = true
+                    return LoginItemCommandResult(status: 0)
+                case "bootout":
+                    loaded = false
+                    return LoginItemCommandResult(status: 0)
+                default:
+                    return LoginItemCommandResult(status: 1, stderr: "unexpected launchctl call")
+                }
+            }
+        )
+        tests.expectEqual(controller.enable(), .enabled, "test18_recoveryAgent_enable_verifies_target")
+        let installedRecoveryPlistData = try Data(contentsOf: controller.plistURL)
+        let plist = try require(
+            try PropertyListSerialization.propertyList(
+                from: Data(contentsOf: controller.plistURL),
+                options: [],
+                format: nil
+            ) as? [String: Any],
+            "test18 recovery plist"
+        )
+        tests.expectEqual(
+            plist["ProgramArguments"] as? [String],
+            RecoveryAgentController.programArguments,
+            "test18_recoveryAgent_program_arguments_are_exact"
+        )
+        tests.expectEqual(plist["RunAtLoad"] as? Bool, true, "test18_recoveryAgent_run_at_load")
+        tests.expectEqual(plist["KeepAlive"] as? Bool, false, "test18_recoveryAgent_not_keep_alive")
+        tests.expect(
+            (plist["StandardOutPath"] as? String)?.hasPrefix(home.appendingPathComponent(".ticker").path)
+                == true,
+            "test18_recoveryAgent_stdout_is_under_ticker_home"
+        )
+        tests.expectEqual(controller.status(), .enabled, "test18_recoveryAgent_status_enabled")
+        loadedSubcommand = "list"
+        let wrongArgumentsStatus = controller.status()
+        tests.expect(
+            {
+                if case .failed = wrongArgumentsStatus { return true }
+                return false
+            }(),
+            "test18_recoveryAgent_rejects_wrong_loaded_arguments"
+        )
+        loadedSubcommand = "recover"
+        tests.expectEqual(controller.disable(), .disabled, "test18_recoveryAgent_disable_verifies_absence")
+        let recoveryCustodyDirectory = home
+            .appendingPathComponent(".ticker", isDirectory: true)
+            .appendingPathComponent("recovery-agent-custody", isDirectory: true)
+        let releasedRecoveryPlists = try FileManager.default.contentsOfDirectory(
+            at: recoveryCustodyDirectory,
+            includingPropertiesForKeys: nil
+        )
+        tests.expectEqual(
+            releasedRecoveryPlists.count,
+            1,
+            "test18_recoveryAgent_retains_validated_released_custody"
+        )
+        tests.expectEqual(
+            try Data(contentsOf: releasedRecoveryPlists[0]),
+            installedRecoveryPlistData,
+            "test18_recoveryAgent_custody_preserves_exact_plist_bytes"
+        )
+        tests.expect(
+            calls.contains(["bootstrap", "gui/42", controller.plistURL.path]),
+            "test18_recoveryAgent_bootstraps_exact_domain_and_path"
+        )
+        tests.expect(
+            calls.contains(["bootout", "gui/42/\(RecoveryAgentController.agentLabel)"]),
+            "test18_recoveryAgent_boots_out_exact_target"
+        )
+        try writePropertyList(
+            ["Label": "com.example.foreign"],
+            to: controller.plistURL
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: controller.plistURL.path
+        )
+        let foreignRecoveryPlistData = try Data(contentsOf: controller.plistURL)
+        let tamperedDisable = controller.disable()
+        tests.expect(
+            {
+                if case .failed = tamperedDisable { return true }
+                return false
+            }(),
+            "test18_recoveryAgent_refuses_tampered_regular_plist"
+        )
+        tests.expect(
+            FileManager.default.fileExists(atPath: controller.plistURL.path),
+            "test18_recoveryAgent_preserves_unowned_regular_plist"
+        )
+        let foreignEnable = controller.enable()
+        tests.expect(
+            {
+                if case .failed = foreignEnable { return true }
+                return false
+            }(),
+            "test18_recoveryAgent_refuses_foreign_regular_plist_on_enable"
+        )
+        tests.expectEqual(
+            try Data(contentsOf: controller.plistURL),
+            foreignRecoveryPlistData,
+            "test18_recoveryAgent_enable_preserves_unowned_regular_plist"
+        )
+    }
+}
+
+private func test19_RecoveryCLI(_ tests: TestHarness) throws {
+    let tickerPath = try test3A_builtCLIPath()
+    try withTemporaryDirectory("round19-recovery-cli") { directory in
+        let storePath = directory.appendingPathComponent("ticker.sqlite").path
+        let store = try SQLiteRunStore(path: storePath)
+        try store.markManaged(jobID: "launchd:policy", backupPath: nil)
+        let environment = ["TICKER_STORE_PATH": storePath]
+
+        let initial = try test3A_runProcess(
+            tickerPath,
+            ["recovery-policy", "launchd:policy", "--json"],
+            environment: environment
+        )
+        tests.expectEqual(initial.status, 0, "test19_recoveryPolicy_status_cli_succeeds")
+        tests.expect(
+            initial.stdout.contains("\"jobID\"") && initial.stdout.contains("\"alertOnly\""),
+            "test19_recoveryPolicy_json_is_stable"
+        )
+
+        let set = try test3A_runProcess(
+            tickerPath,
+            [
+                "recovery-policy", "launchd:policy", "retry-idempotent",
+                "--task-id", "daily-task", "--time-zone", "America/New_York", "--json",
+            ],
+            environment: environment
+        )
+        tests.expectEqual(set.status, 0, "test19_recoveryPolicy_set_cli_succeeds")
+        let setRecord = try require(
+            try JSONSerialization.jsonObject(with: Data(set.stdout.utf8)) as? [String: Any],
+            "test19 recovery policy set JSON"
+        )
+        let setPolicy = try require(
+            setRecord["policy"] as? [String: Any],
+            "test19 recovery policy contract JSON"
+        )
+        tests.expect(
+            setPolicy["kind"] as? String == "retryIdempotent"
+                && setPolicy["taskID"] as? String == "daily-task"
+                && setPolicy["timeZone"] as? String == "America/New_York"
+                && Set(setPolicy.keys) == ["kind", "taskID", "timeZone"],
+            "test19_recoveryPolicy_set_json_contains_only_contract_fields"
+        )
+
+        let invalid = try test3A_runProcess(
+            tickerPath,
+            ["recovery-policy", "launchd:policy", "retry-idempotent", "--task-id", "daily-task"],
+            environment: environment
+        )
+        tests.expectEqual(invalid.status, 2, "test19_recoveryPolicy_rejects_inexact_arguments")
+
+        let unmanaged = try test3A_runProcess(
+            tickerPath,
+            ["recovery-policy", "launchd:unmanaged"],
+            environment: environment
+        )
+        tests.expect(unmanaged.status != 0, "test19_recoveryPolicy_rejects_unmanaged_rows")
+
+        let home = directory.appendingPathComponent("home", isDirectory: true)
+        let state = directory.appendingPathComponent("recovery-agent.state")
+        let fakeLaunchctl = directory.appendingPathComponent("recovery-launchctl")
+        try """
+        #!/bin/sh
+        set -eu
+        case "${1:-}" in
+          print)
+            if [ -f "$TICKER_TEST_RECOVERY_AGENT_STATE" ]; then
+              printf 'gui/%s/com.suchintan.ticker.recover = {\\n state = running\\n program = /Applications/Ticker.app/Contents/Helpers/ticker\\n arguments = {\\n  /Applications/Ticker.app/Contents/Helpers/ticker\\n  recover\\n }\\n}\\n' "$TICKER_TEST_RECOVERY_AGENT_UID"
+              exit 0
+            fi
+            printf 'Could not find service\\n' >&2
+            exit 113
+            ;;
+          bootstrap)
+            : > "$TICKER_TEST_RECOVERY_AGENT_STATE"
+            ;;
+          bootout)
+            rm -f "$TICKER_TEST_RECOVERY_AGENT_STATE"
+            ;;
+          *) exit 64 ;;
+        esac
+        """.write(to: fakeLaunchctl, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeLaunchctl.path)
+        var agentEnvironment = environment
+        agentEnvironment["TICKER_TEST_RECOVERY_AGENT_HOME"] = home.path
+        agentEnvironment["TICKER_TEST_RECOVERY_AGENT_UID"] = "42"
+        agentEnvironment["TICKER_TEST_RECOVERY_AGENT_STATE"] = state.path
+        agentEnvironment["TICKER_TEST_LAUNCHCTL_PATH"] = fakeLaunchctl.path
+
+        let disabled = try test3A_runProcess(
+            tickerPath,
+            ["recovery-agent", "status"],
+            environment: agentEnvironment
+        )
+        tests.expectEqual(disabled.status, 0, "test19_recoveryAgent_status_disabled")
+        tests.expectEqual(disabled.stdout.trimmingCharacters(in: .whitespacesAndNewlines), "disabled",
+                           "test19_recoveryAgent_prints_disabled")
+        let enabled = try test3A_runProcess(
+            tickerPath,
+            ["recovery-agent", "enable"],
+            environment: agentEnvironment
+        )
+        tests.expectEqual(enabled.status, 0, "test19_recoveryAgent_enable_succeeds")
+        let afterEnable = try test3A_runProcess(
+            tickerPath,
+            ["recovery-agent", "status"],
+            environment: agentEnvironment
+        )
+        tests.expectEqual(afterEnable.stdout.trimmingCharacters(in: .whitespacesAndNewlines), "enabled",
+                           "test19_recoveryAgent_status_enabled")
+        let afterDisable = try test3A_runProcess(
+            tickerPath,
+            ["recovery-agent", "disable"],
+            environment: agentEnvironment
+        )
+        tests.expectEqual(afterDisable.status, 0, "test19_recoveryAgent_disable_succeeds")
+        tests.expectEqual(afterDisable.stdout.trimmingCharacters(in: .whitespacesAndNewlines), "disabled",
+                           "test19_recoveryAgent_prints_disabled_after_disable")
+    }
+}
+
+private struct Test19RecoveryFixture {
+    let root: URL
+    let launchdDirectory: URL
+    let emptyLaunchdDirectory: URL
+    let storePath: String
+    let fakeLaunchctl: URL
+    let passingCrontab: URL
+    let failingCrontab: URL
+    let tickerPath: String
+    let runner: URL
+    let capture: URL
+    let cwd: URL
+    let job: Job
+    let environment: [String: String]
+}
+
+private func test19_writeExecutable(_ content: String, to url: URL) throws {
+    try content.write(to: url, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+}
+
+private func test19_makeRecoveryFixture(
+    root: URL,
+    tickerPath: String,
+    label: String = "com.example.test19.recovery",
+    commandArguments: [String] = ["original-flag"]
+) throws -> Test19RecoveryFixture {
+    let launchdDirectory = root.appendingPathComponent("LaunchAgents", isDirectory: true)
+    let emptyLaunchdDirectory = root.appendingPathComponent("empty-launchd", isDirectory: true)
+    let claudeRoot = root.appendingPathComponent("claude", isDirectory: true)
+    let cwd = root.appendingPathComponent("job-cwd", isDirectory: true)
+    let backups = root.appendingPathComponent("backups", isDirectory: true)
+    let capture = root.appendingPathComponent("runner-capture.txt")
+    let runner = root.appendingPathComponent("fake-runner.sh")
+    let fakeLaunchctl = root.appendingPathComponent("launchctl")
+    let passingCrontab = root.appendingPathComponent("crontab-ok")
+    let failingCrontab = root.appendingPathComponent("crontab-fails")
+    let storePath = root.appendingPathComponent("ticker.sqlite").path
+
+    for directory in [launchdDirectory, emptyLaunchdDirectory, claudeRoot, cwd, backups] {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+    try test19_writeExecutable(
+        """
+        #!/bin/sh
+        set -eu
+        {
+          printf 'argc=%s\\n' "$#"
+          for argument in "$@"; do
+            printf 'arg=%s\\n' "$argument"
+          done
+          printf 'cwd=%s\\n' "$PWD"
+          printf 'marker=%s\\n' "${TICKER_TEST19_MARKER:-missing}"
+        } > "$TICKER_TEST19_CAPTURE"
+        printf 'RECOVERY-STDOUT\\n'
+        printf 'RECOVERY-STDERR\\n' >&2
+        exit "${TICKER_TEST19_EXIT_CODE:-0}"
+        """,
+        to: runner
+    )
+    try test19_writeExecutable(
+        """
+        #!/bin/sh
+        set -eu
+        [ "${1:-}" = print ] || exit 64
+        printf 'gui/test19 = {\\n    pid = 1\\n'
+        if [ "${TICKER_TEST19_LAUNCHD_RUNS_MODE:-present}" = present ]; then
+          printf '    runs = 1\\n'
+        fi
+        printf '    last exit code = 0\\n}\\n'
+        """,
+        to: fakeLaunchctl
+    )
+    try test19_writeExecutable("#!/bin/sh\nexit 0\n", to: passingCrontab)
+    try test19_writeExecutable("#!/bin/sh\nexit 1\n", to: failingCrontab)
+
+    let plistURL = launchdDirectory.appendingPathComponent("\(label).plist")
+    try writePropertyList(
+        [
+            "Label": label,
+            "ProgramArguments": [runner.path] + commandArguments,
+            "WorkingDirectory": cwd.path,
+            "EnvironmentVariables": [
+                "TICKER_TEST19_CAPTURE": capture.path,
+                "TICKER_TEST19_MARKER": "launchd-context",
+                "TICKER_TEST19_EXIT_CODE": "0",
+            ],
+        ],
+        to: plistURL
+    )
+
+    let store = try SQLiteRunStore(path: storePath)
+    let originalJob = try test8_discoverLaunchdJob(in: [launchdDirectory], label: label)
+    let wrapper = JobWrapper(store: store, backupDirectory: backups)
+    _ = try wrapper.wrap(job: originalJob, tickerPath: tickerPath)
+    let currentJob = try test8_discoverLaunchdJob(in: [launchdDirectory], label: label)
+    var environment = ProcessInfo.processInfo.environment
+    environment["TICKER_STORE_PATH"] = storePath
+    environment["TICKER_TEST_LAUNCHD_DIRECTORIES"] = launchdDirectory.path
+    environment["TICKER_TEST_LAUNCHCTL_PATH"] = fakeLaunchctl.path
+    environment["TICKER_CRONTAB_PATH"] = passingCrontab.path
+    environment["TICKER_TEST_CLAUDE_ROOTS"] = claudeRoot.path
+    environment["TICKER_TEST19_LAUNCHD_RUNS_MODE"] = "present"
+
+    return Test19RecoveryFixture(
+        root: root,
+        launchdDirectory: launchdDirectory,
+        emptyLaunchdDirectory: emptyLaunchdDirectory,
+        storePath: storePath,
+        fakeLaunchctl: fakeLaunchctl,
+        passingCrontab: passingCrontab,
+        failingCrontab: failingCrontab,
+        tickerPath: tickerPath,
+        runner: runner,
+        capture: capture,
+        cwd: cwd,
+        job: currentJob,
+        environment: environment
+    )
+}
+
+private func test19_addRun(
+    store: SQLiteRunStore,
+    jobID: String,
+    startedAt: Date,
+    launchdRunCountAtStart: Int64?,
+    processID: Int32 = Int32.max,
+    trigger: RunTrigger = .scheduled
+) throws -> Int64 {
+    try store.beginRun(
+        jobID: jobID,
+        startedAt: startedAt,
+        trigger: trigger,
+        context: RunStartContext(
+            processID: processID,
+            bootSessionID: RunExecutionEvidence.currentBootSessionID(),
+            nativeExitStatusAtStart: 0,
+            launchdRunCountAtStart: launchdRunCountAtStart
+        )
+    )
+}
+
+private func test19_recover(
+    fixture: Test19RecoveryFixture,
+    environment: [String: String]? = nil
+) throws -> test3A_ProcessResult {
+    try test3A_runProcess(
+        fixture.tickerPath,
+        ["recover", "--json"],
+        environment: environment ?? fixture.environment
+    )
+}
+
+private func test19_records(_ output: String) throws -> [[String: Any]] {
+    try require(
+        try JSONSerialization.jsonObject(with: Data(output.utf8)) as? [[String: Any]],
+        "test19 recovery JSON records"
+    )
+}
+
+private func test19_recoveryAttemptCount(storePath: String) throws -> Int {
+    var database: OpaquePointer?
+    guard sqlite3_open_v2(storePath, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+          let database else {
+        throw FixtureError.missing("test19 recovery attempt database")
+    }
+    defer { sqlite3_close_v2(database) }
+
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(
+        database,
+        "SELECT COUNT(*) FROM recovery_attempts;",
+        -1,
+        &statement,
+        nil
+    ) == SQLITE_OK,
+    let statement else {
+        throw FixtureError.missing("test19 recovery attempt count statement")
+    }
+    defer { sqlite3_finalize(statement) }
+    guard sqlite3_step(statement) == SQLITE_ROW else {
+        throw FixtureError.missing("test19 recovery attempt count row")
+    }
+    return Int(sqlite3_column_int64(statement, 0))
+}
+
+private func test19_recoveryChild(
+    fixture: Test19RecoveryFixture,
+    claimID: String,
+    taskID: String,
+    dateKey: String,
+    command: [String],
+    environment: [String: String]? = nil
+) throws -> test3A_ProcessResult {
+    try test3A_runProcess(
+        fixture.tickerPath,
+        [
+            "run", "--recovery",
+            "--recovery-claim", claimID,
+            "--recovery-task", taskID,
+            "--recovery-date", dateKey,
+            "--label", fixture.job.id,
+            "--",
+        ] + command,
+        environment: environment ?? fixture.environment
+    )
+}
+
+private func test19_RecoveryRuntime(_ tests: TestHarness) throws {
+    let tickerPath = try test3A_builtCLIPath()
+    try withTemporaryDirectory("round19-recovery-runtime") { root in
+        let alertRoot = root.appendingPathComponent("alert", isDirectory: true)
+        try FileManager.default.createDirectory(at: alertRoot, withIntermediateDirectories: true)
+        let alert = try test19_makeRecoveryFixture(root: alertRoot, tickerPath: tickerPath)
+        let alertStore = try SQLiteRunStore(path: alert.storePath)
+        try alertStore.setRecoveryPolicy(jobID: alert.job.id, policy: .alertOnly)
+        _ = try test19_addRun(
+            store: alertStore,
+            jobID: alert.job.id,
+            startedAt: try utcDate(2025, 1, 1, 0, 30),
+            launchdRunCountAtStart: 0
+        )
+        let alertResult = try test19_recover(fixture: alert)
+        let alertRecords = try test19_records(alertResult.stdout)
+        tests.expectEqual(alertResult.status, 0, "test19_runtime_alertOnly_recover_succeeds")
+        tests.expectEqual(alertRecords.first?["status"] as? String, "reported",
+                          "test19_runtime_alertOnly_reports_without_launch")
+        tests.expectEqual(try test19_recoveryAttemptCount(storePath: alert.storePath), 0,
+                          "test19_runtime_alertOnly_creates_no_attempt")
+        tests.expect(!FileManager.default.fileExists(atPath: alert.capture.path),
+                     "test19_runtime_alertOnly_does_not_execute_runner")
+
+        let missingRoot = root.appendingPathComponent("missing-discovery", isDirectory: true)
+        try FileManager.default.createDirectory(at: missingRoot, withIntermediateDirectories: true)
+        let missing = try test19_makeRecoveryFixture(root: missingRoot, tickerPath: tickerPath)
+        let missingStore = try SQLiteRunStore(path: missing.storePath)
+        try missingStore.setRecoveryPolicy(
+            jobID: missing.job.id,
+            policy: try RecoveryPolicy(taskID: "daily-task", timeZone: "America/New_York")
+        )
+        _ = try test19_addRun(
+            store: missingStore,
+            jobID: missing.job.id,
+            startedAt: try utcDate(2025, 1, 1, 0, 30),
+            launchdRunCountAtStart: 0
+        )
+        var missingEnvironment = missing.environment
+        missingEnvironment["TICKER_TEST_LAUNCHD_DIRECTORIES"] = missing.emptyLaunchdDirectory.path
+        let missingResult = try test19_recover(fixture: missing, environment: missingEnvironment)
+        let missingRecords = try test19_records(missingResult.stdout)
+        tests.expectEqual(missingResult.status, 0, "test19_runtime_missingDiscovery_recover_succeeds")
+        tests.expectEqual(missingRecords.first?["status"] as? String, "skipped",
+                          "test19_runtime_missingDiscovery_reports_no_launch")
+        tests.expectEqual(try test19_recoveryAttemptCount(storePath: missing.storePath), 0,
+                          "test19_runtime_missingDiscovery_creates_no_attempt")
+        tests.expect(!FileManager.default.fileExists(atPath: missing.capture.path),
+                     "test19_runtime_missingDiscovery_does_not_execute_runner")
+
+        let incompleteRoot = root.appendingPathComponent("incomplete-discovery", isDirectory: true)
+        try FileManager.default.createDirectory(at: incompleteRoot, withIntermediateDirectories: true)
+        let incomplete = try test19_makeRecoveryFixture(root: incompleteRoot, tickerPath: tickerPath)
+        let incompleteStore = try SQLiteRunStore(path: incomplete.storePath)
+        try incompleteStore.setRecoveryPolicy(
+            jobID: incomplete.job.id,
+            policy: try RecoveryPolicy(taskID: "daily-task", timeZone: "America/New_York")
+        )
+        _ = try test19_addRun(
+            store: incompleteStore,
+            jobID: incomplete.job.id,
+            startedAt: try utcDate(2025, 1, 1, 0, 30),
+            launchdRunCountAtStart: 0
+        )
+        var incompleteEnvironment = incomplete.environment
+        incompleteEnvironment["TICKER_CRONTAB_PATH"] = incomplete.failingCrontab.path
+        let incompleteResult = try test19_recover(fixture: incomplete, environment: incompleteEnvironment)
+        let incompleteRecords = try test19_records(incompleteResult.stdout)
+        tests.expectEqual(incompleteResult.status, 0, "test19_runtime_incompleteDiscovery_recover_succeeds")
+        tests.expectEqual(incompleteRecords.first?["status"] as? String, "skipped",
+                          "test19_runtime_incompleteDiscovery_reports_no_launch")
+        tests.expectEqual(try test19_recoveryAttemptCount(storePath: incomplete.storePath), 0,
+                          "test19_runtime_incompleteDiscovery_creates_no_attempt")
+        tests.expect(!FileManager.default.fileExists(atPath: incomplete.capture.path),
+                     "test19_runtime_incompleteDiscovery_does_not_execute_runner")
+
+        let missingStartRoot = root.appendingPathComponent("missing-start-count", isDirectory: true)
+        try FileManager.default.createDirectory(at: missingStartRoot, withIntermediateDirectories: true)
+        let missingStart = try test19_makeRecoveryFixture(root: missingStartRoot, tickerPath: tickerPath)
+        let missingStartStore = try SQLiteRunStore(path: missingStart.storePath)
+        try missingStartStore.setRecoveryPolicy(
+            jobID: missingStart.job.id,
+            policy: try RecoveryPolicy(taskID: "daily-task", timeZone: "America/New_York")
+        )
+        _ = try test19_addRun(
+            store: missingStartStore,
+            jobID: missingStart.job.id,
+            startedAt: try utcDate(2025, 1, 1, 0, 30),
+            launchdRunCountAtStart: nil
+        )
+        let missingStartResult = try test19_recover(fixture: missingStart)
+        tests.expectEqual(missingStartResult.status, 0, "test19_runtime_missingStartCount_recover_succeeds")
+        tests.expectEqual(try test19_records(missingStartResult.stdout).count, 0,
+                          "test19_runtime_missingStartCount_reports_no_launch")
+        tests.expectEqual(try test19_recoveryAttemptCount(storePath: missingStart.storePath), 0,
+                          "test19_runtime_missingStartCount_creates_no_attempt")
+        tests.expect(!FileManager.default.fileExists(atPath: missingStart.capture.path),
+                     "test19_runtime_missingStartCount_does_not_execute_runner")
+
+        let missingCurrentRoot = root.appendingPathComponent("missing-current-count", isDirectory: true)
+        try FileManager.default.createDirectory(at: missingCurrentRoot, withIntermediateDirectories: true)
+        let missingCurrent = try test19_makeRecoveryFixture(root: missingCurrentRoot, tickerPath: tickerPath)
+        let missingCurrentStore = try SQLiteRunStore(path: missingCurrent.storePath)
+        try missingCurrentStore.setRecoveryPolicy(
+            jobID: missingCurrent.job.id,
+            policy: try RecoveryPolicy(taskID: "daily-task", timeZone: "America/New_York")
+        )
+        _ = try test19_addRun(
+            store: missingCurrentStore,
+            jobID: missingCurrent.job.id,
+            startedAt: try utcDate(2025, 1, 1, 0, 30),
+            launchdRunCountAtStart: 0
+        )
+        var missingCurrentEnvironment = missingCurrent.environment
+        missingCurrentEnvironment["TICKER_TEST19_LAUNCHD_RUNS_MODE"] = "missing"
+        let missingCurrentResult = try test19_recover(
+            fixture: missingCurrent,
+            environment: missingCurrentEnvironment
+        )
+        tests.expectEqual(missingCurrentResult.status, 0, "test19_runtime_missingCurrentCount_recover_succeeds")
+        tests.expectEqual(try test19_records(missingCurrentResult.stdout).count, 0,
+                          "test19_runtime_missingCurrentCount_reports_no_launch")
+        tests.expectEqual(try test19_recoveryAttemptCount(storePath: missingCurrent.storePath), 0,
+                          "test19_runtime_missingCurrentCount_creates_no_attempt")
+        tests.expect(!FileManager.default.fileExists(atPath: missingCurrent.capture.path),
+                     "test19_runtime_missingCurrentCount_does_not_execute_runner")
+
+        let validRoot = root.appendingPathComponent("valid", isDirectory: true)
+        try FileManager.default.createDirectory(at: validRoot, withIntermediateDirectories: true)
+        let valid = try test19_makeRecoveryFixture(root: validRoot, tickerPath: tickerPath)
+        let validStore = try SQLiteRunStore(path: valid.storePath)
+        let validPolicy = try RecoveryPolicy(taskID: "daily-task", timeZone: "America/New_York")
+        try validStore.setRecoveryPolicy(jobID: valid.job.id, policy: validPolicy)
+        let validStartedAt = try utcDate(2025, 1, 1, 0, 30)
+        let validRunID = try test19_addRun(
+            store: validStore,
+            jobID: valid.job.id,
+            startedAt: validStartedAt,
+            launchdRunCountAtStart: 0
+        )
+        let validResult = try test19_recover(fixture: valid)
+        let validRecords = try test19_records(validResult.stdout)
+        let validRecord = try require(validRecords.first, "test19 valid recovery record")
+        tests.expectEqual(validResult.status, 0, "test19_runtime_valid_recover_succeeds")
+        tests.expectEqual(validRecord["status"] as? String, "succeeded",
+                          "test19_runtime_valid_claim_reaches_succeeded")
+        tests.expectEqual(validRecord["dateKey"] as? String, "2024-12-31",
+                          "test19_runtime_retry_date_uses_newYork_boundary")
+        tests.expectEqual(validRecord["exitCode"] as? Int32, 0,
+                          "test19_runtime_valid_claim_records_exact_success_exit")
+        tests.expectEqual(try test19_recoveryAttemptCount(storePath: valid.storePath), 1,
+                          "test19_runtime_valid_claim_is_atomic_and_unique")
+        let validRuns = try validStore.runs(jobID: valid.job.id, limit: Int.max)
+        let recoveryRuns = validRuns.filter { $0.trigger == .recovery }
+        tests.expectEqual(recoveryRuns.count, 1, "test19_runtime_valid_creates_one_recovery_run")
+        tests.expectEqual(recoveryRuns.first?.exitCode, 0, "test19_runtime_valid_run_records_exit")
+        tests.expectEqual(recoveryRuns.first?.finishedAt == nil, false,
+                          "test19_runtime_valid_run_reaches_terminal_ledger_state")
+        tests.expectEqual(
+            try validStore.scheduledHealthRuns()[valid.job.id]?.id,
+            validRunID,
+            "test19_runtime_recovery_does_not_replace_scheduled_health"
+        )
+        let validCapture = try String(contentsOf: valid.capture, encoding: .utf8)
+        tests.expect(
+            validCapture.contains("arg=original-flag\n"),
+            "test19_runtime_valid_runner_preserves_original_argument"
+        )
+        tests.expect(
+            validCapture.contains("arg=--recovery-date\n")
+                && validCapture.contains("arg=2024-12-31\n"),
+            "test19_runtime_valid_runner_appends_exact_recovery_date"
+        )
+        let capturedWorkingDirectory = try require(
+            validCapture.split(separator: "\n")
+                .first(where: { $0.hasPrefix("cwd=") })
+                .map { String($0.dropFirst("cwd=".count)) },
+            "test19 captured working directory"
+        )
+        tests.expectEqual(
+            URL(fileURLWithPath: capturedWorkingDirectory).resolvingSymlinksInPath().path,
+            valid.cwd.resolvingSymlinksInPath().path,
+            "test19_runtime_valid_runner_preserves_working_directory"
+        )
+        tests.expect(
+            validCapture.contains("marker=launchd-context\n"),
+            "test19_runtime_valid_runner_preserves_environment"
+        )
+        let captureBeforeDuplicate = validCapture
+        let duplicateResult = try test19_recover(fixture: valid)
+        let duplicateRecords = try test19_records(duplicateResult.stdout)
+        tests.expectEqual(duplicateResult.status, 0, "test19_runtime_duplicate_recover_succeeds")
+        tests.expectEqual(duplicateRecords.first?["status"] as? String, "duplicate",
+                          "test19_runtime_duplicate_claim_is_noop")
+        tests.expectEqual(try test19_recoveryAttemptCount(storePath: valid.storePath), 1,
+                          "test19_runtime_duplicate_creates_no_second_attempt")
+        tests.expectEqual(try String(contentsOf: valid.capture, encoding: .utf8), captureBeforeDuplicate,
+                          "test19_runtime_duplicate_does_not_relaunch_runner")
+
+        let forgedRoot = root.appendingPathComponent("forged", isDirectory: true)
+        try FileManager.default.createDirectory(at: forgedRoot, withIntermediateDirectories: true)
+        let forged = try test19_makeRecoveryFixture(root: forgedRoot, tickerPath: tickerPath)
+        let forgedStore = try SQLiteRunStore(path: forged.storePath)
+        let forgedPolicy = try RecoveryPolicy(taskID: "daily-task", timeZone: "America/New_York")
+        try forgedStore.setRecoveryPolicy(jobID: forged.job.id, policy: forgedPolicy)
+        let forgedStartedAt = try utcDate(2025, 1, 1, 0, 30)
+        let forgedRunID = try test19_addRun(
+            store: forgedStore,
+            jobID: forged.job.id,
+            startedAt: forgedStartedAt,
+            launchdRunCountAtStart: 0
+        )
+        let forgedDate = "2024-12-31"
+        let claimID = "test19-valid-claim"
+        _ = try forgedStore.claimRecoveryAttempt(
+            claimID: claimID,
+            jobID: forged.job.id,
+            taskID: "daily-task",
+            dateKey: forgedDate,
+            interruptedRunID: forgedRunID,
+            claimedAt: Date()
+        )
+        let originalCommand = [forged.runner.path, "original-flag", "--recovery-date", forgedDate]
+        let forgedCases: [(String, String, String, [String])] = [
+            ("claim", "forged-claim", "daily-task", originalCommand),
+            ("task", claimID, "forged-task", originalCommand),
+            ("date", claimID, "daily-task", [forged.runner.path, "original-flag", "--recovery-date", "2099-01-01"]),
+            ("command", claimID, "daily-task", [forged.runner.path, "forged-command", "--recovery-date", forgedDate]),
+        ]
+        for (name, claim, task, command) in forgedCases {
+            let result = try test19_recoveryChild(
+                fixture: forged,
+                claimID: claim,
+                taskID: task,
+                dateKey: forgedDate,
+                command: command
+            )
+            tests.expect(result.status != 0, "test19_runtime_forged_\(name)_claim_rejected")
+            tests.expect(!FileManager.default.fileExists(atPath: forged.capture.path),
+                         "test19_runtime_forged_\(name)_claim_does_not_execute_runner")
+        }
+        let staleRunID = try test19_addRun(
+            store: forgedStore,
+            jobID: forged.job.id,
+            startedAt: forgedStartedAt.addingTimeInterval(1),
+            launchdRunCountAtStart: 1,
+            processID: getpid()
+        )
+        let staleClaimID = "test19-stale-claim"
+        _ = try forgedStore.claimRecoveryAttempt(
+            claimID: staleClaimID,
+            jobID: forged.job.id,
+            taskID: "daily-task",
+            dateKey: forgedDate,
+            interruptedRunID: staleRunID,
+            claimedAt: Date()
+        )
+        let staleResult = try test19_recoveryChild(
+            fixture: forged,
+            claimID: staleClaimID,
+            taskID: "daily-task",
+            dateKey: forgedDate,
+            command: originalCommand
+        )
+        tests.expect(staleResult.status != 0, "test19_runtime_nonInterrupted_claim_rejected")
+        tests.expect(!FileManager.default.fileExists(atPath: forged.capture.path),
+                     "test19_runtime_nonInterrupted_claim_does_not_execute_runner")
+    }
+}
+
 @main
 private enum TickerTests {
     static func main() {
+        if ProcessInfo.processInfo.environment["TICKER_TEST19_ONLY"] == "1" {
+            let tests = TestHarness()
+            tests.run("round 19 recovery policy and agent CLI") {
+                try test19_RecoveryCLI(tests)
+            }
+            tests.run("round 19 recovery runtime") {
+                try test19_RecoveryRuntime(tests)
+            }
+            tests.finish()
+        }
         if CommandLine.arguments.dropFirst().first == "--test9-crash-after-exchange" {
             test9_crashAfterFirstExchange(arguments: Array(CommandLine.arguments.dropFirst()))
         }
+        if ProcessInfo.processInfo.environment["TICKER_TEST18_ONLY"] == "1" {
+            let tests = TestHarness()
+            tests.run("round 18 recovery core") {
+                try test18_RecoveryCore(tests)
+            }
+            tests.finish()
+        }
+
         if ProcessInfo.processInfo.environment["TICKER_TEST13_UI_ONLY"] == "1" {
             let tests = TestHarness()
             tests.run("round 13 provenance-first UI architecture") {
@@ -15072,6 +16016,9 @@ private enum TickerTests {
         }
         tests.run("round 17 failure notification transitions") {
             test17_AttentionNotificationPlanner(tests)
+        }
+        tests.run("round 18 recovery core") {
+            try test18_RecoveryCore(tests)
         }
         tests.finish()
     }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import hashlib
 import importlib.machinery
 import io
@@ -380,6 +381,7 @@ class RunnerContractTests(unittest.TestCase):
         task_id: str,
         working_directory: Path | None = None,
         *,
+        recovery_date: str | None = None,
         environment: dict[str, str] | None = None,
         interpreter: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
@@ -392,6 +394,8 @@ class RunnerContractTests(unittest.TestCase):
                 else working_directory
             ),
         ]
+        if recovery_date is not None:
+            command.extend(["--recovery-date", recovery_date])
         if interpreter is not None:
             command.insert(0, str(interpreter))
         return subprocess.run(
@@ -2503,6 +2507,128 @@ class RunnerContractTests(unittest.TestCase):
                 self.assertFalse(harness.stdin.exists())
 
 
+
+    def test_recovery_date_sets_marker_and_reconciliation_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            result = self.invoke(
+                harness,
+                "daily-summary",
+                recovery_date="2026-08-24",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            prompt = harness.stdin.read_text(encoding="utf-8")
+            canonical, _skill_path = expected_task_contract(
+                "daily-summary",
+                harness.home,
+                harness.working_directory,
+                harness.skill_roots,
+                codex_home=harness.codex_home,
+            )
+            self.assertTrue(prompt.startswith(canonical[:-1]))
+            self.assertIn(
+                "This is recovery for TASK_ID=daily-summary and "
+                "SCHEDULED_RUN_DATE_ET=2026-08-24.",
+                prompt,
+            )
+            self.assertEqual(prompt.count("Before any side effect,"), 1)
+            self.assertIn(
+                "inspect/reconcile destination state keyed by both "
+                "TASK_ID and SCHEDULED_RUN_DATE_ET",
+                prompt,
+            )
+            self.assertIn(
+                "If valid output already exists, validate it and exit successfully "
+                "without duplicate writes, messages, or posts",
+                prompt,
+            )
+            self.assertNotIn("retry", prompt.lower())
+            environment = dict(
+                line.split("=", 1)
+                for line in harness.environment.read_text(encoding="utf-8").splitlines()
+            )
+            self.assertEqual(environment["SCHEDULED_RUN_DATE_ET"], "2026-08-24")
+            self.assertEqual(environment["SCHEDULED_RECOVERY_MODE"], "1")
+
+    def test_normal_mode_keeps_prompt_and_environment_compatible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            result = self.invoke(harness, "daily-summary")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            canonical, _skill_path = expected_task_contract(
+                "daily-summary",
+                harness.home,
+                harness.working_directory,
+                harness.skill_roots,
+                codex_home=harness.codex_home,
+            )
+            self.assertEqual(
+                harness.stdin.read_text(encoding="utf-8"),
+                canonical + "\n",
+            )
+            environment = dict(
+                line.split("=", 1)
+                for line in harness.environment.read_text(encoding="utf-8").splitlines()
+            )
+            self.assertNotIn("SCHEDULED_RECOVERY_MODE", environment)
+
+    def test_recovery_preserves_original_et_date_across_utc_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            module = self.load_runner_module(harness)
+            binding = self.binding_object(harness)
+
+            class FrozenDateTime(dt.datetime):
+                @classmethod
+                def now(
+                    cls,
+                    tz: dt.tzinfo | None = None,
+                ) -> "FrozenDateTime":
+                    value = cls(2026, 8, 25, 3, 30, tzinfo=dt.timezone.utc)
+                    return value if tz is None else value.astimezone(tz)
+
+            with mock.patch.object(module, "_read_runtime_binding", return_value=binding), \
+                mock.patch.object(module, "_read_dotenv", return_value={}), \
+                mock.patch.object(module, "_validate_readable_file"), \
+                mock.patch.object(module, "_forwarded_child_status", return_value=0) as child, \
+                mock.patch.object(module.dt, "datetime", FrozenDateTime):
+                result = module.run(
+                    ["daily-summary", str(harness.working_directory)]
+                )
+            self.assertEqual(result, 0)
+            child_environment = child.call_args.args[2]
+            self.assertEqual(child_environment["SCHEDULED_RUN_DATE_ET"], "2026-08-24")
+            self.assertNotIn("SCHEDULED_RECOVERY_MODE", child_environment)
+
+    def test_recovery_rejects_noncanonical_dates_and_option_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            base = [
+                str(harness.runner),
+                "daily-summary",
+                str(harness.working_directory),
+            ]
+            invalid_arguments = (
+                base + ["--recovery-date", "2026-2-01"],
+                base + ["--recovery-date", "2026-02-30"],
+                base + ["--recovery-date"],
+                base + ["2026-08-24", "--recovery-date"],
+                base + ["--recovery-date", "2026-08-24", "extra"],
+                base + ["--unknown-option", "2026-08-24"],
+            )
+            for arguments in invalid_arguments:
+                with self.subTest(arguments=arguments):
+                    result = subprocess.run(
+                        arguments,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        check=False,
+                        env=self.invocation_environment(harness),
+                    )
+                    self.assertEqual(result.returncode, 64)
+            self.assertEqual(self.read_events(harness), [])
 
     def test_missing_root_stops_before_codex(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

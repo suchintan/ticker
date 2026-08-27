@@ -1436,6 +1436,7 @@ RUNNER_INSTALLED = HOME_DIRECTORY / ".local/bin/run-codex-scheduled-task"
 CODEX_EXECUTABLE: Optional[Path] = None
 CODEX_MANAGED_PACKAGE_ROOT: Optional[Path] = None
 CODEX_MANAGED_PACKAGE_VERSION: Optional[str] = None
+CODEX_MANAGED_BY: Optional[str] = None
 TICKER_EXECUTABLE = Path("/Applications/Ticker.app/Contents/Helpers/ticker")
 _LIVE_TICKER_EXECUTABLE = TICKER_EXECUTABLE
 LAUNCHCTL = Path("/bin/launchctl")
@@ -1548,6 +1549,7 @@ class CutoverState:
     claude_was_running: bool = False
     claude_prior_pids: frozenset[int] = frozenset()
     claude_relaunched: bool = False
+    recovery_policies_configured: bool = False
     committed: bool = False
     rolled_back: bool = False
     recovered: bool = False
@@ -2612,6 +2614,78 @@ def validate_ticker_ids(routines: Sequence[Routine]) -> None:
             raise CutoverError(f"Ticker id does not bind label for {routine.task_id}")
 
 
+def _recovery_policy_command(routine: Routine) -> List[str]:
+    if routine.task_id == "daily-summary":
+        return [
+            "recovery-policy",
+            routine.ticker_id,
+            "retry-idempotent",
+            "--task-id",
+            "daily-summary",
+            "--time-zone",
+            "America/New_York",
+        ]
+    return ["recovery-policy", routine.ticker_id, "alert-only"]
+
+
+def _alert_only_policy_command(routine: Routine) -> List[str]:
+    return ["recovery-policy", routine.ticker_id, "alert-only"]
+
+
+def fail_closed_recovery_policies(
+    routines: Sequence[Routine],
+    command_runner: CommandRunner,
+) -> None:
+    errors: List[str] = []
+    for routine in routines:
+        try:
+            result = command_runner.run(
+                TICKER_EXECUTABLE,
+                _alert_only_policy_command(routine),
+            )
+        except BaseException as error:
+            errors.append(f"{routine.task_id}: {error}")
+            continue
+        if result.status != 0:
+            errors.append(f"{routine.task_id}: status {result.status}")
+    if errors:
+        raise RollbackError(
+            "recovery policy fail-closed cleanup failed: " + "; ".join(errors)
+        )
+
+
+def configure_recovery_policies(
+    routines: Sequence[Routine],
+    command_runner: CommandRunner,
+) -> None:
+    selected = tuple(routines)
+    ordered = tuple(
+        routine for routine in selected if routine.task_id != "daily-summary"
+    ) + tuple(
+        routine for routine in selected if routine.task_id == "daily-summary"
+    )
+    try:
+        for routine in ordered:
+            result = command_runner.run(
+                TICKER_EXECUTABLE,
+                _recovery_policy_command(routine),
+            )
+            if result.status != 0:
+                raise CutoverError(
+                    f"Ticker recovery policy failed for {routine.task_id}"
+                )
+    except BaseException as error:
+        try:
+            fail_closed_recovery_policies(selected, command_runner)
+        except BaseException as cleanup_error:
+            raise RollbackError(
+                f"recovery policy configuration failed ({error}); "
+                f"fail-closed cleanup also failed ({cleanup_error})"
+            ) from cleanup_error
+        if isinstance(error, CutoverSignal):
+            raise
+        raise CutoverError(f"recovery policy configuration failed: {error}") from error
+
 def _validate_skill_file(path: Path, description: str) -> None:
     try:
         metadata = path.lstat()
@@ -3317,6 +3391,18 @@ class CutoverTransaction:
         for routine in self.routines:
             if states[routine.task_id] != "wrapped-consistent":
                 raise CutoverError(f"Ticker wrapper validation failed for {routine.task_id}")
+    def _configure_recovery_policies(self) -> None:
+        snapshot = self._inspect_replacements(repair_stale=False)
+        if not snapshot.full_codex:
+            raise CutoverError(
+                "cannot configure recovery policies before all wrappers are consistent"
+            )
+        configure_recovery_policies(self.routines, self.command_runner)
+        self.state.recovery_policies_configured = True
+
+    def _fail_closed_recovery_policies(self) -> None:
+        fail_closed_recovery_policies(self.routines, self.command_runner)
+
 
     def _plist_state(self, routine: Routine) -> PlistState:
         if not os.path.lexists(routine.plist):
@@ -3757,8 +3843,19 @@ class CutoverTransaction:
                 self._check_blackout()
                 self._quiesce_and_revalidate_registry()
                 ensure_success_marker()
+                self._configure_recovery_policies()
+                self._restart_claude_if_requested()
                 self.state.committed = True
         except BaseException as error:
+            if self.state.recovery_policies_configured:
+                try:
+                    self._fail_closed_recovery_policies()
+                except BaseException as policy_error:
+                    raise RollbackError(
+                        f"cutover failed ({error}); recovery policy cleanup "
+                        f"also failed ({policy_error})"
+                    ) from policy_error
+                self.state.recovery_policies_configured = False
             if self.state.committed:
                 self._restart_claude_if_requested()
                 return self.state
@@ -3784,7 +3881,6 @@ class CutoverTransaction:
                     rollback_error,
                 )
             raise
-        self._restart_claude_if_requested()
         return self.state
 
     def rollback_committed(self) -> CutoverState:
@@ -3798,6 +3894,8 @@ class CutoverTransaction:
             self.routines,
         )
         replacements = self._inspect_replacements()
+        if replacements.full_codex:
+            self._fail_closed_recovery_policies()
         if (
             marker == "exact"
             and not registry_enabled
@@ -3926,6 +4024,7 @@ def refresh_runtime_artifact(
     installed_runner: Optional[bytes] = None
     claude_quiesced = False
     relaunch_attempted = False
+    policies_configured = False
     with blocked_cutover_signals():
         with SignalScope():
             try:
@@ -4006,12 +4105,13 @@ def refresh_runtime_artifact(
                             f"committed runtime refresh changed {routine.task_id} plist"
                         )
                 transaction._revalidate_registry_binding()
+                transaction._configure_recovery_policies()
+                policies_configured = True
                 if transaction.state.claude_was_running:
                     relaunch_attempted = True
                     transaction._restart_claude_if_requested()
-            except BaseException:
+            except BaseException as refresh_error:
                 if installed:
-
                     def plists_match_snapshots() -> bool:
                         try:
                             return all(
@@ -4079,6 +4179,15 @@ def refresh_runtime_artifact(
                         transaction._restart_claude_if_requested()
                     except BaseException:
                         pass
+                if policies_configured:
+                    try:
+                        transaction._fail_closed_recovery_policies()
+                    except BaseException as policy_error:
+                        raise RollbackError(
+                            f"committed runtime refresh failed ({refresh_error}); "
+                            f"recovery policy cleanup also failed ({policy_error})"
+                        ) from policy_error
+                    policies_configured = False
                 raise
 
 
