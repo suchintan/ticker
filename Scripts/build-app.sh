@@ -122,6 +122,8 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" <<PLIST
     <string>13.0</string>
     <key>LSUIElement</key>
     <true/>
+    <key>TickerAdHocSigned</key>
+    <true/>
 </dict>
 </plist>
 PLIST

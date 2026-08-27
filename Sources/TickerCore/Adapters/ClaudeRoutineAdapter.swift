@@ -6,8 +6,24 @@ public struct SkipRecord: Codable, Hashable {
     public let reason: String
 }
 
+public struct SkipSourceSnapshot {
+    public let recordsByJobID: [String: [SkipRecord]]
+    public let observedJobIDs: Set<String>
+    public let errors: [Error]
+
+    public init(
+        recordsByJobID: [String: [SkipRecord]],
+        observedJobIDs: Set<String>,
+        errors: [Error] = []
+    ) {
+        self.recordsByJobID = recordsByJobID
+        self.observedJobIDs = observedJobIDs
+        self.errors = errors
+    }
+}
+
 public protocol SkipSourceAdapter {
-    func skips() throws -> [String: [SkipRecord]]
+    func skipSnapshot() -> SkipSourceSnapshot
 }
 
 public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
@@ -30,6 +46,15 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
     private struct ScheduledTaskFile {
         let url: URL
         let accountDirectoryPath: String
+    }
+
+    private struct InvalidSkipSnapshotError: LocalizedError {
+        let path: String
+        let detail: String
+
+        var errorDescription: String? {
+            "Could not read scheduler skips from \(path): \(detail)"
+        }
     }
 
     private let searchRoots: [URL]
@@ -110,43 +135,132 @@ public final class ClaudeRoutineAdapter: JobSourceAdapter, SkipSourceAdapter {
         }.sorted { $0.id < $1.id }
     }
 
-    public func skips() throws -> [String: [SkipRecord]] {
-        let files = scheduledTaskFiles()
+    public func skipSnapshot() -> SkipSourceSnapshot {
         var recordsByJobID: [String: Set<SkipRecord>] = [:]
+        var observedJobIDsByAccount: [String: Set<String>] = [:]
+        var incompleteAccounts = Set<String>()
+        var errors: [Error] = []
 
-        for snapshot in files {
-            guard let root = loadRootDictionary(snapshot.url),
-                  let recordedSkips = root["recordedSkips"] as? [String: Any]
-            else {
-                continue
-            }
-
-            for (taskID, rawRecords) in recordedSkips {
-                guard let values = rawRecords as? [Any] else {
-                    continue
+        for file in scheduledTaskFiles() {
+            do {
+                let snapshot = try skipSnapshot(for: file)
+                observedJobIDsByAccount[file.accountDirectoryPath, default: []]
+                    .formUnion(snapshot.observedJobIDs)
+                for (jobID, records) in snapshot.recordsByJobID {
+                    recordsByJobID[jobID, default: []].formUnion(records)
                 }
-                let jobID = jobID(
-                    taskID: taskID,
-                    accountDirectoryPath: snapshot.accountDirectoryPath
-                )
-                for value in values {
-                    guard let dictionary = value as? [String: Any],
-                          let milliseconds = milliseconds(dictionary["at"]),
-                          let reason = dictionary["reason"] as? String
-                    else {
-                        continue
-                    }
-                    recordsByJobID[jobID, default: []].insert(
-                        SkipRecord(
-                            at: Date(timeIntervalSince1970: milliseconds / 1_000),
-                            reason: reason
-                        )
-                    )
-                }
+            } catch {
+                incompleteAccounts.insert(file.accountDirectoryPath)
+                errors.append(error)
             }
         }
 
-        return recordsByJobID.mapValues { records in
+        let observedJobIDs = observedJobIDsByAccount.reduce(
+            into: Set<String>()
+        ) { result, entry in
+            if !incompleteAccounts.contains(entry.key) {
+                result.formUnion(entry.value)
+            }
+        }
+        return SkipSourceSnapshot(
+            recordsByJobID: sortedSkipRecords(recordsByJobID),
+            observedJobIDs: observedJobIDs,
+            errors: errors
+        )
+    }
+
+    private func skipSnapshot(for snapshot: ScheduledTaskFile) throws -> SkipSourceSnapshot {
+        guard let root = loadRootDictionary(snapshot.url) else {
+            throw InvalidSkipSnapshotError(
+                path: snapshot.url.path,
+                detail: "the file is unreadable or is not a JSON object"
+            )
+        }
+
+        let rawTasks: [Any]
+        if let value = root["scheduledTasks"] {
+            guard let tasks = value as? [Any] else {
+                throw InvalidSkipSnapshotError(
+                    path: snapshot.url.path,
+                    detail: "scheduledTasks is not an array"
+                )
+            }
+            rawTasks = tasks
+        } else {
+            rawTasks = []
+        }
+
+        var observedJobIDs = Set<String>()
+        for rawTask in rawTasks {
+            guard let dictionary = rawTask as? [String: Any],
+                  let taskID = dictionary["id"] as? String,
+                  !taskID.isEmpty
+            else {
+                continue
+            }
+            observedJobIDs.insert(
+                jobID(
+                    taskID: taskID,
+                    accountDirectoryPath: snapshot.accountDirectoryPath
+                )
+            )
+        }
+
+        guard let rawRecordedSkips = root["recordedSkips"] else {
+            return SkipSourceSnapshot(
+                recordsByJobID: [:],
+                observedJobIDs: observedJobIDs
+            )
+        }
+        guard let recordedSkips = rawRecordedSkips as? [String: Any] else {
+            throw InvalidSkipSnapshotError(
+                path: snapshot.url.path,
+                detail: "recordedSkips is not an object"
+            )
+        }
+
+        var recordsByJobID: [String: Set<SkipRecord>] = [:]
+        for (taskID, rawRecords) in recordedSkips {
+            guard let values = rawRecords as? [Any] else {
+                throw InvalidSkipSnapshotError(
+                    path: snapshot.url.path,
+                    detail: "recordedSkips[\(taskID)] is not an array"
+                )
+            }
+            let jobID = jobID(
+                taskID: taskID,
+                accountDirectoryPath: snapshot.accountDirectoryPath
+            )
+            observedJobIDs.insert(jobID)
+            for value in values {
+                guard let dictionary = value as? [String: Any],
+                      let milliseconds = milliseconds(dictionary["at"]),
+                      let reason = dictionary["reason"] as? String
+                else {
+                    throw InvalidSkipSnapshotError(
+                        path: snapshot.url.path,
+                        detail: "recordedSkips[\(taskID)] contains an invalid record"
+                    )
+                }
+                recordsByJobID[jobID, default: []].insert(
+                    SkipRecord(
+                        at: Date(timeIntervalSince1970: milliseconds / 1_000),
+                        reason: reason
+                    )
+                )
+            }
+        }
+
+        return SkipSourceSnapshot(
+            recordsByJobID: sortedSkipRecords(recordsByJobID),
+            observedJobIDs: observedJobIDs
+        )
+    }
+
+    private func sortedSkipRecords(
+        _ recordsByJobID: [String: Set<SkipRecord>]
+    ) -> [String: [SkipRecord]] {
+        recordsByJobID.mapValues { records in
             records.sorted { left, right in
                 if left.at == right.at {
                     return left.reason < right.reason
