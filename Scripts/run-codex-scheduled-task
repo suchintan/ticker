@@ -98,12 +98,12 @@ TASKS: Mapping[str, Tuple[str, bool, str]] = {
     "linkedin-post-ideas": (
         "linkedin-post-ideas",
         False,
-        "with the exact integer argument 10 and exact run_context=scheduled-primary",
+        "with the exact integer argument 20 and exact run_context=scheduled-primary",
     ),
     "linkedin-post-ideas-sweeper": (
         "linkedin-post-ideas",
         False,
-        "with the exact integer argument 10 and exact run_context=scheduled-sweeper",
+        "with the exact integer argument 20 and exact run_context=scheduled-sweeper",
     ),
     "overdue-customer-issues-slack": (
         "overdue-customer-issues-slack",

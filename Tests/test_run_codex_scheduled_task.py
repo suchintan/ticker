@@ -60,12 +60,12 @@ TASKS = {
     "linkedin-post-ideas": TaskSpec(
         "linkedin-post-ideas",
         False,
-        "with the exact integer argument 10 and exact run_context=scheduled-primary",
+        "with the exact integer argument 20 and exact run_context=scheduled-primary",
     ),
     "linkedin-post-ideas-sweeper": TaskSpec(
         "linkedin-post-ideas",
         False,
-        "with the exact integer argument 10 and exact run_context=scheduled-sweeper",
+        "with the exact integer argument 20 and exact run_context=scheduled-sweeper",
     ),
     "overdue-customer-issues-slack": TaskSpec(
         "overdue-customer-issues-slack",
