@@ -44,6 +44,7 @@ class TaskSpec:
     skill_name: str
     project_relative: bool
     invocation: str
+    web_search: bool
 
 
 TASKS = {
@@ -51,31 +52,37 @@ TASKS = {
         "daily-summary",
         False,
         "with no arguments",
+        False,
     ),
     "daily-vitals-morning": TaskSpec(
         "vitals-run-all",
         False,
         "with the exact argument morning",
+        False,
     ),
     "linkedin-post-ideas": TaskSpec(
         "linkedin-post-ideas",
         False,
         "with the exact integer argument 20 and exact run_context=scheduled-primary",
+        True,
     ),
     "linkedin-post-ideas-sweeper": TaskSpec(
         "linkedin-post-ideas",
         False,
         "with the exact integer argument 20 and exact run_context=scheduled-sweeper",
+        True,
     ),
     "overdue-customer-issues-slack": TaskSpec(
         "overdue-customer-issues-slack",
         True,
         "with no arguments",
+        False,
     ),
     "team-progress-digest": TaskSpec(
         "team-progress-digest",
         False,
         "with no arguments",
+        False,
     ),
 }
 
@@ -107,6 +114,20 @@ def expected_task_contract(
 
 
 def render_test_runner(source: bytes, binding: dict[str, object]) -> bytes:
+    # Keep fixture executable copies out of the real user's ~/.local/bin.
+    staging_bin = Path(str(binding["repository"])) / "private staging"
+    staging_bin.mkdir(mode=0o700, exist_ok=True)
+    staging_assignment = b'    staging_bin = binding.home / ".local" / "bin"\n'
+    if source.count(staging_assignment) != 1:
+        raise AssertionError("runner must have one private staging directory assignment")
+    source = source.replace(
+        staging_assignment,
+        (
+            f"    staging_bin = (Path({str(staging_bin)!r}) "
+            f"if binding.home == Path({binding['home']!r}) "
+            'else binding.home / ".local" / "bin")\n'
+        ).encode("utf-8"),
+    )
     _shebang, separator, body = source.partition(b"\n")
     if not separator:
         raise AssertionError("runner source must have a shebang line")
@@ -496,7 +517,7 @@ class RunnerContractTests(unittest.TestCase):
             ), mock.patch.object(
                 module,
                 "_task_contract",
-                return_value=("prompt", task_root, skill_path),
+                return_value=("prompt", task_root, skill_path, False),
             ), mock.patch.object(
                 module,
                 "_read_dotenv",
@@ -526,7 +547,7 @@ class RunnerContractTests(unittest.TestCase):
                 harness.codex_home / "skills" / "linkedin-post-ideas"
             )
 
-            prompt, root, link = module._task_contract(
+            prompt, root, link, web_search = module._task_contract(
                 "linkedin-post-ideas",
                 binding,
             )
@@ -534,6 +555,7 @@ class RunnerContractTests(unittest.TestCase):
             self.assertEqual(root, installed_root)
             self.assertEqual(link, installed_root / "SKILL.md")
             self.assertIn(f"at {installed_root}", prompt)
+            self.assertTrue(web_search)
 
 
             external_skills = harness.root / "installed skill links"
@@ -542,13 +564,14 @@ class RunnerContractTests(unittest.TestCase):
                 external_skills,
                 target_is_directory=True,
             )
-            linked_prompt, linked_root, linked_file = module._task_contract(
+            linked_prompt, linked_root, linked_file, linked_web_search = module._task_contract(
                 "linkedin-post-ideas",
                 binding,
             )
             self.assertEqual(linked_root, installed_root)
             self.assertEqual(linked_file, installed_root / "SKILL.md")
             self.assertIn(f"at {installed_root}", linked_prompt)
+            self.assertTrue(linked_web_search)
 
     def test_bound_home_requires_current_passwd_home(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -581,7 +604,7 @@ class RunnerContractTests(unittest.TestCase):
             ), mock.patch.object(
                 module,
                 "_task_contract",
-                return_value=("prompt", task_root, skill_path),
+                return_value=("prompt", task_root, skill_path, False),
             ), mock.patch.object(
                 module,
                 "_validate_readable_file",
@@ -620,7 +643,7 @@ class RunnerContractTests(unittest.TestCase):
             ) as matching_child, mock.patch.object(
                 module,
                 "_task_contract",
-                return_value=("prompt", task_root, skill_path),
+                return_value=("prompt", task_root, skill_path, False),
             ), mock.patch.object(
                 module,
                 "_validate_readable_file",
@@ -1011,7 +1034,7 @@ class RunnerContractTests(unittest.TestCase):
                     ), mock.patch.object(
                         module,
                         "_task_contract",
-                        return_value=("prompt", task_root, skill_path),
+                        return_value=("prompt", task_root, skill_path, False),
                     ), mock.patch.object(
                         module,
                         "_validate_readable_file",
@@ -1092,7 +1115,7 @@ class RunnerContractTests(unittest.TestCase):
                     ), mock.patch.object(
                         module,
                         "_task_contract",
-                        return_value=("prompt", task_root, skill_path),
+                        return_value=("prompt", task_root, skill_path, False),
                     ), mock.patch.object(
                         module,
                         "_validate_readable_file",
@@ -1677,7 +1700,12 @@ class RunnerContractTests(unittest.TestCase):
                     return 0
 
             def fake_popen(arguments: list[str], **kwargs: object) -> Child:
-                self.assertEqual(arguments, expected_arguments)
+                self.assertEqual(
+                    arguments,
+                    expected_arguments[:1]
+                    + (["--search"] if TASKS[current_task[0]].web_search else [])
+                    + expected_arguments[1:],
+                )
                 self.assertEqual(kwargs["cwd"], binding.repository)
                 seen_tasks.append(current_task[0])
                 return Child()
@@ -1694,7 +1722,9 @@ class RunnerContractTests(unittest.TestCase):
                     ), mock.patch.object(
                         module,
                         "_task_contract",
-                        return_value=("prompt", task_root, skill_path),
+                        return_value=(
+                            "prompt", task_root, skill_path, TASKS[task_id].web_search
+                        ),
                     ), mock.patch.object(
                         module,
                         "_validate_readable_file",
@@ -1721,6 +1751,21 @@ class RunnerContractTests(unittest.TestCase):
                     self.assertEqual(result, 0)
 
             self.assertEqual(seen_tasks, list(TASKS))
+
+    def test_web_search_is_global_and_enabled_only_for_linkedin_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            for task_id in TASKS:
+                with self.subTest(task_id=task_id):
+                    result = self.invoke(harness, task_id)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    arguments = harness.argv.read_text(encoding="utf-8").splitlines()
+                    if task_id in {"linkedin-post-ideas", "linkedin-post-ideas-sweeper"}:
+                        self.assertEqual(arguments[:2], ["--search", "exec"])
+                        self.assertEqual(arguments.count("--search"), 1)
+                    else:
+                        self.assertNotIn("--search", arguments)
+                        self.assertEqual(arguments[0], "exec")
 
     def test_forwarding_signal_mask_order_has_no_spawn_window(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1902,6 +1947,7 @@ class RunnerContractTests(unittest.TestCase):
                     self.assertEqual(
                         harness.argv.read_text(encoding="utf-8").splitlines(),
                         [
+                            *(["--search"] if TASKS[task_id].web_search else []),
                             "exec",
                             "--model",
                             "gpt-6-astra",
@@ -2220,7 +2266,7 @@ class RunnerContractTests(unittest.TestCase):
                 ), mock.patch.object(
                     module,
                     "_task_contract",
-                    return_value=("prompt", task_root, skill_path),
+                    return_value=("prompt", task_root, skill_path, False),
                 ), mock.patch.object(
                     module,
                     "_read_dotenv",
