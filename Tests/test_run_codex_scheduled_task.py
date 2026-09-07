@@ -97,7 +97,7 @@ def expected_task_contract(
         )
     else:
         skill_root = (
-            home / ".codex" if codex_home is None else codex_home
+            home / ".codex-ccswap" if codex_home is None else codex_home
         ) / "skills" / task.skill_name
     prompt = (
         f"Use ${task.skill_name} at {skill_root} {task.invocation}. "
@@ -330,7 +330,7 @@ class RunnerContractTests(unittest.TestCase):
             "codex": str(codex_path),
             "codex_home": str(codex_home),
             "path": controlled_path,
-            "model": "gpt-5.6-sol",
+            "model": "gpt-6-astra",
             "skill_roots": {task_id: str(path) for task_id, path in skill_roots.items()},
             "codex_sha256": hashlib.sha256(codex_path.read_bytes()).hexdigest(),
             "codex_macho_arch": codex_arch,
@@ -436,7 +436,7 @@ class RunnerContractTests(unittest.TestCase):
             codex=harness.codex,
             codex_code_mode_host=harness.code_mode_host,
             path=harness.controlled_path,
-            model="gpt-5.6-sol",
+            model="gpt-6-astra",
             skill_roots={
                 task_id: path
                 for task_id, path in harness.skill_roots.items()
@@ -1232,7 +1232,7 @@ class RunnerContractTests(unittest.TestCase):
                 str(binding.codex),
                 "exec",
                 "--model",
-                "gpt-5.6-sol",
+                "gpt-6-astra",
                 "--cd",
                 str(binding.repository),
                 "-c",
@@ -1343,7 +1343,7 @@ class RunnerContractTests(unittest.TestCase):
                 str(binding.codex),
                 "exec",
                 "--model",
-                "gpt-5.6-sol",
+                "gpt-6-astra",
                 "--cd",
                 str(binding.repository),
                 "-c",
@@ -1659,7 +1659,7 @@ class RunnerContractTests(unittest.TestCase):
                 str(binding.codex),
                 "exec",
                 "--model",
-                "gpt-5.6-sol",
+                "gpt-6-astra",
                 "--cd",
                 str(binding.repository),
                 "-c",
@@ -1904,7 +1904,7 @@ class RunnerContractTests(unittest.TestCase):
                         [
                             "exec",
                             "--model",
-                            "gpt-5.6-sol",
+                            "gpt-6-astra",
                             "--cd",
                             str(harness.working_directory),
                             "-c",
@@ -2149,7 +2149,7 @@ class RunnerContractTests(unittest.TestCase):
                 [
                     "exec",
                     "--model",
-                    "gpt-5.6-sol",
+                    "gpt-6-astra",
                     "--cd",
                     str(harness.working_directory),
                     "-c",
@@ -2158,6 +2158,37 @@ class RunnerContractTests(unittest.TestCase):
                 ],
             )
 
+
+    def test_codex_home_accepts_trusted_symlinked_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            module = self.load_runner_module(harness)
+            binding = self.binding_object(harness)
+            shared = harness.root / ".codex"
+            shared.mkdir(mode=0o700)
+            target = shared / "config.toml"
+            target.write_text("", encoding="utf-8")
+            config = harness.codex_home / "config.toml"
+            config.unlink()
+            config.symlink_to(Path("../.codex/config.toml"))
+            for mode in (0o600, 0o644):
+                with self.subTest(mode=mode):
+                    target.chmod(mode)
+                    module._validate_codex_home(binding)
+            shared.chmod(0o777)
+            with self.assertRaisesRegex(ValueError, "writable"):
+                module._validate_codex_home(binding)
+
+    def test_codex_home_rejects_symlinked_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            harness = self.make_harness(Path(directory))
+            module = self.load_runner_module(harness)
+            auth = harness.codex_home / "auth.json"
+            target = harness.root / "auth target.json"
+            auth.rename(target)
+            auth.symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "auth.json is not trustworthy"):
+                module._validate_codex_home(self.binding_object(harness))
 
     def test_runner_rejects_untrusted_bound_path_component_and_codex_home(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2276,7 +2307,7 @@ class RunnerContractTests(unittest.TestCase):
 
             config_target = harness.root / "config target.toml"
             config_target.write_text("", encoding="utf-8")
-            config_target.chmod(0o600)
+            config_target.chmod(0o666)
 
             def symlink_config() -> None:
                 config.unlink()
@@ -2288,7 +2319,7 @@ class RunnerContractTests(unittest.TestCase):
                 config.chmod(0o600)
 
             assert_rejected(
-                "symlinked Codex config",
+                "symlinked writable Codex config",
                 symlink_config,
                 restore_config,
             )
@@ -2394,7 +2425,7 @@ class RunnerContractTests(unittest.TestCase):
                 [
                     "exec",
                     "--model",
-                    "gpt-5.6-sol",
+                    "gpt-6-astra",
                     "--cd",
                     str(harness.working_directory),
                     "-c",

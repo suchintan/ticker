@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 
 RUNTIME_BINDING_PREFIX = b"# TICKER-RUNTIME-V1 "
 RUNTIME_BINDING_VERSION = 3
-RUNTIME_MODEL = "gpt-5.6-sol"
+RUNTIME_MODEL = "gpt-6-astra"
 RUNTIME_REASONING_EFFORT = "xhigh"
 TRUSTED_TZ = "America/New_York"
 CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -198,7 +198,7 @@ class RuntimeBinding:
                 raise ValueError(f"runtime binding {key} must be an absolute path")
             paths[key] = Path(raw)
         if version == 1 or "codex_home" not in value:
-            codex_home = paths["home"] / ".codex"
+            codex_home = paths["home"] / ".codex-ccswap"
         else:
             raw_codex_home = value["codex_home"]
             if (
@@ -888,13 +888,29 @@ def _validate_codex_home(binding: RuntimeBinding) -> None:
         owner=True,
     )
     try:
-        _validate_regular_at(
-            descriptor,
-            "config.toml",
-            binding.uid,
-            "Codex home config.toml",
-            auth=True,
-        )
+        try:
+            config_metadata = os.stat("config.toml", dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            config_metadata = None
+        except OSError as error:
+            raise ValueError("Codex home config.toml is not trustworthy") from error
+        if config_metadata is not None and stat.S_ISLNK(config_metadata.st_mode):
+            _validate_codex_surface_entry(
+                descriptor,
+                codex_home,
+                "config.toml",
+                binding.uid,
+                "Codex home config.toml",
+                directory=False,
+            )
+        else:
+            _validate_regular_at(
+                descriptor,
+                "config.toml",
+                binding.uid,
+                "Codex home config.toml",
+                auth=True,
+            )
         _validate_regular_at(
             descriptor,
             "auth.json",

@@ -46,7 +46,7 @@ class CutoverSignal(BaseException):
 
 RUNTIME_BINDING_PREFIX = b"# TICKER-RUNTIME-V1 "
 RUNTIME_BINDING_VERSION = 3
-RUNTIME_MODEL = "gpt-5.6-sol"
+RUNTIME_MODEL = "gpt-6-astra"
 _CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f]")
 _NATIVE_MACHO_MAGICS = {
     b"\xfe\xed\xfa\xce",
@@ -405,7 +405,7 @@ class RuntimeBinding:
                 raise CutoverError(f"runtime binding {key} is invalid")
             path_values[key] = _validate_absolute_path_text(raw, f"runtime binding {key}")
         if version == 1 or "codex_home" not in value:
-            codex_home = path_values["home"] / ".codex"
+            codex_home = path_values["home"] / ".codex-ccswap"
         else:
             raw_codex_home = value["codex_home"]
             if not isinstance(raw_codex_home, str):
@@ -1308,13 +1308,29 @@ def _validate_codex_home(codex_home: Path) -> None:
             raise CutoverError("cannot inspect Codex home") from error
         if metadata.st_uid != uid:
             raise CutoverError("Codex home is not owned by the current user")
-        _validate_optional_codex_file(
-            descriptor,
-            "config.toml",
-            uid,
-            "Codex home config.toml",
-            auth=True,
-        )
+        try:
+            config_metadata = os.stat("config.toml", dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            config_metadata = None
+        except OSError as error:
+            raise CutoverError("Codex home config.toml is not trustworthy") from error
+        if config_metadata is not None and stat.S_ISLNK(config_metadata.st_mode):
+            _validate_codex_surface_entry(
+                descriptor,
+                codex_home,
+                "config.toml",
+                uid,
+                "Codex home config.toml",
+                directory=False,
+            )
+        else:
+            _validate_optional_codex_file(
+                descriptor,
+                "config.toml",
+                uid,
+                "Codex home config.toml",
+                auth=True,
+            )
         _validate_optional_codex_file(
             descriptor,
             "auth.json",
@@ -1440,6 +1456,7 @@ CODEX_MANAGED_BY: Optional[str] = None
 TICKER_EXECUTABLE = Path("/Applications/Ticker.app/Contents/Helpers/ticker")
 _LIVE_TICKER_EXECUTABLE = TICKER_EXECUTABLE
 LAUNCHCTL = Path("/bin/launchctl")
+PLUTIL = Path("/usr/bin/plutil")
 PS = Path("/bin/ps")
 OSASCRIPT = Path("/usr/bin/osascript")
 OPEN = Path("/usr/bin/open")
@@ -2277,12 +2294,12 @@ def bind_locked_registry_runtime() -> None:
 
 def prepare_forward_launchd_environment() -> None:
     resolution = resolve_native_codex(os.environ)
-    _validate_codex_home(HOME_DIRECTORY / ".codex")
+    _validate_codex_home(HOME_DIRECTORY / ".codex-ccswap")
     launchd_environment = {
         "HOME": str(HOME_DIRECTORY),
         "PATH": build_controlled_path(HOME_DIRECTORY, resolution.path),
         "TZ": "America/New_York",
-        "CODEX_HOME": str(HOME_DIRECTORY / ".codex"),
+        "CODEX_HOME": str(HOME_DIRECTORY / ".codex-ccswap"),
     }
     globals().update(
         {
@@ -2384,7 +2401,7 @@ def _validated_launchd_environment(value: Any) -> Dict[str, str]:
     ):
         raise CutoverError("launchd PATH must contain only nonempty absolute paths")
     raw_codex_home = (
-        str(HOME_DIRECTORY / ".codex")
+        str(HOME_DIRECTORY / ".codex-ccswap")
         if set(value) == legacy_keys
         else value["CODEX_HOME"]
     )
@@ -2403,7 +2420,7 @@ def _plist_state_and_environment(
     routine: Routine,
 ) -> Tuple[PlistState, Dict[str, str]]:
     metadata = _regular_file(routine.plist, "launchd plist")
-    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != 0o644:
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) not in (0o600, 0o644):
         raise CutoverError(f"launchd ownership or mode changed for {routine.task_id}")
     value = parse_plist(routine.plist)
     if set(value) != {
@@ -4191,17 +4208,123 @@ def refresh_runtime_artifact(
                 raise
 
 
+def rebind_runtime_artifact(
+    routines: Sequence[Routine] = ROUTINES,
+    *,
+    command_runner: Optional[CommandRunner] = None,
+    clock: Callable[[], dt.datetime] = lambda: dt.datetime.now(tz=NEW_YORK),
+) -> None:
+    """Refresh the runner and rebind existing managed plists to the live Codex home."""
+    runner = command_runner or CommandRunner()
+    selected = tuple(
+        routine for routine in routines
+        if routine.plist.name == f"com.suchintan.codex-scheduled.{routine.task_id}.plist"
+        and os.path.lexists(routine.plist)
+    )
+    if not selected:
+        raise CutoverError("no managed launchd plists to rebind")
+    transaction = CutoverTransaction(selected, command_runner=runner, clock=clock)
+    transaction._preflight_common()
+    transaction._check_blackout()
+    codex_home = HOME_DIRECTORY / ".codex-ccswap"
+    snapshots: Dict[str, Tuple[bytes, int, bytes]] = {}
+    environment: Optional[Dict[str, str]] = None
+    for routine in selected:
+        metadata = _regular_file(routine.plist, "launchd plist")
+        mode = stat.S_IMODE(metadata.st_mode)
+        if metadata.st_uid != os.getuid() or mode not in (0o600, 0o644):
+            raise CutoverError(f"launchd ownership or mode changed for {routine.task_id}")
+        before = read_regular(routine.plist, "launchd plist")
+        try:
+            payload = plistlib.loads(before)
+        except plistlib.InvalidFileException as error:
+            raise CutoverError(f"launchd plist is malformed: {routine.plist}") from error
+        if not isinstance(payload, dict) or payload.get("Label") != routine.label:
+            raise CutoverError(f"launchd label changed for {routine.task_id}")
+        if payload.get("ProgramArguments") != routine.wrapper_arguments:
+            raise CutoverError(f"launchd wrapper state is unknown for {routine.task_id}")
+        stored = _validated_launchd_environment(payload.get("EnvironmentVariables"))
+        _validate_bound_path(stored["PATH"], os.getuid())
+        stored["CODEX_HOME"] = str(codex_home)
+        if environment is not None and environment != stored:
+            raise CutoverError("replacement plists contain inconsistent launchd environments")
+        environment = stored
+        payload["EnvironmentVariables"]["CODEX_HOME"] = str(codex_home)
+        snapshots[routine.task_id] = (
+            before, mode, plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False)
+        )
+
+    runner_before = read_regular(RUNNER_INSTALLED, "installed runner")
+    previous_environment = LAUNCHD_ENVIRONMENT
+    prepare_forward_launchd_environment()
+    # Preserve the installed jobs' PATH while binding the new home and native runtime.
+    globals()["LAUNCHD_ENVIRONMENT"] = environment
+    changed: List[Routine] = []
+    reloaded: List[Routine] = []
+
+    def reload_service(routine: Routine) -> None:
+        result = runner.run(LAUNCHCTL, ["bootout", f"gui/{os.getuid()}/{routine.label}"])
+        if result.status != 0 and not _service_absent(result):
+            raise CutoverError(f"launchctl bootout failed for {routine.task_id}")
+        result = runner.run(LAUNCHCTL, ["bootstrap", f"gui/{os.getuid()}", str(routine.plist)])
+        if result.status != 0:
+            raise CutoverError(f"launchctl bootstrap failed for {routine.task_id}")
+
+    with blocked_cutover_signals(), SignalScope():
+        try:
+            install_runner_atomically()
+            for routine in selected:
+                transaction._check_blackout()
+                changed.append(routine)
+                atomic_write(routine.plist, snapshots[routine.task_id][2], 0o600)
+                result = runner.run(PLUTIL, ["-lint", str(routine.plist)])
+                if result.status != 0:
+                    raise CutoverError(f"plutil lint failed for {routine.task_id}")
+            for routine in selected:
+                transaction._check_blackout()
+                reloaded.append(routine)
+                reload_service(routine)
+        except BaseException as rebind_error:
+            errors = []
+            for routine in reversed(changed):
+                try:
+                    before, mode, _after = snapshots[routine.task_id]
+                    atomic_write(routine.plist, before, mode)
+                except BaseException as error:
+                    errors.append(str(error))
+            try:
+                _restore_installed_runner(runner_before)
+            except BaseException as error:
+                errors.append(str(error))
+            globals()["LAUNCHD_ENVIRONMENT"] = previous_environment
+            if not errors:
+                for routine in reloaded:
+                    try:
+                        reload_service(routine)
+                    except BaseException as error:
+                        errors.append(str(error))
+            if errors:
+                raise RollbackError(
+                    f"runtime rebind failed ({rebind_error}); restoration failed: {'; '.join(errors)}"
+                ) from rebind_error
+            raise
+
+
 def main(arguments: Optional[Sequence[str]] = None) -> int:
     values = list(sys.argv[1:] if arguments is None else arguments)
-    if values not in ([], ["--rollback"], ["--refresh"]):
+    if values not in ([], ["--rollback"], ["--refresh"], ["--rebind"]):
         print(
-            f"usage: {Path(sys.argv[0]).name} [--rollback|--refresh]",
+            f"usage: {Path(sys.argv[0]).name} [--rollback|--refresh|--rebind]",
             file=sys.stderr,
         )
         return 64
     try:
         configure_static_runtime()
         with migration_transaction_lock():
+            if values == ["--rebind"]:
+                rebind_runtime_artifact(ROUTINES)
+                print(f"{TICKET} scheduled-routine runtime rebind completed")
+                return 0
             bind_locked_registry_runtime()
             transaction = CutoverTransaction(ROUTINES)
             if values == ["--rollback"]:
