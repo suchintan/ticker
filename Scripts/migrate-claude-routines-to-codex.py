@@ -2506,9 +2506,8 @@ def prepare_codex_compensation() -> None:
         if environment != binding_environment:
             raise CutoverError("stored launchd controls do not match runtime binding")
     identity = inspect_native_codex(binding.codex, binding.codex_macho_arch)
+    version: Optional[str] = None
     if binding.binding_version >= 2:
-        if identity.sha256 != binding.codex_sha256 or identity.arch != binding.codex_macho_arch:
-            raise CutoverError("bound Codex native identity changed")
         code_mode_identity: Optional[NativeCodexIdentity] = None
         if binding.binding_version >= RUNTIME_BINDING_VERSION:
             if binding.codex_code_mode_host is None:
@@ -2517,8 +2516,6 @@ def prepare_codex_compensation() -> None:
                 binding.codex_code_mode_host,
                 binding.codex_macho_arch,
             )
-            if code_mode_identity.sha256 != binding.codex_code_mode_host_sha256:
-                raise CutoverError("bound Codex code-mode host identity changed")
         if binding.codex_managed_by == "npm":
             if binding.codex_managed_package_root is None:
                 raise CutoverError("npm Codex binding has no package root")
@@ -2527,7 +2524,6 @@ def prepare_codex_compensation() -> None:
             )
             if (
                 native != binding.codex
-                or version != binding.codex_managed_package_version
                 or package_identity.sha256 != identity.sha256
             ):
                 raise CutoverError("bound Codex package provenance changed")
@@ -2542,7 +2538,7 @@ def prepare_codex_compensation() -> None:
     elif binding.codex_managed_by == "npm":
         if binding.codex_managed_package_root is None:
             raise CutoverError("legacy npm binding has no package root")
-        native, _host, _version, _package_identity, _host_identity = (
+        native, _host, version, _package_identity, _host_identity = (
             _validate_package_topology(binding.codex_managed_package_root)
         )
         if native != binding.codex:
@@ -2556,7 +2552,7 @@ def prepare_codex_compensation() -> None:
                 else None
             ),
             "CODEX_MANAGED_PACKAGE_VERSION": (
-                binding.codex_managed_package_version
+                version
                 if binding.codex_managed_by == "npm"
                 else None
             ),

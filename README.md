@@ -45,6 +45,15 @@ Run the dependency-free test executable through the direct compiler path:
 bash Scripts/run-tests.sh
 ```
 
+## Codex scheduled jobs
+
+The scheduled Codex runner uses the current native executable and code-mode host
+at the configured installation paths. Package upgrades do not require rebinding
+the jobs. Stored versions and hashes record the installation; they do not restrict
+future runs. Each run checks file ownership, permissions, native architecture,
+and npm package consistency, then verifies its private executable copies against
+the hashes measured during that run.
+
 ## Supported sources and native history
 
 | Source | What the scheduler exposes without Ticker wrapping |

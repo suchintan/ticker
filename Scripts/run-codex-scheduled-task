@@ -1353,9 +1353,6 @@ def _validate_package_identity(
     package_root: Path,
     bound_codex: Path,
     bound_code_mode_host: Path,
-    expected_digest: Optional[str],
-    expected_code_mode_host_digest: Optional[str],
-    expected_version: Optional[str] = None,
 ) -> None:
     _validate_directory_chain(package_root, os.getuid(), "Codex package root", owner=True)
     root_metadata = _read_package_metadata(package_root / "package.json", "Codex package metadata")
@@ -1368,8 +1365,6 @@ def _validate_package_identity(
         or ":" in version
     ):
         raise ValueError("Codex package metadata identity is invalid")
-    if expected_version is not None and version != expected_version:
-        raise ValueError("Codex package version changed")
     bin_metadata = root_metadata.get("bin")
     if not isinstance(bin_metadata, dict) or bin_metadata.get("codex") != "bin/codex.js":
         raise ValueError("Codex package bin metadata is invalid")
@@ -1418,13 +1413,11 @@ def _validate_package_identity(
     _validate_directory_chain(native.parent, os.getuid(), "Codex native vendor path", owner=False)
     if native != bound_codex or code_mode_host != bound_code_mode_host:
         raise ValueError("bound Codex paths are outside the official package topology")
-    if expected_digest is None or expected_code_mode_host_digest is None:
-        raise ValueError("npm Codex binding has incomplete native digests")
+
 
 def _open_bound_native(
     path: Path,
     binding: RuntimeBinding,
-    expected_digest: Optional[str],
     description: str,
 ) -> Tuple[int, str, str]:
     if not path.is_absolute():
@@ -1447,8 +1440,6 @@ def _open_bound_native(
         os.close(parent)
     try:
         _payload, arch, digest = _native_bytes_and_identity(descriptor)
-        if expected_digest is None or digest != expected_digest:
-            raise ValueError(f"{description} identity changed")
         if arch != binding.codex_macho_arch:
             raise ValueError(f"{description} architecture changed")
         return descriptor, arch, digest
@@ -1466,15 +1457,13 @@ def _open_bound_codex(binding: RuntimeBinding) -> Tuple[int, int, str, str]:
     descriptor, arch, digest = _open_bound_native(
         binding.codex,
         binding,
-        binding.codex_sha256,
         "bound Codex",
     )
     code_mode_descriptor: Optional[int] = None
     try:
-        code_mode_descriptor, code_mode_arch, _code_mode_digest = _open_bound_native(
+        code_mode_descriptor, code_mode_arch, code_mode_digest = _open_bound_native(
             binding.codex_code_mode_host,
             binding,
-            binding.codex_code_mode_host_sha256,
             "bound Codex code-mode host",
         )
         if code_mode_arch != arch:
@@ -1486,13 +1475,11 @@ def _open_bound_codex(binding: RuntimeBinding) -> Tuple[int, int, str, str]:
                 binding.codex_managed_package_root,
                 binding.codex,
                 binding.codex_code_mode_host,
-                binding.codex_sha256,
-                binding.codex_code_mode_host_sha256,
-                binding.codex_managed_package_version,
             )
         elif binding.codex_managed_package_root is not None:
             raise ValueError("direct Codex binding contains package metadata")
-        return descriptor, code_mode_descriptor, arch, digest
+        # Hashes describe this invocation, so installed Codex upgrades remain valid.
+        return descriptor, code_mode_descriptor, digest, code_mode_digest
     except BaseException:
         os.close(descriptor)
         if code_mode_descriptor is not None:
@@ -1599,6 +1586,8 @@ def _materialize_validated_codex(
     binding: RuntimeBinding,
     descriptor: int,
     code_mode_descriptor: int,
+    codex_digest: str,
+    code_mode_digest: str,
 ) -> Path:
     staging_bin = binding.home / ".local" / "bin"
     _validate_directory_chain(
@@ -1610,13 +1599,13 @@ def _materialize_validated_codex(
     codex_payload = _read_validated_executable(
         descriptor,
         binding,
-        binding.codex_sha256,
+        codex_digest,
         "bound Codex",
     )
     host_payload = _read_validated_executable(
         code_mode_descriptor,
         binding,
-        binding.codex_code_mode_host_sha256,
+        code_mode_digest,
         "bound Codex code-mode host",
     )
     parent_descriptor = _open_trusted_directory_chain(
@@ -1736,7 +1725,7 @@ def _forwarded_child_status(
         "-",
     ]
     try:
-        descriptor, code_mode_descriptor, _arch, _digest = _open_bound_codex(binding)
+        descriptor, code_mode_descriptor, digest, code_mode_digest = _open_bound_codex(binding)
     except (OSError, ValueError) as error:
         return _error(f"cannot validate bound Codex: {error}", 69)
 
@@ -1769,6 +1758,8 @@ def _forwarded_child_status(
             binding,
             descriptor,
             code_mode_descriptor,
+            digest,
+            code_mode_digest,
         )
         for signum in HANDLED_SIGNALS:
             previous[signum] = signal.getsignal(signum)

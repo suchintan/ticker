@@ -1848,7 +1848,7 @@ class StaticContractTests(unittest.TestCase):
                             binding.skill_roots[routine.task_id],
                             routine.root.canonical_root,
                         )
-                fixture.codex.write_bytes(fixture.codex.read_bytes() + b"tampered")
+                fixture.codex.write_bytes(b"not a native executable")
                 fixture.codex.chmod(0o755)
                 with mock.patch.object(
                     cutover,
@@ -2705,22 +2705,17 @@ class StaticContractTests(unittest.TestCase):
                 )
                 self.assertEqual(payload["codex_home"], str(fixture.codex_home))
 
-    def test_v2_native_digest_drift_fails_before_refresh_for_direct_and_npm(
+    def test_maintenance_accepts_native_upgrades_without_rebinding(
         self,
     ) -> None:
-        for manager in ("direct", "npm"):
-            with self.subTest(manager=manager), tempfile.TemporaryDirectory() as directory:
+        for binding_version in (2, 3):
+            with self.subTest(binding_version=binding_version), tempfile.TemporaryDirectory() as directory:
                 with CutoverFixture(Path(directory)) as fixture:
                     payload = fixture.binding_payload()
-                    payload["binding_version"] = 2
-                    payload.pop("codex_code_mode_host")
-                    payload.pop("codex_code_mode_host_sha256")
-                    payload["codex_managed_by"] = manager
-                    if manager == "npm":
-                        payload["codex_managed_package_root"] = str(
-                            fixture.root / "npm package"
-                        )
-                        payload["codex_managed_package_version"] = "0.147.0"
+                    payload["binding_version"] = binding_version
+                    if binding_version == 2:
+                        payload.pop("codex_code_mode_host")
+                        payload.pop("codex_code_mode_host_sha256")
                     fixture.runner_installed.write_bytes(
                         bind_generated_runner(
                             fixture.runner_source.read_bytes(),
@@ -2733,12 +2728,11 @@ class StaticContractTests(unittest.TestCase):
                         fixture.codex.read_bytes() + b"valid-native-digest-drift"
                     )
                     fixture.codex.chmod(0o755)
+                    host = fixture.codex.with_name("codex-code-mode-host")
+                    host.write_bytes(host.read_bytes() + b"valid-host-upgrade")
+                    host.chmod(0o755)
 
-                    with self.assertRaisesRegex(
-                        cutover.CutoverError,
-                        "bound Codex native identity changed",
-                    ):
-                        cutover.prepare_codex_compensation()
+                    cutover.prepare_codex_compensation()
 
                     self.assertEqual(
                         fixture.runner_installed.read_bytes(),

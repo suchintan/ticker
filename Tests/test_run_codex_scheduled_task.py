@@ -818,7 +818,39 @@ class RunnerContractTests(unittest.TestCase):
                         self.assertNotIn(name, child_environment)
 
 
-    def test_npm_package_identity_allows_unrelated_bin_entries(self) -> None:
+    def test_native_upgrades_run_without_rebinding(self) -> None:
+        for upgraded in ("codex", "code_mode_host"):
+            with self.subTest(upgraded=upgraded), tempfile.TemporaryDirectory() as directory:
+                harness = self.make_harness(Path(directory))
+                runner_before = harness.runner.read_bytes()
+                self.compile_native_codex(getattr(harness, upgraded), 23)
+
+                result = self.invoke(harness, "daily-summary")
+
+                self.assertEqual(result.returncode, 23 if upgraded == "codex" else 0, result.stderr)
+                self.assertEqual(self.read_events(harness), ["native-codex"])
+                self.assertEqual(harness.runner.read_bytes(), runner_before)
+
+    def test_executable_change_after_validation_is_rejected(self) -> None:
+        for changed in ("codex", "code_mode_host"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                harness = self.make_harness(Path(directory))
+                module = self.load_runner_module(harness)
+                binding = self.binding_object(harness)
+                codex_fd, host_fd, digest, host_digest = module._open_bound_codex(binding)
+                try:
+                    with getattr(harness, changed).open("ab") as executable:
+                        executable.write(b"changed-after-validation")
+                    with self.assertRaisesRegex(ValueError, "identity changed while being copied"):
+                        module._materialize_validated_codex(
+                            binding, codex_fd, host_fd, digest, host_digest,
+                        )
+                    self.assertEqual(self.read_events(harness), [])
+                finally:
+                    os.close(codex_fd)
+                    os.close(host_fd)
+
+    def test_npm_package_upgrade_runs_without_rebinding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             harness = self.make_harness(Path(directory))
             module = self.load_runner_module(harness)
@@ -873,35 +905,30 @@ class RunnerContractTests(unittest.TestCase):
             )
             entrypoint.write_text("#!/usr/bin/env node\n", encoding="utf-8")
             helper.write_text("#!/usr/bin/env node\n", encoding="utf-8")
-            native.write_bytes(harness.codex.read_bytes())
-            code_mode_host.write_bytes(harness.code_mode_host.read_bytes())
+            self.compile_native_codex(native, 23)
+            self.compile_native_codex(code_mode_host, 24)
             for executable in (entrypoint, helper, native, code_mode_host):
                 executable.chmod(0o755)
 
-            binding = self.binding_object(harness)
-            binding.codex = native
-            binding.codex_sha256 = hashlib.sha256(native.read_bytes()).hexdigest()
-            binding.codex_code_mode_host = code_mode_host
-            binding.codex_code_mode_host_sha256 = hashlib.sha256(
-                code_mode_host.read_bytes()
-            ).hexdigest()
-            binding.codex_managed_package_root = package_root
-            binding.codex_managed_package_version = package_version
-            binding.codex_managed_by = "npm"
-
-            self.assertIsNone(
-                module._validate_package_identity(
-                    package_root,
-                    binding.codex,
-                    binding.codex_code_mode_host,
-                    binding.codex_sha256,
-                    binding.codex_code_mode_host_sha256,
-                    package_version,
-                )
+            binding = dict(harness.binding)
+            binding.update(
+                codex=str(native),
+                codex_code_mode_host=str(code_mode_host),
+                codex_managed_package_root=str(package_root),
+                codex_managed_package_version="0.146.0",
+                codex_managed_by="npm",
             )
+            harness.runner.write_bytes(render_test_runner(RUNNER.read_bytes(), binding))
+            runner_before = harness.runner.read_bytes()
+
+            result = self.invoke(harness, "daily-summary")
+
+            self.assertEqual(result.returncode, 23, result.stderr)
+            self.assertEqual(self.read_events(harness), ["native-codex"])
+            self.assertEqual(harness.runner.read_bytes(), runner_before)
 
 
-    def test_npm_package_version_drift_rejects_before_spawn_with_bound_native_digest(
+    def test_inconsistent_npm_package_rejects_before_spawn(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -933,11 +960,14 @@ class RunnerContractTests(unittest.TestCase):
             entrypoint.parent.mkdir(parents=True)
             entrypoint.write_text("#!/usr/bin/env node\n", encoding="utf-8")
             native.write_bytes(harness.codex.read_bytes())
-            for executable in (entrypoint, native):
+            code_mode_host = native.with_name("codex-code-mode-host")
+            code_mode_host.write_bytes(harness.code_mode_host.read_bytes())
+            for executable in (entrypoint, native, code_mode_host):
                 executable.chmod(0o755)
 
             binding = self.binding_object(harness)
             binding.codex = native
+            binding.codex_code_mode_host = code_mode_host
             binding.codex_sha256 = hashlib.sha256(native.read_bytes()).hexdigest()
             binding.codex_managed_package_root = package_root
             binding.codex_managed_package_version = package_version
@@ -980,11 +1010,11 @@ class RunnerContractTests(unittest.TestCase):
 
             cases = (
                 (
-                    "version-drift",
+                    "incomplete-upgrade",
                     drifted_version,
                     f"npm:@openai/codex@{drifted_platform_version}",
                     "@openai/codex",
-                    drifted_platform_version,
+                    platform_version,
                 ),
                 (
                     "wrong-alias-target",
@@ -1054,7 +1084,7 @@ class RunnerContractTests(unittest.TestCase):
                     self.assertEqual(result, 69)
                     popen.assert_not_called()
 
-    def test_codex_digest_macho_and_package_identity_are_checked_before_spawn(
+    def test_codex_native_format_and_package_identity_are_checked_before_spawn(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1086,12 +1116,6 @@ class RunnerContractTests(unittest.TestCase):
             wrong_arch.codex.write_bytes(bytes(wrong_payload))
             wrong_arch.codex.chmod(0o755)
             cases.append(("wrong-arch", wrong_arch))
-
-            changed = SimpleNamespace(**vars(binding))
-            changed.codex = harness.root / "changed-codex"
-            changed.codex.write_bytes(original + b"changed")
-            changed.codex.chmod(0o755)
-            cases.append(("changed-digest", changed))
 
             direct = SimpleNamespace(**vars(binding))
             direct.codex = harness.root / "shell-codex"
@@ -1182,9 +1206,15 @@ class RunnerContractTests(unittest.TestCase):
                 codex_position = os.lseek(codex_fd, 0, os.SEEK_CUR)
                 host_position = os.lseek(host_fd, 0, os.SEEK_CUR)
 
-                first = Path(materialize(binding, codex_fd, host_fd))
+                first = Path(materialize(
+                    binding, codex_fd, host_fd,
+                    binding.codex_sha256, binding.codex_code_mode_host_sha256,
+                ))
                 private_paths.append(first)
-                second = Path(materialize(binding, codex_fd, host_fd))
+                second = Path(materialize(
+                    binding, codex_fd, host_fd,
+                    binding.codex_sha256, binding.codex_code_mode_host_sha256,
+                ))
                 private_paths.append(second)
 
                 for private_codex in private_paths:
@@ -1313,8 +1343,8 @@ class RunnerContractTests(unittest.TestCase):
                     return_value=(
                         source_fd,
                         code_mode_fd,
-                        str(binding.codex_macho_arch),
                         str(binding.codex_sha256),
+                        str(binding.codex_code_mode_host_sha256),
                     ),
                 ), mock.patch.object(
                     module.subprocess,
@@ -1394,8 +1424,8 @@ class RunnerContractTests(unittest.TestCase):
                     return_value=(
                         source_fd,
                         code_mode_fd,
-                        binding.codex_macho_arch,
                         binding.codex_sha256,
+                        binding.codex_code_mode_host_sha256,
                     ),
                 ), mock.patch.object(
                     module,
@@ -1477,8 +1507,8 @@ class RunnerContractTests(unittest.TestCase):
                     return_value=(
                         source_fd,
                         code_mode_fd,
-                        binding.codex_macho_arch,
                         binding.codex_sha256,
+                        binding.codex_code_mode_host_sha256,
                     ),
                 ), mock.patch.object(
                     module,
@@ -1564,8 +1594,8 @@ class RunnerContractTests(unittest.TestCase):
                     return_value=(
                         source_fd,
                         code_mode_fd,
-                        binding.codex_macho_arch,
                         binding.codex_sha256,
+                        binding.codex_code_mode_host_sha256,
                     ),
                 ), mock.patch.object(
                     module.os,
@@ -1644,8 +1674,8 @@ class RunnerContractTests(unittest.TestCase):
                     return_value=(
                         source_fd,
                         code_mode_fd,
-                        binding.codex_macho_arch,
                         binding.codex_sha256,
+                        binding.codex_code_mode_host_sha256,
                     ),
                 ), mock.patch.object(
                     module.subprocess,
