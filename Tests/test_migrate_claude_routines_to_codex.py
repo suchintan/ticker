@@ -328,6 +328,13 @@ class FakeCommandRunner:
         arguments = list(arguments)
         name = executable.name
         self.events.append(name + " " + " ".join(arguments))
+        if name == "plutil":
+            assert executable == Path("/usr/bin/plutil")
+            assert arguments[0] == "-lint"
+            if self.consume_failure("lint"):
+                return cutover.CommandResult(1, "", "injected lint failure")
+            plistlib.loads(Path(arguments[1]).read_bytes())
+            return cutover.CommandResult(0, "OK", "")
         if name == "ps":
             if self.quit_requested:
                 self.shutdown_poll_count += 1
@@ -474,7 +481,7 @@ class CutoverFixture:
         root = root.resolve(strict=True)
         self.root = root
         self.home = root / "home"
-        self.codex_home = self.home / ".codex"
+        self.codex_home = self.home / ".codex-ccswap"
         self.codex_home.mkdir(parents=True)
         self.codex_home.chmod(0o700)
         (self.codex_home / "config.toml").write_text("", encoding="utf-8")
@@ -648,7 +655,7 @@ class CutoverFixture:
             "codex": str(selected_codex),
             "codex_home": str(self.codex_home),
             "path": self.launchd_environment["PATH"],
-            "model": "gpt-5.6-sol",
+            "model": "gpt-6-astra",
             "skill_roots": {
                 routine.task_id: str(routine.root.canonical_root)
                 for routine in self.routines
@@ -809,6 +816,33 @@ class CutoverFixture:
 
 
 class StaticContractTests(unittest.TestCase):
+    def test_codex_home_accepts_trusted_symlinked_config(self) -> None:
+        for mode in (0o600, 0o644):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                with CutoverFixture(Path(directory)) as fixture:
+                    shared = fixture.home / ".codex"
+                    shared.mkdir(mode=0o700)
+                    target = shared / "config.toml"
+                    target.write_text("", encoding="utf-8")
+                    target.chmod(mode)
+                    config = fixture.codex_home / "config.toml"
+                    config.unlink()
+                    config.symlink_to(Path("../.codex/config.toml"))
+                    cutover._validate_codex_home(fixture.codex_home)
+                    shared.chmod(0o777)
+                    with self.assertRaisesRegex(cutover.CutoverError, "writable"):
+                        cutover._validate_codex_home(fixture.codex_home)
+
+    def test_codex_home_rejects_symlinked_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with CutoverFixture(Path(directory)) as fixture:
+                auth = fixture.codex_home / "auth.json"
+                target = fixture.root / "auth target.json"
+                auth.rename(target)
+                auth.symlink_to(target)
+                with self.assertRaisesRegex(cutover.CutoverError, "auth.json is not trustworthy"):
+                    cutover._validate_codex_home(fixture.codex_home)
+
     maxDiff = None
 
     def test_migration_script_uses_isolated_python_shebang(self) -> None:
@@ -2335,7 +2369,7 @@ class StaticContractTests(unittest.TestCase):
                 self.assertEqual(binding.python, Path(sys.executable))
                 self.assertEqual(binding.codex, fixture.codex)
                 self.assertEqual(binding.path, fixture.launchd_environment["PATH"])
-                self.assertEqual(binding.model, "gpt-5.6-sol")
+                self.assertEqual(binding.model, "gpt-6-astra")
                 self.assertEqual(binding.codex_sha256, native_digest(fixture.codex))
                 self.assertEqual(binding.codex_macho_arch, host_native_arch())
                 self.assertIsNone(binding.codex_managed_package_root)
@@ -2489,7 +2523,7 @@ class StaticContractTests(unittest.TestCase):
                 "python": sys.executable,
                 "codex": str(fixture.codex),
                 "path": fixture.launchd_environment["PATH"],
-                "model": "gpt-5.6-sol",
+                "model": "gpt-6-astra",
                 "codex_managed_package_root": str(fixture.codex.parent),
                 "codex_managed_by": "direct",
             }
@@ -2616,7 +2650,7 @@ class StaticContractTests(unittest.TestCase):
                 fixture.runner_installed.chmod(0o755)
                 parsed = cutover.read_runtime_binding(fixture.runner_installed)
                 self.assertEqual(parsed.binding_version, 2)
-                self.assertEqual(parsed.codex_home, fixture.home / ".codex")
+                self.assertEqual(parsed.codex_home, fixture.home / ".codex-ccswap")
 
                 missing_path = fixture.root / "missing caller PATH"
                 missing_path.mkdir()
@@ -3855,7 +3889,7 @@ class TransactionTests(unittest.TestCase):
             "home-writable",
             "home-symlink",
             "config-mode",
-            "config-symlink",
+            "config-symlink-writable",
             "auth-mode",
             "auth-symlink",
         ):
@@ -3871,10 +3905,10 @@ class TransactionTests(unittest.TestCase):
                         fixture.codex_home.symlink_to(target, target_is_directory=True)
                     elif case == "config-mode":
                         config.chmod(0o644)
-                    elif case == "config-symlink":
+                    elif case == "config-symlink-writable":
                         target = fixture.root / "config target"
                         target.write_text("", encoding="utf-8")
-                        target.chmod(0o600)
+                        target.chmod(0o666)
                         config.unlink()
                         config.symlink_to(target)
                     elif case == "auth-mode":
@@ -4716,7 +4750,7 @@ class TransactionTests(unittest.TestCase):
                 self.assertEqual(binding.python, Path(sys.executable))
                 self.assertEqual(binding.codex, fixture.codex)
                 self.assertEqual(binding.path, fixture.launchd_environment["PATH"])
-                self.assertEqual(binding.model, "gpt-5.6-sol")
+                self.assertEqual(binding.model, "gpt-6-astra")
                 self.assertEqual(binding.codex_sha256, native_digest(fixture.codex))
                 self.assertEqual(binding.codex_macho_arch, host_native_arch())
                 self.assertEqual(binding.codex_code_mode_host, fixture.code_mode_host)
