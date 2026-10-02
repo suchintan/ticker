@@ -306,6 +306,8 @@ struct JobDetailView: View {
 
     private func attentionCalloutTitle(_ attention: JobAttention) -> String {
         switch attention {
+        case .launchBlocked:
+            return attention.summary
         case .missingPayload:
             return "Missing payload"
         case .malformedConfiguration:
@@ -323,7 +325,7 @@ struct JobDetailView: View {
             return "Ticker found the job, but \(path) does not exist. Restore the file or update the plist command."
         case .malformedConfiguration(let path, let message):
             return "Ticker found \(path), but it is not a valid property list: \(message)"
-        case .inertConfiguration:
+        case .inertConfiguration, .launchBlocked:
             return attention.detail
         case .unreadableConfiguration:
             return attention.detail

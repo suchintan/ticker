@@ -189,6 +189,8 @@ public final class LaunchdAdapter: JobSourceAdapter {
         let observedAt: Date
         let processID: Int32?
         let runCount: Int64?
+        let lastExitReason: String?
+        let isRunning: Bool
     }
 
     private let searchDirectories: [URL]
@@ -209,7 +211,8 @@ public final class LaunchdAdapter: JobSourceAdapter {
            !paths.isEmpty {
             self.init(searchDirectories: paths.split(separator: ":").map {
                     URL(fileURLWithPath: String($0), isDirectory: true) },
-                launchctlURL: URL(fileURLWithPath: "/bin/launchctl"),
+                launchctlURL: URL(fileURLWithPath:
+                    ProcessInfo.processInfo.environment["TICKER_TEST_LAUNCHCTL_PATH"] ?? "/bin/launchctl"),
                 homeDirectory: home,
                 commandRunner: { try runAdapterCommand(executable: $0, arguments: $1) })
             return
@@ -294,11 +297,17 @@ public final class LaunchdAdapter: JobSourceAdapter {
                 launchdLabel: configuration.parsedLabel,
                 effectiveExecutable: configuration.effectiveExecutable
             )
+            var attention = classification.attention
+            if attention == nil, configuration.managed, configuration.domain == .userAgent,
+               let runtimeStatus, !runtimeStatus.isRunning,
+               runtimeStatus.lastExitReason == "OS_REASON_CODESIGNING" {
+                attention = .launchBlocked(path: configuration.configPath, reason: "OS_REASON_CODESIGNING")
+            }
             return Job(
                 id: jobID(label: configuration.label, configPath: configuration.configPath),
                 source: .launchd,
                 provenance: classification.provenance,
-                attention: classification.attention,
+                attention: attention,
                 label: configuration.label,
                 schedule: configuration.schedule,
                 command: configuration.command,
@@ -697,7 +706,9 @@ public final class LaunchdAdapter: JobSourceAdapter {
             attribution: attribution,
             observedAt: Date(),
             processID: snapshot.processID,
-            runCount: snapshot.runCount
+            runCount: snapshot.runCount,
+            lastExitReason: snapshot.lastExitReason,
+            isRunning: snapshot.state == "running" || snapshot.processID != nil
         )
     }
 

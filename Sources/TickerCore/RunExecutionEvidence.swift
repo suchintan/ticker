@@ -26,15 +26,27 @@ public struct LaunchdRuntimeSnapshot: Equatable {
     public let processID: Int32?
     public let lastExitStatus: ExitStatus?
     public let runCount: Int64?
+    public let lastExitReason: String?
+    public let properties: [String]
+    public let state: String?
+    public let path: String?
 
-    public init(processID: Int32?, lastExitStatus: ExitStatus?, runCount: Int64?) {
+    public init(processID: Int32?, lastExitStatus: ExitStatus?, runCount: Int64?,
+                lastExitReason: String? = nil, properties: [String] = [], state: String? = nil,
+                path: String? = nil) {
         self.processID = processID; self.lastExitStatus = lastExitStatus; self.runCount = runCount
+        self.lastExitReason = lastExitReason; self.properties = properties; self.state = state
+        self.path = path
     }
 
     public static func parse(_ output: String) -> LaunchdRuntimeSnapshot {
         var processID: Int32?
         var lastExitStatus: ExitStatus?
         var runCount: Int64?
+        var lastExitReason: String?
+        var properties: [String] = []
+        var state: String?
+        var path: String?
         var depth = 0
         var hasRootRecord = false
 
@@ -48,7 +60,16 @@ public struct LaunchdRuntimeSnapshot: Equatable {
                let token = trimmed[trimmed.index(after: equals)...]
                 .trimmingCharacters(in: CharacterSet(charactersIn: " ;\t\r\n"))
                 .split(whereSeparator: \.isWhitespace).first {
-                if normalized.hasPrefix("pid =") { processID = Int32(token) }
+                let value = trimmed[trimmed.index(after: equals)...]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.hasPrefix("path =") { path = value }
+                else if normalized.hasPrefix("last exit reason =") { lastExitReason = value }
+                else if normalized.hasPrefix("properties =") {
+                    properties = value.split(separator: "|").map {
+                        $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                } else if normalized.hasPrefix("state =") { state = value }
+                else if normalized.hasPrefix("pid =") { processID = Int32(token) }
                 else if normalized.hasPrefix("runs =") { runCount = Int64(token) }
                 else if normalized.contains("last exit code") || normalized.contains("lastexitstatus"),
                         let raw = Int32(token) { lastExitStatus = ExitStatus(raw: raw) }
@@ -57,7 +78,8 @@ public struct LaunchdRuntimeSnapshot: Equatable {
             depth = max(0, depth + openingBraces - closingBraces)
         }
         return LaunchdRuntimeSnapshot(processID: processID, lastExitStatus: lastExitStatus,
-                                      runCount: runCount)
+                                      runCount: runCount, lastExitReason: lastExitReason,
+                                      properties: properties, state: state, path: path)
     }
 }
 
