@@ -129,6 +129,46 @@ If `Program` or `ProgramArguments` changed to neither the Ticker wrapper nor the
 
 Ticker never deletes backups. Unwrap jobs before deleting `Ticker.app`. A wrapped job whose `ticker` binary is missing will fail with exit 127, so removing the app first can leave that job unable to run until you restore its backup.
 
+## Launch kills after a reboot
+
+Some wrapped jobs stop after a reboot without recording a Ticker run. launchd reports
+`OS_REASON_CODESIGNING` or marks the job `needs LWCR update`. This happens when launchd
+first loads a job with an Apple platform binary, such as `/usr/bin/python3` or `/bin/bash`,
+and Ticker later wraps it. macOS keeps the original program's launch constraint and
+kills the Ticker helper before it starts.
+
+At login, `ticker recover` re-registers loaded, wrapped user LaunchAgents that have
+either trigger. It only handles plists owned by the current user in that user's
+`~/Library/LaunchAgents` directory. It compares canonical paths, resolving symlinks.
+It excludes ambiguous jobs and the recovery agent itself.
+If the loaded plist path is missing or differs from the candidate path, it skips the
+job with reason `path-mismatch`. It makes no launchctl write for that job.
+It also skips unreadable plists, unloaded jobs, running jobs, and jobs with
+`RunAtLoad` true or `KeepAlive` true or a dictionary.
+
+Recovery removes and reloads each eligible job, then checks that `needs LWCR update`
+is gone and the loaded plist path still matches.
+After a failed bootout, it checks whether the job is still loaded.
+If so, it records `failed`. Otherwise, it continues to bootstrap.
+It makes up to five bootstrap attempts. Before retries, it waits 0.5, 1, 2, and 4 seconds,
+about 7.5 seconds in total. Results are `reregistered`, `unchanged`, `skipped`, or `failed`.
+A `failed` result makes recovery exit nonzero after printing
+both the re-registration results and the run recovery results. If bootstrap fails all
+five times, the message says the job is unloaded and gives a manual bootstrap command.
+Re-registration runs before Ticker opens the run store. Its results print even if run
+recovery fails. JSON output then includes `runRecoveryError`, and recovery exits nonzero.
+Ticker does not claim a run retry for a job whose re-registration failed.
+
+Run recovery by hand with:
+
+```bash
+/Applications/Ticker.app/Contents/Helpers/ticker recover
+```
+
+`ticker doctor` shows `broken` for an observed kill (`OS_REASON_CODESIGNING`).
+The app sends its broken-job notification for that kill. The `needs LWCR update`
+marker only triggers re-registration; it creates no job attention.
+
 ## CLI reference
 
 Ticker uses hand-rolled argument parsing and has no CLI package dependency.

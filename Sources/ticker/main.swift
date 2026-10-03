@@ -235,6 +235,12 @@ private struct RecoveryRecord: Encodable {
     let message: String?
 }
 
+private struct RecoveryOutput: Encodable {
+    let reregistrations: [LaunchdReregistrationRecord]
+    let runs: [RecoveryRecord]
+    let runRecoveryError: String?
+}
+
 private struct RecoveryChildResult {
     let terminationStatus: Int32?
     let launchError: String?
@@ -1255,8 +1261,35 @@ private struct TickerCLI {
 
     private func recover(arguments: [String]) throws {
         let json = try parseJSONOnlyOption(arguments, command: "recover")
-        let store = try SQLiteRunStore(path: configuredStorePath())
         let discovery = discoverJobs()
+        #if TICKER_TESTING
+        let home = ProcessInfo.processInfo.environment["TICKER_TEST_HOME_DIRECTORY"]
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        #else
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        #endif
+        let reregistrations = LaunchdReregistration(
+            jobs: discovery.jobs, uid: getuid(),
+            launchAgentsDirectory: home.appendingPathComponent("Library/LaunchAgents", isDirectory: true),
+            launchctl: runRecoveryLaunchctl
+        ).recover()
+        let records: [RecoveryRecord]
+        do {
+            records = try recoverRuns(discovery: discovery, reregistrations: reregistrations)
+        } catch {
+            try finishRecoveryOutput(records: [], reregistrations: reregistrations,
+                                     json: json, runRecoveryError: error)
+            return
+        }
+        try finishRecoveryOutput(records: records, reregistrations: reregistrations, json: json)
+    }
+
+    private func recoverRuns(
+        discovery: (jobs: [Job], complete: Bool),
+        reregistrations: [LaunchdReregistrationRecord]
+    ) throws -> [RecoveryRecord] {
+        let store = try SQLiteRunStore(path: configuredStorePath())
         let unfinishedRuns = try store.unfinishedRuns().sorted {
             if $0.id == $1.id { return $0.startedAt > $1.startedAt }
             return $0.id > $1.id
@@ -1295,7 +1328,7 @@ private struct TickerCLI {
                     message: "current job discovery was incomplete"
                 )
             }
-            return try finishRecoveryOutput(records: records, json: json)
+            return records
         }
 
         var currentJobs: [String: Job] = [:]
@@ -1368,6 +1401,16 @@ private struct TickerCLI {
                 )
                 continue
             case .retryIdempotent(let taskID, let timeZone):
+                if reregistrations.contains(where: { $0.jobID == currentJob.id && $0.status == .failed }) {
+                    append(
+                        run: run,
+                        jobID: canonicalJobID,
+                        status: "skipped",
+                        policy: policy,
+                        message: "launchd re-registration failed; Ticker did not claim recovery"
+                    )
+                    continue
+                }
                 let dateKey: String
                 do {
                     dateKey = try RecoveryDate.key(
@@ -1493,27 +1536,45 @@ private struct TickerCLI {
                 }
             }
         }
-        try finishRecoveryOutput(records: records, json: json)
+        return records
     }
 
-    private func finishRecoveryOutput(records: [RecoveryRecord], json: Bool) throws {
+    private func finishRecoveryOutput(
+        records: [RecoveryRecord],
+        reregistrations: [LaunchdReregistrationRecord],
+        json: Bool,
+        runRecoveryError: Error? = nil
+    ) throws {
         if json {
-            try printJSON(records)
-            return
+            try printJSON(RecoveryOutput(
+                reregistrations: reregistrations, runs: records,
+                runRecoveryError: runRecoveryError.map { ($0 as? CLIError)?.message ?? $0.localizedDescription }
+            ))
+        } else {
+            printTable(
+                headers: ["JOB", "STATUS", "REASON", "MESSAGE"],
+                rows: reregistrations.map {
+                    [$0.jobID, $0.status.rawValue, $0.reason ?? "—", $0.message ?? "—"]
+                }
+            )
+            printTable(
+                headers: ["RUN", "JOB", "STATUS", "DATE", "EXIT", "MESSAGE"],
+                rows: records.map {
+                    [
+                        String($0.runID),
+                        $0.jobID,
+                        $0.status,
+                        $0.dateKey ?? "—",
+                        $0.exitCode.map(String.init) ?? "—",
+                        $0.message ?? "—",
+                    ]
+                }
+            )
         }
-        printTable(
-            headers: ["RUN", "JOB", "STATUS", "DATE", "EXIT", "MESSAGE"],
-            rows: records.map {
-                [
-                    String($0.runID),
-                    $0.jobID,
-                    $0.status,
-                    $0.dateKey ?? "—",
-                    $0.exitCode.map(String.init) ?? "—",
-                    $0.message ?? "—",
-                ]
-            }
-        )
+        if let runRecoveryError { throw runRecoveryError }
+        if reregistrations.contains(where: { $0.status == .failed }) {
+            throw CLIError.operation("one or more launchd jobs could not be re-registered")
+        }
     }
 
     private func launchRecoveryChild(arguments: [String]) -> RecoveryChildResult {
@@ -1644,7 +1705,7 @@ private struct TickerCLI {
 
     #if TICKER_TESTING
     private func testingRuntimeJob(_ job: Job) -> Job {
-        guard job.source == .launchd,
+        guard job.source == .launchd, job.runtimeStatusAttribution != .ambiguous,
               let domain = job.launchdDomain else {
             return job
         }
@@ -1763,7 +1824,7 @@ private struct TickerCLI {
           ticker recovery-policy <job-id> alert-only [--json]
           ticker recovery-policy <job-id> retry-idempotent --task-id <id> --time-zone <iana> [--json]
           ticker recovery-agent [status|enable|disable]
-          ticker recover [--json]
+          ticker recover [--json]  Recover runs and re-register launch-blocked wrapped jobs
           ticker wrap <job-id>
           ticker unwrap <job-id>
           ticker doctor [--clear-stale <job-id>]

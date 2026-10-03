@@ -15442,7 +15442,7 @@ private func test19_recover(
 
 private func test19_records(_ output: String) throws -> [[String: Any]] {
     try require(
-        try JSONSerialization.jsonObject(with: Data(output.utf8)) as? [[String: Any]],
+        (try JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any])?["runs"] as? [[String: Any]],
         "test19 recovery JSON records"
     )
 }

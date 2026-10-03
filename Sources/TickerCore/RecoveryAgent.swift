@@ -155,13 +155,13 @@ public struct RecoveryAgentController {
         switch initialState {
         case .present:
             let bootout = launchctl(["bootout", target])
-            if !isExactNotFound(bootout), bootout.status != 0 {
+            if !Self.isExactNotFound(bootout), bootout.status != 0 {
                 failures.append(commandFailure("Recovery LaunchAgent bootout", bootout))
             }
         case .indeterminate(let result):
             failures.append(queryFailure(result))
             let bootout = launchctl(["bootout", target])
-            if !isExactNotFound(bootout), bootout.status != 0 {
+            if !Self.isExactNotFound(bootout), bootout.status != 0 {
                 failures.append(commandFailure("Recovery LaunchAgent bootout", bootout))
             }
         case .absent:
@@ -178,7 +178,7 @@ public struct RecoveryAgentController {
         // prevents a target loaded between the first probe and the unlink from
         // surviving a successful disable operation.
         let finalBootout = launchctl(["bootout", target])
-        if !isExactNotFound(finalBootout), finalBootout.status != 0 {
+        if !Self.isExactNotFound(finalBootout), finalBootout.status != 0 {
             failures.append(commandFailure("Recovery LaunchAgent final bootout", finalBootout))
         }
 
@@ -407,7 +407,7 @@ public struct RecoveryAgentController {
     private func probeTarget() -> TargetState {
         let result = launchctl(["print", target])
         if result.status == 0 { return .present(result) }
-        if isExactNotFound(result) { return .absent }
+        if Self.isExactNotFound(result) { return .absent }
         return .indeterminate(result)
     }
 
@@ -470,7 +470,7 @@ public struct RecoveryAgentController {
         }
     }
 
-    private func isExactNotFound(_ result: LoginItemCommandResult) -> Bool {
+    static func isExactNotFound(_ result: LoginItemCommandResult) -> Bool {
         (result.status == 113 && result.stderr.contains("Could not find service"))
             || (result.status == 3 && result.stderr.contains("No such process"))
     }

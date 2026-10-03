@@ -110,12 +110,15 @@ extension JobProvenance: Codable {
 
 public enum JobAttention: Hashable {
     case missingPayload(String)
+    case launchBlocked(path: String, reason: String)
     case malformedConfiguration(path: String, message: String)
     case inertConfiguration(path: String, message: String)
     case unreadableConfiguration(path: String, message: String)
 
     public var kind: String {
         switch self {
+        case .launchBlocked:
+            return "launchBlocked"
         case .missingPayload:
             return "missingPayload"
         case .malformedConfiguration:
@@ -131,7 +134,8 @@ public enum JobAttention: Hashable {
         switch self {
         case .missingPayload(let path):
             return path
-        case .malformedConfiguration(let path, _),
+        case .launchBlocked(let path, _),
+             .malformedConfiguration(let path, _),
              .inertConfiguration(let path, _),
              .unreadableConfiguration(let path, _):
             return path
@@ -140,6 +144,8 @@ public enum JobAttention: Hashable {
 
     public var summary: String {
         switch self {
+        case .launchBlocked:
+            return "Launch blocked"
         case .missingPayload:
             return "Missing payload"
         case .malformedConfiguration:
@@ -153,7 +159,7 @@ public enum JobAttention: Hashable {
 
     public var requiresAttention: Bool {
         switch self {
-        case .missingPayload, .malformedConfiguration:
+        case .launchBlocked, .missingPayload, .malformedConfiguration:
             return true
         case .inertConfiguration, .unreadableConfiguration:
             return false
@@ -162,7 +168,7 @@ public enum JobAttention: Hashable {
 
     public var isConfigurationDiagnostic: Bool {
         switch self {
-        case .missingPayload:
+        case .missingPayload, .launchBlocked:
             return false
         case .malformedConfiguration, .inertConfiguration, .unreadableConfiguration:
             return true
@@ -171,6 +177,8 @@ public enum JobAttention: Hashable {
 
     public var detail: String {
         switch self {
+        case .launchBlocked(_, let reason):
+            return "launchd killed the last launch of this job before Ticker started (last exit reason \(reason)), so Ticker recorded no run. Run `ticker recover` to re-register the job."
         case .missingPayload(let path):
             return "The job's payload does not exist at \(path)."
         case .malformedConfiguration(let path, let message):
@@ -184,6 +192,8 @@ public enum JobAttention: Hashable {
 
     public var diagnosticDescription: String {
         switch self {
+        case .launchBlocked(_, let reason):
+            return "launch blocked by launchd (\(reason)); run `ticker recover` to re-register the job"
         case .missingPayload(let path):
             return "missing payload at \(path)"
         case .malformedConfiguration(let path, let message):
@@ -201,11 +211,17 @@ extension JobAttention: Codable {
         case kind
         case path
         case message
+        case reason
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         switch try container.decode(String.self, forKey: .kind) {
+        case "launchBlocked":
+            self = .launchBlocked(
+                path: try container.decode(String.self, forKey: .path),
+                reason: try container.decode(String.self, forKey: .reason)
+            )
         case "missingPayload":
             self = .missingPayload(try container.decode(String.self, forKey: .path))
         case "malformedConfiguration":
@@ -251,6 +267,8 @@ extension JobAttention: Codable {
              .inertConfiguration(_, let message),
              .unreadableConfiguration(_, let message):
             try container.encode(message, forKey: .message)
+        case .launchBlocked(_, let reason):
+            try container.encode(reason, forKey: .reason)
         case .missingPayload:
             break
         }
