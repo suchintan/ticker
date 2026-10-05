@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public struct LaunchdReregistrationRecord: Codable {
@@ -46,10 +47,13 @@ public struct LaunchdReregistration {
     }
 
     private func reregister(_ job: Job) -> LaunchdReregistrationRecord {
+        var modificationTimeWarning: String?
         func record(_ status: LaunchdReregistrationRecord.Status,
                     reason: String? = nil, message: String? = nil) -> LaunchdReregistrationRecord {
-            LaunchdReregistrationRecord(jobID: job.id, label: job.label, status: status,
-                                        reason: reason, message: message)
+            let messages = [message, modificationTimeWarning].compactMap { $0 }
+            return LaunchdReregistrationRecord(jobID: job.id, label: job.label, status: status,
+                                              reason: reason,
+                                              message: messages.isEmpty ? nil : messages.joined(separator: " "))
         }
 
         guard let path = job.configPath,
@@ -98,6 +102,9 @@ public struct LaunchdReregistration {
                 return record(.failed, reason: trigger,
                               message: "bootout failed (exit \(bootout.status)): \(bootout.stderr.trimmingCharacters(in: .whitespacesAndNewlines)). The job is still loaded.")
             }
+        }
+        if path.withCString({ Darwin.utimes($0, nil) }) != 0 {
+            modificationTimeWarning = "Could not update the plist modification time (\(String(cString: strerror(errno)))); macOS may keep its old launch record."
         }
         var bootstrap = launchctl(["bootstrap", domain, path])
         for delay in [0.5, 1.0, 2.0, 4.0] {

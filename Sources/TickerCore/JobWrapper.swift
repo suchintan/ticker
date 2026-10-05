@@ -1342,6 +1342,10 @@ public final class JobWrapper {
             guard metadataResult == 0 else {
                 throw posixError("preserve metadata for \(metadataSourceURL.path)")
             }
+            // BTM refreshes its launch record only when the plist's modification time changes.
+            guard temporaryURL.path.withCString({ Darwin.utimes($0, nil) }) == 0 else {
+                throw posixError("update modification time for \(temporaryURL.path)")
+            }
         }
         try fullySync(descriptor, description: "temporary file at \(temporaryURL.path)")
         guard Darwin.close(descriptor) == 0 else {
