@@ -134,8 +134,9 @@ Ticker never deletes backups. Unwrap jobs before deleting `Ticker.app`. A wrappe
 Some wrapped jobs stop after a reboot without recording a Ticker run. launchd reports
 `OS_REASON_CODESIGNING` or marks the job `needs LWCR update`. This happens when launchd
 first loads a job with an Apple platform binary, such as `/usr/bin/python3` or `/bin/bash`,
-and Ticker later wraps it. macOS keeps the original program's launch constraint and
-kills the Ticker helper before it starts.
+and Ticker later wraps it. The wrap kept the plist's old modification time, so macOS
+kept its old launch record and killed the Ticker helper before it started.
+`wrap` and `unwrap` now write a fresh modification time.
 
 At login, `ticker recover` re-registers loaded, wrapped user LaunchAgents that have
 either trigger. It only handles plists owned by the current user in that user's
@@ -146,8 +147,10 @@ job with reason `path-mismatch`. It makes no launchctl write for that job.
 It also skips unreadable plists, unloaded jobs, running jobs, and jobs with
 `RunAtLoad` true or `KeepAlive` true or a dictionary.
 
-Recovery removes and reloads each eligible job, then checks that `needs LWCR update`
-is gone and the loaded plist path still matches.
+Recovery removes each eligible job, refreshes the plist's modification time, and
+reloads it. This lets macOS update its record, so the next login no longer needs a
+repair. Recovery then checks that `needs LWCR update` is gone and the loaded plist
+path still matches.
 After a failed bootout, it checks whether the job is still loaded.
 If so, it records `failed`. Otherwise, it continues to bootstrap.
 It makes up to five bootstrap attempts. Before retries, it waits 0.5, 1, 2, and 4 seconds,
@@ -163,6 +166,14 @@ Run recovery by hand with:
 
 ```bash
 /Applications/Ticker.app/Contents/Helpers/ticker recover
+```
+
+To repair a blocked job manually, run these commands with its plist, user ID, and label:
+
+```bash
+touch <plist>
+launchctl bootout gui/<uid>/<label>
+launchctl bootstrap gui/<uid> <plist>
 ```
 
 `ticker doctor` shows `broken` for an observed kill (`OS_REASON_CODESIGNING`).
